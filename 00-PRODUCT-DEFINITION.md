@@ -160,6 +160,39 @@ mesher's fixed acceptance test, not an open-ended accuracy chase.
 
 Maximum deviation is always reported and never capped.
 
+### 4.1a Minimum defensible tolerance — computed, not asserted
+
+The 10 mm floor is a **global product minimum**, not a claim that 10 mm is
+achievable on every project. Different surveys have different instruments,
+control and registration quality.
+
+RapidMesh computes a **project-specific minimum defensible tolerance** when the
+inputs exist. Contributing terms, each reported separately with its confidence
+basis:
+
+- the surveyor's requested tolerance
+- RapidMesh's measured contribution (reconstruction, and decimation where
+  applicable)
+- declared instrument uncertainty
+- registration and control/georeferencing uncertainty
+- comparison sampling contribution
+- whether the selected tolerance is supported by the available evidence
+
+**Do not simply add RMS, p99.9, registration residuals and survey accuracy.**
+They are different statistics at different confidence levels. The combination
+method must be defined, stated in the report, and applied consistently.
+
+Where any required term is missing, the report states:
+
+> **Minimum defensible tolerance cannot be computed from the available project
+> evidence.**
+
+and names which inputs are absent. It does not guess, and it does not fall back
+to the global floor as though it were project-specific.
+
+Phase 2 determines whether 10 mm is supportable **for the reference dataset**.
+If it is not, the report says so. That result does not raise the global floor.
+
 ### 4.2 Everything else
 
 | Property | Target | How it is measured |
@@ -168,7 +201,7 @@ Maximum deviation is always reported and never capped.
 | Mover removal | ≥ 95% of transient points dropped | Synthetic scan with a scripted moving object |
 | False positives from mover removal | ≤ 0.1% of static surface points dropped | Same fixture |
 | **Processing working memory** | **≤ 512 MB** | Resident during processing, excluding incrementally written output. Measured on the largest real sample station |
-| **Peak process RSS** | **≤ 1.5 GB**, enforced by `RLIMIT_AS` | The hard ceiling. Sized to sit alongside the web server on a 4 GB host |
+| **Measured peak RSS** | **≤ 1.5 GB** | Acceptance gate, measured by an RSS watchdog. **Not** enforced by `RLIMIT_AS`, which bounds virtual address space and is a separate, calibrated fail-safe. The hard physical boundary is a job-specific cgroup limit. See `docs/adr/ADR-006` |
 | Time to first paint, browser | ≤ 1 s on a 10 Mbit link | LOD0 tier size budget, test contract per `RAPIDMESH-REVIEW-FINDINGS.md` §11 |
 | Size per site | Beat Cairn at equal or better deviation | Same scans, same components counted |
 
@@ -193,18 +226,21 @@ mesh built from these points". Real data has no analytic truth to substitute.
 for the full pipeline on a 2.95 M-point station. Neither budget is currently
 met.
 
-**Known gap against the acceptance test.** The best synthetic result is
-1.00 mm RMS / **3.55 mm p99.9**. The derived budget at the 10 mm tolerance
-floor is 1.0 mm RMS / **3.2 mm p99.9**. RMS passes; **p99.9 misses by 11%**.
+**Known gap against the acceptance test, in the exact wording to use:**
 
-Stated precisely, because the distinction matters: at the 25 mm default
-tolerance the p99.9 budget is 8.0 mm and 3.55 mm passes with margin. The miss
-is at the 10 mm floor only, and the synthetic fixture carries 2 mm range sigma,
-so part of that tail is instrument noise rather than mesh error. It is still a
-miss against a stated acceptance test and is tracked as open item 9 in
-`CLAUDE.md` §9. Resolution options, in order of preference: improve the mesher;
-separate instrument noise from mesh error in the metric; or raise the tolerance
-floor. Do not quietly widen the budget.
+> **Passes the 25 mm default-tolerance budget and fails the 10 mm
+> minimum-tolerance budget.**
+
+Best synthetic result 1.00 mm RMS / 3.55 mm p99.9. Budget at the 25 mm default
+is 8.0 mm p99.9 (pass, with margin); at the 10 mm floor it is 3.2 mm (fail, by
+11%).
+
+**Measured, not assumed:** the tail is geometric, not stochastic. At zero range
+noise with carving disabled, p99.9 is still 12.89 mm at coarse sampling. Range
+noise moves it about 5%; carving moves it about 5%. The responsible stage is
+**not yet identified**, and an isolation matrix is a phase 1 deliverable. See
+`FINDING-003-GEOMETRIC-TAIL.md`. Do not attribute a cause before that run
+completes, and do not quietly widen the 3.2 mm budget.
 
 Until §6's QA rework lands, **no real-data fidelity claim may be made.** The
 targets stand; the evidence for them is narrower than this document previously
@@ -345,9 +381,9 @@ being finished.
 |---|---|---|
 | **0a** | **Endpoint safety, today.** Disable or authorise-gate `build_meshes` and `build_vantage_meshes` at the server, not the frontend. Automatic meshing stays off | Both routes return 403/404 to an unauthorised direct call, proven by test. No route can reach `mesher.py` from an ordinary request |
 | **0b** | Job isolation. Child process, per-workload `RLIMIT_AS`, pre-flight ceiling, no retry loop | 1.77 GB file fails its own job; `/api/health` 200 throughout; other projects viewable; scan preserved; explicit failure status; `dmesg` shows the child killed, not uvicorn |
-| **1** | QA rework (§6) + streamed/chunked processing | Real-data retained-surface, ledger and mesh-to-source figures exist for both sample resolutions; ledger balances to the sample; working memory ≤ 512 MB, RSS ≤ 1.5 GB on the 14.5 M-point station |
-| **2** | Real-data baseline: Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first** | Both numbers published with the commands that produced them; LAZ quantisation status stated |
-| **3a** | **Comparison vertical slice.** Mode A only, one station against the IFC, JSON out, no heat map, no site aggregation | A signed deviation number per model element, traceable to scan points, with the georeferencing checks passing on the real IFC |
+| **1** | QA rework (§6) + streamed/chunked processing + **the `FINDING-003` isolation matrix** + a clean-checkout smoke gate | Real-data retained-surface, ledger and mesh-to-source figures for both sample resolutions; ledger balances to the sample; working memory ≤ 512 MB and measured peak RSS ≤ 1.5 GB on the 14.5 M-point station; the geometric-tail cause **identified by stage**; CLI, benchmark and inventory tools all run from a clean checkout |
+| **2** | Real-data baseline: Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first.** Obtain the scanner identity and registration report | Both numbers published with the commands that produced them; LAZ quantisation status stated; scanner and registration evidence recorded, or their absence recorded |
+| **3a** | **Comparison vertical slice.** Mode A only, one station against the IFC, JSON out, no heat map, no site aggregation. Built on the **observation-set interface** (`docs/adr/ADR-007`) | A signed deviation number per model element, traceable to scan **observations**, georeferencing checks passing on the real IFC, and the **decimation-invariance test in place** |
 | **3b** | Error-bounded decimation + LOD chain + tiled incremental writing | Every LOD within its stated deviation budget on real data; §4.1 met; memory budgets held with output streamed, per `docs/adr/ADR-006` |
 | **4** | RMX container, browser first paint, progressive refinement, texture | First paint ≤ 1 s at 10 Mbit under the §11 test contract; 30-station site navigable at a stated frame rate; package size beats Cairn at equal or better measured fidelity |
 | **5** | Site-level comparison: modes B and D, heat map both targets, full report | Heat map matches its own JSON exactly; grey correct on known-occluded surfaces; element attribution correct; denominators documented |
@@ -421,9 +457,17 @@ One suite, identical source datasets, results committed to `benchmarks/`.
 Scheduled by the phase that can first produce each figure — a browser metric
 cannot exist before phase 4.
 
+A **clean-checkout smoke gate** runs continuously from phase 1: the CLI, the
+benchmark and the inventory tools must each execute from their documented
+locations on a fresh clone. This catches missing dependencies and standard
+library shadowing. It exists because `tools/inspect.py` shadowed Python's
+stdlib `inspect` and broke every script run from `tools/`.
+
 | Metric | First available |
 |---|---|
 | Source size, point count, lattice tier | Now |
+| Layered noise sweep: 0, 1, 2, 3, 5 mm sigma, layers 1–4 | Phase 1 |
+| Tile-size sweep: memory, output size, locked-boundary %, seam-local max deviation, cracks, decimation ratio, LOD0 bytes and decode time | Phase 3b |
 | Processing time, peak RSS, working memory | Phase 1 |
 | RMS, p99.9, max — retained-surface **and** mesh-to-source | Phase 1 |
 | Filtering ledger completeness | Phase 1 |
@@ -497,8 +541,9 @@ evidence that measurements are traced to.
 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review, 1 Aug 2026. Requirements, not commentary |
 | `FINDING-001-PDAL-QUANTISATION.md` | Cairn likely quantising E57 imports to 1 cm |
 | `FINDING-002-QA-DEFINITION.md` | The deviation report measures the wrong thing |
+| `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 tail is geometric; cause not yet identified |
 | `CAIRN-MESH-MEMORY-ISSUE.md` | The production defect phase 0 fixes |
-| `docs/adr/ADR-001` … `ADR-005` | Decisions taken, with reasoning |
+| `docs/adr/ADR-001` … `ADR-007` | Decisions taken, with reasoning |
 | `docs/HANDOVER.md` | Cold-start brief for an implementation session |
 | `CLAUDE.md` | Charter. Read every session |
 

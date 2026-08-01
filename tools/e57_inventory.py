@@ -1,5 +1,5 @@
 import sys, re, os, json
-sys.path.insert(0,'/sessions/ecstatic-sharp-keller/mnt/outputs/tools')
+sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent))
 from e57_xml import read_e57_xml
 
 def g(x, tag):

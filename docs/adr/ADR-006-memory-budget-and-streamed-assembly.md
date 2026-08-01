@@ -52,12 +52,33 @@ resolution, which is the project's entire premise.
 | Budget | Value | Meaning |
 |---|---|---|
 | **Processing working memory** | **≤ 512 MB** | Everything resident during a station's processing, *excluding* output written incrementally to disk |
-| **Peak process RSS** | **≤ 1.5 GB**, hard `RLIMIT_AS` in the child | The enforced ceiling. Sized to fit alongside the web server on a 4 GB host |
+| **Measured peak RSS** | **≤ 1.5 GB** | The acceptance gate. Sized to fit alongside the web server on a 4 GB host |
 
 Both are asserted by tests on the largest real sample station, not on fixtures.
 
-The working-memory figure is the one the architecture is designed around. The
-RSS ceiling is the safety net that makes an overrun fail its own job.
+### Three enforcement mechanisms, all different
+
+**`RLIMIT_AS` does not enforce an RSS ceiling.** It bounds virtual address
+space, which is not physical resident memory. Documentation must never conflate
+them. Large NumPy allocations are mmap'd, so address space can far exceed RSS;
+calibrating the limit is empirical, not arithmetic.
+
+| Mechanism | Bounds | Failure mode | Role |
+|---|---|---|---|
+| `RLIMIT_AS`, calibrated | Virtual address space | `MemoryError` — **catchable** | Fail-safe. Gives a graceful abort with a traceback, a recorded peak and a clean project failure status, rather than a silent kill |
+| RSS watchdog polling `/proc/self/status` `VmRSS` | Actual resident | Voluntary termination | The measured acceptance gate, and deployment-independent |
+| Job-specific cgroup limit | Actual resident | SIGKILL | The hard physical boundary |
+
+The original incident was a **cgroup** OOM (`Memory cgroup out of memory` in
+`dmesg`), so the physical boundary already exists in the deployment. It simply
+was not scoped per job.
+
+The per-job cgroup is a **phase 0b stretch, not an entry requirement**,
+provided phase 0a has disabled the live endpoints and phase 0b proves that
+`RLIMIT_AS` plus the RSS watchdog protects uvicorn under the actual Lightsail
+container limit. Per-job cgroups on that host mean either a short-lived
+container per job, which needs Docker socket access and carries its own
+security question, or cgroup v2 sub-hierarchy delegation. Neither is free.
 
 ## Decision 2 — Nothing full-resolution is ever fully materialised
 
@@ -77,9 +98,57 @@ Consequences:
   leaves a one-row seam, which is subtle enough to ship by accident.
 - **Output is written incrementally as spatial tiles**, not assembled and then
   saved.
-- **Error-bounded decimation must be able to run per band or per tile**, with a
-  documented reconciliation at tile boundaries. A global quadric decimator over
-  a 24.5 M-triangle mesh is exactly what this ADR exists to prevent.
+- **Error-bounded decimation must be able to run per band or per tile.** A
+  global quadric decimator over a 24.5 M-triangle mesh is exactly what this ADR
+  exists to prevent. The boundary strategy is specified below and is not
+  optional.
+
+## Decision 2a — Tile boundary strategy
+
+Independent per-tile decimation creates cracks, T-junctions and inconsistent
+LOD transitions where tiles meet. The strategy is explicit:
+
+| Element | Requirement |
+|---|---|
+| **Halo** | Each tile is decimated with a halo of neighbouring geometry present, so error metrics near the edge see the real surface rather than an artificial boundary |
+| **Locked boundary vertices** | Vertices on a shared tile boundary are not collapsed. Both neighbours therefore agree on the boundary ring exactly |
+| **Deterministic ownership** | A shared vertex or triangle belongs to exactly **one** tile, by a rule that does not depend on processing order or thread scheduling — for example lowest tile index by (x, y, z) of the tile origin. This is a **reproducibility requirement**, not only a correctness one: non-deterministic ownership means identical inputs produce non-identical output, which breaks a non-negotiable |
+| **Stitching** | Where adjacent tiles carry different LOD levels, the transition must not leave T-junctions. Either constrain neighbouring tiles to adjacent LOD levels, or emit explicit stitch geometry |
+| **Cross-tile QA** | Measured **seam-locally**, in a band around each boundary. A site-wide average hides a crack completely. Report seam-local maximum deviation, not just seam-local mean |
+
+### The cost this creates, stated plainly
+
+**Locked boundaries never simplify.** With many tiles the output accumulates a
+lattice of full-resolution seams running through the surface, which eats
+directly into the size budget that decimation exists to serve.
+
+That produces a three-way tension:
+
+- **smaller tiles** → lower peak working memory, but more locked-boundary
+  vertices and a larger share of undecimated geometry;
+- **larger tiles** → fewer seams and better decimation ratio, but higher peak
+  working memory, which is the constraint that forced tiling in the first
+  place;
+- **streaming granularity** → smaller tiles give finer view-dependent loading
+  and faster first paint; larger tiles give fewer requests.
+
+**Tile size is therefore a measured parameter, not a chosen constant.**
+
+### Phase 3b tile-size benchmark
+
+Run across a range of tile sizes on the largest real station and record:
+
+- peak working memory
+- total output size
+- percentage of locked boundary vertices
+- seam-local maximum deviation
+- cracks or normal discontinuities detected
+- decimation ratio
+- LOD0 tile size and decode time
+
+**Time to first paint is not measurable at 3b.** It requires RMX and the
+browser, which is phase 4. LOD0 tile bytes and decode time are the honest
+proxies at 3b; TTFP is confirmed at 4.
 
 ## Decision 3 — Tiled and streamed writing moves earlier
 

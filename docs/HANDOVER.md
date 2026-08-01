@@ -187,6 +187,11 @@ and **peak RSS ≤ 1.5 GB** enforced by `RLIMIT_AS`.
 - [ ] Coordinate precision test at real MGA Zone 55 values
 - [ ] Every report states its source of truth, whether figures are exact or
       sampled, source hash, version, settings, exclusions, time and peak memory
+- [ ] **`FINDING-003` isolation matrix run, and the geometric-tail cause
+      identified by stage.** Do not reprioritise filtering or triangulation
+      work before it
+- [ ] Clean-checkout smoke gate: CLI, benchmark and inventory tools all run
+      from their documented locations on a fresh clone
 - [ ] `CLAUDE.md` §5 and §9 updated
 
 Then stop and report the numbers.

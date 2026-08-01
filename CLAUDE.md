@@ -110,9 +110,10 @@ ever need to meet.** Fixed acceptance test.
 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review. Requirements, not commentary |
 | `FINDING-001-PDAL-QUANTISATION.md` | Cairn likely quantising imports to 1 cm |
 | `FINDING-002-QA-DEFINITION.md` | The deviation report measures the wrong thing |
+| `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 tail is geometric; cause not yet identified |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's mesher does |
 | `CAIRN-MESH-MEMORY-ISSUE.md` | The production defect phase 0 fixes |
-| `docs/adr/ADR-001` … `ADR-006` | Decisions taken |
+| `docs/adr/ADR-001` … `ADR-007` | Decisions taken |
 | `docs/HANDOVER.md` | Cold-start brief |
 
 ## 8. Known traps — all confirmed in the real files
@@ -144,8 +145,10 @@ ever need to meet.** Fixed acceptance test.
 | 6 | NavVis raw has no point cloud, no georeferencing, unstitched panoramas | Phase 6 |
 | 7 | Station-to-station registration residuals not supplied | Any future fused display surface |
 | 8 | FINDING-001 unconfirmed against a real Cairn LAZ | Phase 2 baseline interpretation. If Cairn quantises to 1 cm, the baseline is against a handicapped opponent and must say so |
-| 9 | Synthetic p99.9 is 3.55 mm against a 3.2 mm budget at the 10 mm floor | The acceptance test at the tolerance floor. Passes at 25 mm default (budget 8.0 mm) |
+| 9 | **Passes the 25 mm default-tolerance budget and fails the 10 mm minimum-tolerance budget.** Tail is geometric; noise and carving eliminated; **stage not yet identified** | Phase 1 isolation matrix. See `FINDING-003` |
 | 10 | Per-station output scales package size with station count, not site area | Browser first paint and package-size targets. Measure at phase 4 |
+| 11 | Scanner identity and registration report for 02516.182 not obtained | Any statement about minimum defensible tolerance for the reference data. Phase 2 |
+| 12 | Combination method for minimum defensible tolerance undefined | The computed project-specific floor. Different statistics, different confidence levels; do not simply add them |
 
 ## 10. Reference data
 
@@ -161,6 +164,13 @@ Model\25199S - Ampol Tallarook Southbound.ifc           12.2 MB, IFC2X3
 ## 11. What not to do
 
 - Do not quote synthetic-fixture numbers as real-data results.
+- Do not attribute a cause without isolating the stage. The p99.9 tail was
+  nearly blamed on grazing incidence from one per-feature line. Measurement
+  eliminated noise and carving; the cause is still unknown.
+- Do not describe the fixture's 2 mm sigma as a property of 02516.182. It is a
+  documented test parameter. The instrument is unknown.
+- Do not say `RLIMIT_AS` enforces RSS. It bounds virtual address space.
+- Do not feed a display mesh to the comparison engine (`docs/adr/ADR-007`).
 - Do not claim RapidMesh already matches or beats TurboMesh. It is *intended*
   to. Benchmark evidence first (`00-PRODUCT-DEFINITION.md` §8A, §8B).
 - Do not build decimation before the QA rework.
