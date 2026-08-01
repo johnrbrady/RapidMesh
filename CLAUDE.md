@@ -66,8 +66,8 @@ code being finished.
 
 | Phase | Deliverable | Status |
 |---|---|---|
-| 0a | **Endpoint safety.** Disable/gate `build_meshes` + `build_vantage_meshes` at the server. Frontend removal is not protection | **NOT STARTED — do this first** |
-| 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | NOT STARTED |
+| 0a | **Endpoint safety.** Disable/gate `build_meshes` + `build_vantage_meshes` at the server. Frontend removal is not protection | **DONE** 2 Aug 2026 — Cairn `b514f4b`. Both 404 unless `CAIRN_ENABLE_MESH_ROUTES=1`; gate test proven to fail against the pre-fix code first |
+| 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | **IN PROGRESS** |
 | 1 | QA rework (3 reports) + streamed/chunked processing | NOT STARTED |
 | 2 | Real-data baseline, Cairn vs RapidMesh. Confirm `FINDING-001` first | NOT STARTED |
 | 3a | Comparison vertical slice: mode A, one station vs IFC, JSON only | NOT STARTED |
