@@ -367,13 +367,68 @@ inside the uvicorn worker. The rule that follows:
 | Control | Value |
 |---|---|
 | Isolation | `subprocess`, matching the existing PDAL / PotreeConverter pattern |
-| Memory limit | `RLIMIT_AS` in the child, below the container ceiling |
+| Memory limit | `RLIMIT_AS` in the child, below the container ceiling. **Per workload, not one global value** |
 | Pre-flight ceiling | Size and point count checked before spawning |
-| Failure semantics | Job fails, scan stays converted, `/api/health` keeps answering 200 |
+| Failure semantics | Job fails; scan stays converted; explicit failure status on the project; **no automatic retry loop**; `/api/health` keeps answering 200 |
 
-Applies to all three Cairn call sites, not only the one that crashed. Fixing
-one leaves the actual Phase 3 deliverable carrying the identical risk on the
-identical file.
+**The three Cairn paths are different workloads and need different limits.**
+
+| Path | Workload | Implication |
+|---|---|---|
+| `conversion.run_conversion` | One station | Smallest limit. Currently disabled and stays disabled |
+| `routers/models.py build_meshes` | **Every scan in a project, loaded simultaneously** | Limit scales with project size, or the design changes to sequential |
+| `routers/models.py build_vantage_meshes` | May load an entire registered cloud before creating vantage points | Largest limit. This is the path the Ampol file would exercise |
+
+A single global limit either strangles the small path or fails to protect
+against the large one.
+
+### Endpoint safety comes before isolation
+
+Isolation is real engineering and takes time. The two remaining routes are a
+production availability risk **now**, and their frontend buttons being removed
+does not protect them — they are still reachable by direct call.
+
+**First action: disable or authorise-gate `build_meshes` and
+`build_vantage_meshes` at the server**, with a test proving an unauthorised
+direct call cannot reach `mesher.py`. Then build isolation, then re-enable
+behind it.
+
+---
+
+## Streamed assembly — nothing full-resolution is materialised
+
+Measured (`docs/adr/ADR-006`): a finished full-resolution mesh for one
+high-resolution station is **628.9 MB of output alone**, and the whole sample
+site is **397 M triangles, 10.21 GB**.
+
+**A full-resolution native mesh is a processing intermediate. It is never a
+deliverable.** Decimation is therefore structural, not a tuning knob.
+
+The band interface in `grid.py` already makes memory independent of scan
+height. That property extends through the whole pipeline:
+
+```
+read band -> filter -> triangulate -> QA -> decimate -> write tile -> release
+```
+
+- Triangulation, QA and decimation all become band-local. Cross-band
+  correctness needs the same overlap discipline already documented above:
+  triangulation overlap 1, despeckle halo 1. The wrong overlap leaves a one-row
+  seam, subtle enough to ship by accident.
+- Output is written incrementally as spatial tiles, never assembled then saved.
+- Error-bounded decimation runs per band or per tile with documented boundary
+  reconciliation. A global quadric pass over 24.5 M triangles is precisely what
+  this design prevents.
+
+Two budgets, separately tested on the largest real station:
+
+| Budget | Value |
+|---|---|
+| Processing working memory, excluding incrementally written output | **≤ 512 MB** |
+| Peak process RSS, enforced by `RLIMIT_AS` | **≤ 1.5 GB** |
+
+Memory is recovered by chunking, streaming, tiling and removing verified
+duplicate allocations. **Never** by narrowing world coordinates to f32.
 
 ---
 

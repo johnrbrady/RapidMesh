@@ -167,9 +167,14 @@ Maximum deviation is always reported and never capped.
 | Real detail preserved | Door frames, handrails, window reveals survive filtering | Synthetic fixtures with known edges |
 | Mover removal | ≥ 95% of transient points dropped | Synthetic scan with a scripted moving object |
 | False positives from mover removal | ≤ 0.1% of static surface points dropped | Same fixture |
-| Peak RSS per station | ≤ 512 MB | Measured on the largest real sample station |
+| **Processing working memory** | **≤ 512 MB** | Resident during processing, excluding incrementally written output. Measured on the largest real sample station |
+| **Peak process RSS** | **≤ 1.5 GB**, enforced by `RLIMIT_AS` | The hard ceiling. Sized to sit alongside the web server on a 4 GB host |
 | Time to first paint, browser | ≤ 1 s on a 10 Mbit link | LOD0 tier size budget, test contract per `RAPIDMESH-REVIEW-FINDINGS.md` §11 |
 | Size per site | Beat Cairn at equal or better deviation | Same scans, same components counted |
+
+The single flat "512 MB peak RSS" figure previously stated here was wrong. A
+finished full-resolution mesh for one high-resolution station is **628.9 MB of
+output alone**, before working memory. See `docs/adr/ADR-006`.
 
 ### 4.3 State of the evidence — read this before quoting any number above
 
@@ -185,10 +190,23 @@ sample becomes a mesh vertex, so point-to-mesh distance is trivially zero for
 mesh built from these points". Real data has no analytic truth to substitute.
 
 **Measured memory:** 1,418 MB peak reading one 14.5 M-point station; 1,747 MB
-for the full pipeline on a 2.95 M-point station. The 512 MB target is **not
-currently met**.
+for the full pipeline on a 2.95 M-point station. Neither budget is currently
+met.
 
-Until §5's QA rework lands, **no real-data fidelity claim may be made.** The
+**Known gap against the acceptance test.** The best synthetic result is
+1.00 mm RMS / **3.55 mm p99.9**. The derived budget at the 10 mm tolerance
+floor is 1.0 mm RMS / **3.2 mm p99.9**. RMS passes; **p99.9 misses by 11%**.
+
+Stated precisely, because the distinction matters: at the 25 mm default
+tolerance the p99.9 budget is 8.0 mm and 3.55 mm passes with margin. The miss
+is at the 10 mm floor only, and the synthetic fixture carries 2 mm range sigma,
+so part of that tail is instrument noise rather than mesh error. It is still a
+miss against a stated acceptance test and is tracked as open item 9 in
+`CLAUDE.md` §9. Resolution options, in order of preference: improve the mesher;
+separate instrument noise from mesh error in the metric; or raise the tolerance
+floor. Do not quietly widen the budget.
+
+Until §6's QA rework lands, **no real-data fidelity claim may be made.** The
 targets stand; the evidence for them is narrower than this document previously
 implied.
 
@@ -320,20 +338,151 @@ truth and whether figures are exact or sampled.
 
 Each phase produces a number before the next begins.
 
-| Phase | Deliverable | Gate |
-|---|---|---|
-| **0** | Cairn memory fix: subprocess isolation, `RLIMIT_AS`, remove the redundant f64 copy, pre-flight ceiling, all three call sites | 1.77 GB file fails its own job only; `/api/health` answers 200 throughout |
-| **1** | QA rework (§6) + chunked E57 reading | Real-data retained-surface and mesh-to-source figures exist; ≤ 512 MB on the 14.5 M-point station |
-| **2** | Cairn baseline + first real comparison | Measured RapidMesh vs `mesher.py` on the same file, same metric |
-| **3** | Error-bounded decimation, LOD chain | Every LOD within its stated budget; §4.1 met on real data |
-| **4** | IFC import, modes A + D, site-level heat map and report | Heat map matches its own JSON; grey correct on known-occluded surfaces |
-| **5** | RMX container, browser first paint, texture | First paint ≤ 1 s; size beats Cairn at equal fidelity |
-| **6** | NavVis B1, then B2 | Per `docs/adr/ADR-003`, `ADR-004` |
-| **7** | Cairn integration | Legacy projects open; RapidMesh disableable; export restrictions enforced |
+Every phase ends with a **measured result and a pass/fail gate**, not with code
+being finished.
 
-Phase ordering changed on 2 Aug 2026. QA and memory moved ahead of decimation
-because `FINDING-002` showed there is currently no real-data number to
-decimate against.
+| Phase | Deliverable | Gate — all must pass |
+|---|---|---|
+| **0a** | **Endpoint safety, today.** Disable or authorise-gate `build_meshes` and `build_vantage_meshes` at the server, not the frontend. Automatic meshing stays off | Both routes return 403/404 to an unauthorised direct call, proven by test. No route can reach `mesher.py` from an ordinary request |
+| **0b** | Job isolation. Child process, per-workload `RLIMIT_AS`, pre-flight ceiling, no retry loop | 1.77 GB file fails its own job; `/api/health` 200 throughout; other projects viewable; scan preserved; explicit failure status; `dmesg` shows the child killed, not uvicorn |
+| **1** | QA rework (§6) + streamed/chunked processing | Real-data retained-surface, ledger and mesh-to-source figures exist for both sample resolutions; ledger balances to the sample; working memory ≤ 512 MB, RSS ≤ 1.5 GB on the 14.5 M-point station |
+| **2** | Real-data baseline: Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first** | Both numbers published with the commands that produced them; LAZ quantisation status stated |
+| **3a** | **Comparison vertical slice.** Mode A only, one station against the IFC, JSON out, no heat map, no site aggregation | A signed deviation number per model element, traceable to scan points, with the georeferencing checks passing on the real IFC |
+| **3b** | Error-bounded decimation + LOD chain + tiled incremental writing | Every LOD within its stated deviation budget on real data; §4.1 met; memory budgets held with output streamed, per `docs/adr/ADR-006` |
+| **4** | RMX container, browser first paint, progressive refinement, texture | First paint ≤ 1 s at 10 Mbit under the §11 test contract; 30-station site navigable at a stated frame rate; package size beats Cairn at equal or better measured fidelity |
+| **5** | Site-level comparison: modes B and D, heat map both targets, full report | Heat map matches its own JSON exactly; grey correct on known-occluded surfaces; element attribution correct; denominators documented |
+| **6** | NavVis B1, then B2 | Per `docs/adr/ADR-003`, `ADR-004` |
+| **7** | Cairn integration | Legacy projects open; RapidMesh disableable; export restrictions enforced; comparison UI performs |
+
+**Two ordering decisions worth defending.**
+
+Phase 0 splits. Isolation is real engineering and takes time; the two live
+routes are a production availability risk *today*. Disabling them is hours of
+work and does not depend on isolation being finished.
+
+Phase 3a exists because the comparison report is the commercial deliverable and
+would otherwise sit behind decimation, RMX and browser streaming — three
+substantial phases — before anyone learns whether it works. A thin slice is
+cheap (BVH plus nearest-surface distance) and can run against the existing
+full-resolution mesh. It is far better to discover an IFC georeferencing or
+correspondence problem at phase 3 than at phase 5.
+
+---
+
+## 8A. Parity targets — what "TurboMesh or better" means
+
+RapidMesh is the processing engine. **The customer experience is RapidMesh
+operating through Cairn**: upload, processing, browser streaming, navigation,
+measurement, model comparison and reporting.
+
+Cintoo and TurboMesh are a **public capability benchmark only**. Nothing is
+copied, examined or reverse-engineered. We compete against published outcomes
+using our own architecture and our own measurements.
+
+**We may state that RapidMesh is intended to compete with or exceed TurboMesh.
+We may not state that it does until benchmark evidence exists.**
+
+### Parity — the table stakes
+
+| Target | Measured how |
+|---|---|
+| Per-station multiresolution meshes | LOD chain with per-level deviation budgets |
+| Fast first paint, then progressive refinement | ≤ 1 s at 10 Mbit under the §11 test contract |
+| Smooth navigation across a many-station project | Stated frame rate and GPU memory on the 30-station sample site, on named hardware |
+| Fine features survive: handrails, door frames, window reveals, pipes, openings | Synthetic fixtures with analytic edges, plus named real features |
+| Scan colour and texture where the source supports it | 4 of 30 sample stations have no RGB; `images2D` empty on all 31. Report the limitation, do not fabricate |
+| Measurements traceable to the original scan | Never to a decimated display mesh unless stated with its simplification error |
+| Model overlay and scan-to-model comparison | §3A |
+| Structured TLS and NavVis through appropriate pipelines | §5.1 |
+| Processing cannot take Cairn offline | Phase 0 gate |
+
+### Differentiators — where we intend to be ahead
+
+1. Published **mesh-to-source** QA, not just point-to-mesh.
+2. Error-bounded decimation with the achieved error measured, not assumed.
+3. A filtering and coverage ledger accounting for every input sample exactly
+   once.
+4. Site-level, element-attributed model comparison.
+5. Auditable green / red / **grey** tolerance reporting, with grey never
+   silently folded into red.
+6. Complete provenance and reproducibility on every report.
+7. No silent ICP. Set-out errors are never concealed by alignment.
+8. Native structured-lattice processing before any simplification.
+9. Source point clouds protected from client export while authorised mesh
+   outputs and reports remain available.
+
+These are the claims to defend. Each needs a benchmark row in §8B.
+
+---
+
+## 8B. Controlled benchmark suite
+
+One suite, identical source datasets, results committed to `benchmarks/`.
+Scheduled by the phase that can first produce each figure — a browser metric
+cannot exist before phase 4.
+
+| Metric | First available |
+|---|---|
+| Source size, point count, lattice tier | Now |
+| Processing time, peak RSS, working memory | Phase 1 |
+| RMS, p99.9, max — retained-surface **and** mesh-to-source | Phase 1 |
+| Filtering ledger completeness | Phase 1 |
+| Cairn vs RapidMesh on the same file | Phase 2 |
+| Output size, compression ratio | Phase 3b |
+| Fine-feature survival; opening and occlusion preservation | Phase 3b |
+| Time to first paint; time to usable detail | Phase 4 |
+| Browser frame rate, GPU memory | Phase 4 |
+| Measurement differences against the original E57 | Phase 4 |
+| Scan-to-model classification correctness | Phase 5 |
+| Behaviour on unsupported, corrupt and exceptionally large files | Continuous from phase 1 |
+
+Every row records the command that produced it and the commit it ran at.
+
+---
+
+## 8C. Comparison engine — what must be defined, and when
+
+The comparison report is the commercial differentiator, so its behaviour is
+product definition rather than implementation detail. But specifying all of it
+before writing any of it is documentation instead of code, which §7 forbids.
+Split accordingly.
+
+**Decide before phase 3a, because these change the architecture:**
+
+1. **Site-level observation selection** across stations — nearest, best
+   incidence angle, shortest range, or a combination. Documented, testable,
+   recorded in the report.
+2. **Grey classification** — the visibility and occlusion test that separates
+   "not observed" from "wrong". Grey is never automatically red.
+3. **Denominators and exclusions** — what "91.4% of scanned surface" is a
+   percentage *of*, and which samples are excluded from it.
+4. **Attribution** — element, storey and category, from IFC `GlobalId`.
+
+**Decide during phase 5, with measurement, because a guess now would be
+arbitrary:**
+
+model and scan coordinate validity checks · normal-angle acceptance ·
+overlapping and contradictory observations · ambiguous correspondence ·
+model-surface sampling density · weighting by area versus scan samples versus
+elements · signed-deviation confidence · behaviour when registration quality is
+unknown · behaviour when the model and scan disagree grossly.
+
+Each is answered in the report it appears in, with the rule stated.
+
+---
+
+## 8D. Unified site mesh — deferred, not cancelled
+
+Per-station geometry is the correct first release: it preserves the original
+evidence and cannot hide registration error (`docs/adr/ADR-005`).
+
+A seamless display surface is part of the expected experience of comparable
+products and stays on the roadmap. It remains deferred until station-to-station
+registration residuals can be measured and reported.
+
+**Condition, non-negotiable:** a future unified surface is **display only**. It
+never produces numbers, and it never replaces or obscures the per-station
+evidence that measurements are traced to.
 
 ---
 

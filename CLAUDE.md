@@ -61,14 +61,19 @@ Comparison and reporting are per site** (`docs/adr/ADR-005`).
 
 ## 5. Phase tracker — update this
 
+Every phase ends with a **measured result and a pass/fail gate**, never with
+code being finished.
+
 | Phase | Deliverable | Status |
 |---|---|---|
-| 0 | Cairn memory fix: subprocess isolation, rlimit, remove redundant f64 copy, ceiling, all 3 call sites | **NOT STARTED** |
-| 1 | QA rework (3 reports) + chunked E57 reading | **NOT STARTED — start here** |
-| 2 | Cairn baseline + first real comparison | NOT STARTED |
-| 3 | Error-bounded decimation, LOD chain | NOT STARTED |
-| 4 | IFC import, modes A + D, site-level heat map and report | NOT STARTED |
-| 5 | RMX, browser first paint, texture | NOT STARTED |
+| 0a | **Endpoint safety.** Disable/gate `build_meshes` + `build_vantage_meshes` at the server. Frontend removal is not protection | **NOT STARTED — do this first** |
+| 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | NOT STARTED |
+| 1 | QA rework (3 reports) + streamed/chunked processing | NOT STARTED |
+| 2 | Real-data baseline, Cairn vs RapidMesh. Confirm `FINDING-001` first | NOT STARTED |
+| 3a | Comparison vertical slice: mode A, one station vs IFC, JSON only | NOT STARTED |
+| 3b | Error-bounded decimation, LOD chain, tiled incremental writing | NOT STARTED |
+| 4 | RMX, browser first paint, progressive refinement, texture | NOT STARTED |
+| 5 | Site-level comparison: modes B + D, heat map, full report | NOT STARTED |
 | 6 | NavVis B1, then B2 | NOT STARTED |
 | 7 | Cairn integration | NOT STARTED |
 
@@ -107,7 +112,7 @@ ever need to meet.** Fixed acceptance test.
 | `FINDING-002-QA-DEFINITION.md` | The deviation report measures the wrong thing |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's mesher does |
 | `CAIRN-MESH-MEMORY-ISSUE.md` | The production defect phase 0 fixes |
-| `docs/adr/ADR-001` … `ADR-005` | Decisions taken |
+| `docs/adr/ADR-001` … `ADR-006` | Decisions taken |
 | `docs/HANDOVER.md` | Cold-start brief |
 
 ## 8. Known traps — all confirmed in the real files
@@ -123,6 +128,8 @@ ever need to meet.** Fixed acceptance test.
 | Deviation report includes island-culled points | Reports 50.84 mm RMS on data that is actually fine. See `FINDING-002` |
 | No decimation yet, so point-to-mesh is trivially zero | The metric proves nothing on real data until reworked |
 | `read_scan_raw` materialises whole scans | 1,418 MB for one 14.5 M-point station |
+| A full-res station mesh is **628.9 MB of output alone**; the site is 397 M tris / 10.21 GB | Full resolution is an intermediate, never a deliverable. Decimation is structural. See `docs/adr/ADR-006` |
+| Removing a frontend button does not disable a route | `build_meshes` and `build_vantage_meshes` are still callable directly |
 | The 3 scan datasets do **not** pair up | See `docs/DATA-INVENTORY.md` §5 before designing any test |
 
 ## 9. Open items and blockers — update this
@@ -136,7 +143,9 @@ ever need to meet.** Fixed acceptance test.
 | 5 | Observation-selection rule for site-level comparison undecided | Phase 4 |
 | 6 | NavVis raw has no point cloud, no georeferencing, unstitched panoramas | Phase 6 |
 | 7 | Station-to-station registration residuals not supplied | Any future fused display surface |
-| 8 | FINDING-001 unconfirmed against a real Cairn LAZ | Phase 2 baseline interpretation |
+| 8 | FINDING-001 unconfirmed against a real Cairn LAZ | Phase 2 baseline interpretation. If Cairn quantises to 1 cm, the baseline is against a handicapped opponent and must say so |
+| 9 | Synthetic p99.9 is 3.55 mm against a 3.2 mm budget at the 10 mm floor | The acceptance test at the tolerance floor. Passes at 25 mm default (budget 8.0 mm) |
+| 10 | Per-station output scales package size with station count, not site area | Browser first paint and package-size targets. Measure at phase 4 |
 
 ## 10. Reference data
 
@@ -152,7 +161,10 @@ Model\25199S - Ampol Tallarook Southbound.ifc           12.2 MB, IFC2X3
 ## 11. What not to do
 
 - Do not quote synthetic-fixture numbers as real-data results.
+- Do not claim RapidMesh already matches or beats TurboMesh. It is *intended*
+  to. Benchmark evidence first (`00-PRODUCT-DEFINITION.md` §8A, §8B).
 - Do not build decimation before the QA rework.
+- Do not materialise a full-resolution mesh in memory.
 - Do not touch Cairn beyond the phase 0 defect fix.
 - Do not examine, copy or reverse-engineer Cintoo or TurboMesh.
 - Do not write documentation instead of code. Every phase ends with a

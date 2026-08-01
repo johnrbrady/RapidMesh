@@ -91,24 +91,49 @@ pipeline. Target is 512 MB.
 Repo: `pointcloud-viewer`, branch `navvis-phase3-vvp-meshing`. Remediation of a
 live fault, not integration. Full account in `CAIRN-MESH-MEMORY-ISSUE.md`.
 
+**This is a production availability issue, not a performance issue.** The
+kernel killed uvicorn, taking down every user's session, not just one job.
+
+### 0a — Endpoint safety. Do this first; it is hours, not days.
+
+Automatic meshing was removed from uploads and **stays removed**. But two
+routes remain live and reachable by direct call:
+
+- `routers/models.py build_meshes` — loads every scan in a project
+  **simultaneously**
+- `routers/models.py build_vantage_meshes` — may load an entire registered
+  cloud
+
+Their frontend buttons were deleted. **That is not protection.** curl, a test,
+or a future UI still reaches them.
+
+Disable or authorise-gate both **at the server**. Do not wait for isolation.
+
+**Gate 0a:** an unauthorised direct call to either route returns 403/404,
+proven by test. No ordinary request path can reach `mesher.py`.
+
+### 0b — Job isolation
+
 1. **Subprocess-isolate the mesh step**, matching the existing `subprocess.run`
-   pattern for PDAL and PotreeConverter in `backend/converter.py`. Set
-   `RLIMIT_AS` in the child.
-2. **All three call sites**, not just the one that crashed:
-   `conversion.py run_conversion` (already removed, verify), `routers/models.py
-   build_meshes` (loads every scan in a project simultaneously), and
-   `routers/models.py build_vantage_meshes` (still live via direct API call).
+   pattern for PDAL and PotreeConverter in `backend/converter.py`.
+2. **`RLIMIT_AS` per workload, not one global value.** The three paths are
+   different workloads: one station, every scan in a project, and a whole
+   registered cloud. One limit either strangles the small path or fails to
+   protect against the large one.
 3. **Remove the redundant copy.** `load_points` ends with
    `.T.astype(np.float64)` on an array already f64. NumPy copies by default —
    **1.37 GB of pure waste** on the 56,950,017-point NavVis file. Use
    `copy=False` or drop the cast. **Do not narrow to f32**; the f64 is
    deliberate and load-bearing at MGA magnitudes.
 4. **Pre-flight size/point-count ceiling** before spawning.
+5. **No automatic retry loop.** A failed oversized job must not respawn itself.
 
-**Gate 0:** the 1.77 GB file fails its own job only; `/api/health` answers 200
-throughout; the scan stays converted; `dmesg` shows the child killed, not
-uvicorn; regression test proven to fail against the pre-fix code first; full
-existing gate re-run (pytest, ruff, `mypy --strict`, Playwright).
+**Gate 0b — all must pass:** the 1.77 GB file fails its own job only;
+`/api/health` answers 200 throughout, verified by polling during the run; other
+users can view other projects; the source scan remains available; the project
+shows an explicit failure status; no retry loop; `dmesg` shows the child
+killed, not uvicorn; a regression test proven to fail against the pre-fix code
+first; full existing gate re-run (pytest, ruff, `mypy --strict`, Playwright).
 
 Confirm every path against the current repository. Line numbers here are from
 1 Aug 2026 and may have moved.
@@ -135,21 +160,50 @@ decimate against.
 Each report states which dataset is the source of truth and whether figures are
 exact or sampled.
 
-**1b. Chunked E57 reading.** `pye57.read_scan_raw` materialises whole scans.
-The band interface in `grid.py` is already the right shape for the fix.
+**1b. Streamed and chunked processing.** `pye57.read_scan_raw` materialises
+whole scans. But chunked *reading* alone does not solve the problem: a finished
+full-resolution mesh for the high-res station is **628.9 MB of output on its
+own** (`docs/adr/ADR-006`). The whole pipeline must stream:
 
-**Gate 1:**
+```
+read band -> filter -> triangulate -> QA -> write tile -> release band
+```
 
-- [ ] Real-data retained-surface and mesh-to-source figures exist for
+The band interface in `grid.py` is already the right shape. Two budgets, tested
+separately: **working memory ≤ 512 MB** excluding incrementally written output,
+and **peak RSS ≤ 1.5 GB** enforced by `RLIMIT_AS`.
+
+**Gate 1 — all must pass:**
+
+- [ ] Real-data retained-surface **and mesh-to-source** figures for both
       `02516.182_6.e57` and `02516.182_1.e57`
-- [ ] Filtering ledger balances: every input sample in exactly one category
-- [ ] Peak RSS ≤ 512 MB on the 14.5 M-point station, asserted in a test
+- [ ] Filtering ledger balances: every input sample in exactly one category,
+      summing to the input count
+- [ ] Working memory ≤ 512 MB and peak RSS ≤ 1.5 GB on the 14.5 M-point
+      station, asserted in a test
+- [ ] Output written incrementally; no full-resolution mesh held in memory
 - [ ] All 30 structured stations process without error, both lattice
       resolutions, including the 4 without colour
 - [ ] Coordinate precision test at real MGA Zone 55 values
+- [ ] Every report states its source of truth, whether figures are exact or
+      sampled, source hash, version, settings, exclusions, time and peak memory
 - [ ] `CLAUDE.md` §5 and §9 updated
 
 Then stop and report the numbers.
+
+## 6A. After that, in order
+
+Full gates in `00-PRODUCT-DEFINITION.md` §8.
+
+| Phase | Deliverable |
+|---|---|
+| **2** | Real-data baseline, Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first** — if Cairn quantises to 1 cm, the comparison is against a handicapped opponent and the report must say so |
+| **3a** | Comparison vertical slice: mode A only, one station against the IFC, JSON out, no heat map. Cheap, and it de-risks the commercial premise early |
+| **3b** | Error-bounded decimation, LOD chain, tiled incremental writing |
+| **4** | RMX, browser first paint, progressive refinement, texture |
+| **5** | Site-level comparison: modes B and D, heat map both targets, full report |
+| **6** | NavVis B1, then B2 |
+| **7** | Cairn integration |
 
 ## 7. Reference data
 
