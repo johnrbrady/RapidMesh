@@ -1,0 +1,56 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rapidmesh"
+version = "0.1.0"
+description = "Survey-grade per-station mesh engine for terrestrial laser scans"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "John Brady" }]
+license = { text = "Proprietary" }
+
+dependencies = [
+    "numpy>=1.26",
+    "scipy>=1.11",
+]
+
+[project.optional-dependencies]
+# E57 reading. Kept optional so the numeric core stays importable and testable
+# without a native build toolchain — mirrors the lazy-import discipline in
+# rapidmesh/e57_reader.py.
+e57 = ["pye57>=0.4"]
+dev = [
+    "pytest>=8.0",
+    "mypy>=1.10",
+    "ruff>=0.5",
+]
+
+[project.scripts]
+rapidmesh = "rapidmesh.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "NPY"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+files = ["src/rapidmesh"]
+# numpy/scipy stubs are incomplete for the array-heavy kernels; the modules
+# below annotate their own dtypes explicitly rather than suppressing per-line.
+[[tool.mypy.overrides]]
+module = ["scipy.*", "pye57.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

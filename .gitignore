@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Scan data — never commit client data (00-PRODUCT-DEFINITION.md §7)
+*.e57
+*.las
+*.laz
+*.fls
+*.tzf
+*.rmx
+*.cmh
+data/
+scans/
+out/
+tmp/
+
+# Test fixtures that are generated, not authored
+tests/fixtures/generated/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Raw scanner recordings and imagery
+*.bag
+*.dng
+*.ifc
+*.rvt
