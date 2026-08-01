@@ -1,0 +1,464 @@
+# DATA-INVENTORY.md
+
+Measured inventory of the RapidMesh reference datasets. Every figure here was
+read directly from file headers on 1 Aug 2026. Nothing in this document is
+estimated or inferred from filenames.
+
+Source: `H:\Sample`. **No client data may be committed to the repository.**
+This document records metadata and counts only.
+
+Method: the E57 XML footer was extracted by seeking to `xmlPhysicalOffset` and
+stripping the 4-byte per-page CRC (`tools/e57_xml.py`). No point data was
+decoded. The IFC was inspected by text scan.
+
+---
+
+## 1. Structured terrestrial set
+
+`H:\Sample\Structured` — 30 files, 5.3 GB, project `02516.182`.
+
+### 1.1 Two resolution classes
+
+| | High-res | Medium |
+|---|---|---|
+| Files | 12 | 18 |
+| File numbers | 1, 2, 3, 4, 9, 11, 13, 15, 18, 20, 29, 30 | 5–8, 10, 12, 14, 16, 17, 19, 21–28 |
+| Lattice (cols × rows) | 6095 × 2387 or 6096 × 2387 | 2746 × 1075 |
+| Points per station | 14,548,765 / 14,551,152 | 2,951,950 |
+| File size | 363.5–363.6 MB | 64.9–73.8 MB |
+| Lattice fill | 100.0% | 100.0% |
+
+Total across the project: **approximately 227.7 million points**
+(12 × ~14.549 M + 18 × 2.951950 M).
+
+### 1.2 Point prototype
+
+All 30 stations store **spherical** coordinates:
+
+```
+sphericalRange       Float, precision="single"
+sphericalAzimuth     Float, precision="single"
+sphericalElevation   Float, precision="single"
+intensity            ScaledInteger 0..32767, scale 3.05185094759971923e-05
+colorRed/Green/Blue  Integer 0..255        (26 of 30 files)
+rowIndex             Integer 0..4294967295
+columnIndex          Integer 0..4294967295
+```
+
+**Consequences, all load-bearing:**
+
+- There are no cartesian fields. The file *is* a range image. Cartesian
+  coordinates are derived, not stored.
+- `rowIndex` and `columnIndex` are explicit. The native lattice does not need
+  to be reconstructed or guessed.
+- Files **6, 7, 8 and 14** have no colour (intensity only). XML length 3168 B
+  versus 3736–3740 B for the colour-bearing files. Any pipeline that assumes
+  RGB will fail on 4 of 30 stations.
+
+### 1.3 Line grouping — native column random access
+
+Every station carries:
+
+```xml
+<pointGroupingSchemes><groupingByLine>
+  <idElementName>columnIndex</idElementName>
+  <groups type="CompressedVector" recordCount="{cols}">
+    <prototype>
+      <startPointIndex .../>
+      <idElementValue .../>
+      <pointCount .../>
+```
+
+This gives per-column byte offsets into the point stream. Column-banded
+streaming is a native capability of these files, not something RapidMesh has
+to invent.
+
+### 1.4 Invalid returns
+
+There is **no** `sphericalInvalidState` or `cartesianInvalidState` element in
+any of the 30 files, and lattice fill is exactly 100.0%. Every lattice cell
+has a record. Invalid returns are therefore encoded in the values themselves,
+almost certainly `sphericalRange == 0`.
+
+**Action required:** the reader must define and validate its own
+invalid-return predicate against real data before any triangulation. This is
+an open item, not a settled fact. See `ARCHITECTURE.md` §3.2.
+
+### 1.5 Pose and georeferencing
+
+Each station carries a `pose` with a quaternion rotation and a float64
+translation. Sampled translations:
+
+```
+station 1   E 335767.803  N 5802251.244  H 90.286
+station 6   E 335787.751  N 5802256.424  H 90.244
+station 30  E 335785.543  N 5802270.975  H 90.267
+```
+
+MGA Zone 55. All 30 stations lie within roughly a 55 m × 25 m footprint,
+heights 90.15–90.31 m. A single, tight site.
+
+### 1.6 What is absent
+
+- `images2D` is **empty on all 30 stations**. No panoramic imagery.
+- No `coordinateMetadata`. The CRS is implied by the translation values, not
+  declared.
+- No `creationDateTime`, no timestamps.
+- No `sensorVendor`, no `sensorModel`, no station `name`.
+
+Scanner make and model are **not recoverable from these files**. The lattice
+dimensions (6096 × 2387 and 2746 × 1075) are the only fingerprint available.
+Do not assert Trimble X7, X9 or Faro anywhere in the codebase or
+documentation on the basis of this dataset.
+
+### 1.7 Angular resolution
+
+| | Cells | Horizontal step | Spacing @ 10 m | Spacing @ 20 m |
+|---|---|---|---|---|
+| Cairn fixed grid 2048 × 1024 | 2.10 M | 0.1758° | 30.7 mm | 61.4 mm |
+| Native medium 2746 × 1075 | 2.95 M | 0.1311° | 22.9 mm | 45.8 mm |
+| Native high-res 6095 × 2387 | 14.55 M | 0.0591° | 10.3 mm | 20.6 mm |
+
+Native versus fixed grid: **6.94× the cells** on high-res stations,
+**1.41×** on medium stations. The competitive claim is strong on 12 of 30
+stations and modest on 18 of 30. State it that way. See `adr/ADR-001`.
+
+---
+
+## 2. NavVis registered E57 export
+
+`H:\Sample\Navvis e57\25199_Ampol_Tallarook_250501-registered.e57`
+— 1,773,378,560 bytes.
+
+This is byte-for-byte the file that OOM-killed the uvicorn process on
+1 Aug 2026. See `../CAIRN-MESH-MEMORY-ISSUE.md`.
+
+### 2.1 Structure
+
+One `data3D` child, unstructured.
+
+```
+name                pointcloud-registered-BHNXAIZE.e57
+description         Generated by NavVis GmbH
+sensorVendor        NavVis
+e57LibraryVersion   LIB57 Foundation v1.0
+recordCount         56,950,017
+```
+
+Prototype:
+
+```
+cartesianX/Y/Z      Float, precision="single"
+nor:normalX/Y/Z     Float, precision="single"   (libE57 NOR extension)
+intensity           Float, precision="single", 0..1
+colorRed/Green/Blue Integer 0..255
+```
+
+### 2.2 Coordinates
+
+Points are stored in **local** coordinates:
+
+```
+x  -50.827 .. 57.826
+y  -30.123 .. 76.209
+z   -3.402 .. 19.673
+```
+
+with a single scan-level pose translating to MGA Zone 55:
+
+```
+E 331247.926902514  N 5896435.24255916  H 157.566989395794
+rotation quaternion w=-0.329200899, x=0, y=0, z=0.944259905
+```
+
+This is already the correct precision pattern: float64 origin, float32 local
+offsets. RapidMesh must preserve it, not undo it.
+
+### 2.3 Precomputed normals
+
+The file carries per-point normals via the libE57 `NOR` extension. This is
+significant: normal estimation is the slowest and least reliable stage of
+point-based surface reconstruction, and it is already done. NavVis
+reconstruction can consume these directly.
+
+Normals have not yet been validated for orientation consistency or for
+whether they are outward-facing relative to the sensor. That is a phase 5
+task.
+
+### 2.4 What is absent from this export
+
+The following are **not present** in the registered E57. Several of them *are*
+present in the raw recording described in §2A, but that is a different project
+and a different file format.
+
+- trajectory
+- per-point or per-sweep timestamps
+- per-point sensor origin or pose
+- sensor-head identifier
+- acquisition-session identifier
+- `images2D` — empty, so no panoramas
+- `coordinateMetadata` — empty
+- registration or loop-closure metadata
+- point classification
+
+A raw NavVis recording is now available and is inventoried separately in §2A.
+It is a **different project** and does **not** correspond to this export.
+
+### 2.5 Memory arithmetic for the OOM
+
+At N = 56,950,017, the current `backend/mesher.py:load_points` allocates:
+
+| Allocation | Size |
+|---|---|
+| laspy raw point record buffer (~34 B/pt with RGB) | ~1.94 GB |
+| `las.x`, `las.y`, `las.z` materialised as float64 | 3 × 455.6 MB = 1.37 GB |
+| `np.vstack([...])` | 1.37 GB |
+| `.T.astype(np.float64)` — copies despite matching dtype | 1.37 GB |
+| **Peak** | **> 4 GB** |
+
+Against a 3 GB cgroup ceiling. This fully explains `anon-rss:3105336kB` in the
+kernel log. The `.astype(np.float64)` call is 1.37 GB of pure waste on this
+file and is a one-line fix.
+
+---
+
+## 2A. NavVis raw recording
+
+`H:\Sample\Navvis raw\2025-09-11_01.03.56` — 3.0 GB.
+
+A complete NavVis device recording, not a processed export.
+
+### 2A.1 Dataset metadata (`dataset.json`)
+
+```
+name                     25409_S - 250911 - Run 1
+dataset_id               2025-09-11_01.03.56
+dataset_uuid             2c23a03f-ad0f-4dbf-a94d-48c05c81f91a
+dataset_type             rec
+dataset_version_layout   rec-v4
+device serial            G10-256
+software_release_rec     4.1.0-b56238-286398f8-bionic-release-4.1.0
+calibration_version_rec  C6.3 rev0
+
+trajectory_length        359.1480755198536 m
+capture_locations        49
+slam_anchors             6
+mapping_timestart        1757545442.3659256
+mapping_timeend          1757546405.2582184
+mapping_duration         962.8922927379608 s
+mapped_area              3284.62 m²
+mapped_area_v2_rec       1741.9956769155156 m²
+processed_panoramas      0
+depth_maps_version       1
+blurring_person          false
+```
+
+### 2A.2 Contents
+
+| Path | Contents | Size |
+|---|---|---|
+| `internal/bags/bag_laser_horiz_{0..16}.bag` | 17 raw horizontal LiDAR sweep bags | 594 MB |
+| `internal/bags/bag_laser_vert_{0..16}.bag` | 17 raw vertical LiDAR sweep bags | 493 MB |
+| `internal/bags/bag_2025-09-11-01-04-01.bag` | Main recording bag | 25.6 MB |
+| `internal/bags/sensor_analytics.bag` | | 1.7 MB |
+| `internal/trajectory_slam.bag` | Continuous SLAM trajectory | 4.5 MB |
+| `internal/artifacts/trajectory_local.bag` | Local trajectory | 1.85 MB |
+| `internal/slam_parameters.txt` | SLAM configuration | 35.8 KB |
+| `info/{00000..00048}-info.json` | 49 capture locations | |
+| `cam/{00000..00048}-cam{0..3}.dng` | 196 raw frames, 4 cameras | 1.9 GB |
+| `cam/cam{0..3}_params.csv` | Per-camera capture parameters | |
+| `anchors/` | `anchors.txt`, `anchor_poses.txt`, `anchor_poses_recorded.txt` | 12 KB |
+| `sensor_frame.xml` (+ `.sig`) | Sensor extrinsic and intrinsic calibration | 43.4 KB |
+| `maps/`, `qualitymap_rec.png` | SLAM quality maps | 5.9 MB |
+| `wifi/` | 49 WiFi fingerprint files | 456 KB |
+| `logs/` | NavVis, mapping, kernel and sensor analytics logs | 1.3 MB |
+| `dataset_manifest.json` | File manifest | 118 KB |
+| `trolley.cer` | Device certificate | 1.95 KB |
+
+### 2A.3 Sensor calibration (`sensor_frame.xml`)
+
+Eight sensors, each with a 6-DOF `Pose` (position vector + orientation
+quaternion), plus 168 intrinsic coefficients across the camera entries:
+
+```
+cam_head       Model G6-generic
+cam0           serial 22142265
+cam1           serial 22142271
+cam2           serial 22141728
+cam3           serial 22138946
+laser_horiz    serial 11506221699435
+laser_vert     serial 11506221691363
+imu            Model imu-v3, serial AV0JVF3U
+```
+
+Device model `G10`, stream controller `nv_StreamCtrl3`.
+
+This provides everything needed to transform a raw laser return into the
+device frame, and the trajectory transforms the device frame into the map
+frame. **Per-observation rays are reconstructable from this dataset.**
+
+### 2A.4 Capture locations (`info/*.json`)
+
+49 files, each containing:
+
+```json
+{ "cam_head":  { "position": [x,y,z], "quaternion": [w,x,y,z] },
+  "footprint": { "position": [x,y,z], "quaternion": [w,x,y,z] },
+  "timestamp": 1757545454.858455,
+  "valid": "true" }
+```
+
+Measured across all 49:
+
+```
+footprint bounds   x -37.15 .. 15.79   y -52.40 .. 0.13   z -1.13 .. 0.40
+polyline through capture locations   259.6 m
+first-to-last capture span           879.5 s
+```
+
+Against a reported `trajectory_length` of 359.1 m, so the 49 discrete stops
+are waypoints on a longer continuous path, not the path itself.
+
+### 2A.5 SLAM anchors
+
+`anchors.txt` lists 6 anchors, all flagged `use_for_alignment`,
+`use_for_verification` and `use_for_optimization` = true:
+
+```
+1757545468.745664613 "TDS10"
+1757545553.846199391 "TDS8"
+1757545770.764709258 "TDS9"
+1757546181.765607504 "TDS5"
+1757546260.189274408 "TDS4"
+1757546356.982391514 "TDS6"
+```
+
+**`anchor_poses.txt` contains no coordinate rows.** It holds only the format
+header and the version line `1.1`. The surveyed control point values were
+never entered into this file. Any georeferencing of this dataset happened
+downstream, and this recording carries no map-to-MGA transform.
+
+### 2A.6 Four blockers
+
+| # | Blocker | Consequence |
+|---|---|---|
+| 1 | **No point cloud.** Points exist only as raw sweeps in ROS bags | A cloud must be accumulated from laser bags + `sensor_frame.xml` extrinsics + interpolated trajectory. This reimplements part of NavVis IVION. Achievable, and the only route to true per-ray data, but it is a phase of its own |
+| 2 | **Different project.** `25409_S`, 11 Sep 2025 | Does not correspond to the `25199 Ampol Tallarook` E57 (1 May 2025) or to the IFC model. Gives format knowledge, not a joined comparison test case |
+| 3 | **`processed_panoramas: 0`** | 196 raw DNG frames, not stitched panoramas. Panorama navigation and texture baking require running stitching |
+| 4 | **No georeferencing** (§2A.5) | Map frame only. No MGA transform in the recording |
+
+### 2A.7 Dependency implication
+
+Reading this dataset requires ROS bag decoding. The `rosbags` Python package
+reads bag files without a ROS installation and is the expected route. Record
+it in the dependency and licence register when the raw path is scheduled.
+
+---
+
+## 3. Model
+
+`H:\Sample\Model\25199S - Ampol Tallarook Southbound.ifc` — 12,200,030 bytes.
+
+```
+FILE_SCHEMA        IFC2X3
+Authoring tool     Autodesk Revit 2024 (ENG), IFC exporter 24.3.20.34
+View definition    CoordinationView_V2.0
+Coordinate base    Shared Coordinates, Default Site
+Length unit        IFCSIUNIT(*,.LENGTHUNIT.,.MILLI.,.METRE.)  -> MILLIMETRES
+Precision          0.01 (IfcGeometricRepresentationContext)
+```
+
+### 3.1 Contents
+
+| Entity | Count |
+|---|---|
+| `IfcBuildingStorey` | 2 (Level 0 at 0 mm, Level 1 at 4000 mm) |
+| `IfcWallStandardCase` | 98 |
+| `IfcWall` | 67 |
+| `IfcSlab` | 58 |
+| `IfcMember` | 127 |
+| `IfcPlate` | 51 |
+| `IfcColumn` | 41 |
+| `IfcOpeningElement` | 53 |
+| `IfcExtrudedAreaSolid` | 464 |
+| `IfcFacetedBrep` / `IfcClosedShell` | 141 |
+| `IfcFace` | 58,382 |
+| `IfcPropertySet` | 1,552 |
+
+Roughly 600 products. Small and clean. Tessellation and BVH construction are
+not a performance concern for this model.
+
+### 3.2 Georeferencing — two traps in this actual file
+
+**Trap 1: magnitude.** The placement carries
+
+```
+IFCCARTESIANPOINT((331255332., 5896381927., 157228.))
+```
+
+in millimetres, i.e. MGA Zone 55 E 331,255.332 N 5,896,381.927 H 157.228.
+
+Northing 5.896 × 10⁹ mm sits between 2³² and 2³³, so a float32 ULP there is
+**512 mm**. In metres the figure is identical: 5.896 × 10⁶ m sits between 2²²
+and 2²³, ULP 0.5 m. Against a 25 mm tolerance that is **20× the quantity
+being measured**. Model geometry must be parsed to float64 and localised to a
+tile origin before any float32 buffer is touched.
+
+**Trap 2: false site coordinates.**
+
+```
+IFCSITE(... RefLatitude (51,30,23,112487), RefLongitude (0,-7,-37,-956022) ...)
+```
+
+51°30'23"N, 0°07'37"W. That is central London. It is Revit's untouched
+default and has nothing to do with Tallarook. Real georeferencing exists only
+in the placement chain. **Any importer that trusts `IfcSite` lat/long will
+mislocate this building by 16,000 km.**
+
+IFC2X3 has no `IfcMapConversion`, so there is no declared CRS to fall back on.
+
+### 3.3 Dataset pairing
+
+The model is `25199S — Ampol Tallarook Southbound`. Its placement
+(E 331,255 N 5,896,382) matches the **NavVis** dataset pose
+(E 331,248 N 5,896,435), roughly 7 m east and 53 m north — the expected
+offset between a project base point and a scan origin.
+
+The structured set `02516.182` sits at E 335,788 N 5,802,256, approximately
+**94 km south**. It is a different site.
+
+**Therefore:**
+
+- The only end-to-end testable comparison on current data is
+  **NavVis cloud versus IFC model**, using nearest-surface distance.
+- Scanner-ray comparison cannot be validated end to end until an IFC or
+  Revit model is supplied for site 02516.182.
+- Cross-validating NavVis reconstruction against terrestrial ground truth is
+  not possible with these two datasets.
+
+---
+
+## 4. Open items
+
+| # | Item | Blocks |
+|---|---|---|
+| 1 | Invalid-return predicate for structured E57 (§1.4) | Phase 1 |
+| 2 | Scanner make/model unidentifiable from headers (§1.6) | Documentation accuracy only |
+| 3 | NavVis normal orientation not yet validated (§2.3) | Phase 5 |
+| 4 | Raw recording has no point cloud; must be accumulated from ROS bags (§2A.6) | Phase 6 |
+| 5 | Raw recording is a different project from the E57 and the model (§2A.6) | Joined end-to-end NavVis comparison test |
+| 6 | Raw recording carries no georeferencing; `anchor_poses.txt` is empty (§2A.5) | Absolute positioning of raw-path output |
+| 7 | Panoramas not processed in the raw recording (§2A.6) | Imagery navigation and texture baking |
+| 8 | No model for site 02516.182 (§3.3) | Scanner-ray comparison validation |
+
+## 5. Dataset pairing summary
+
+| Dataset | Points | Rays / trajectory | Imagery | Model | Georeferenced |
+|---|---|---|---|---|---|
+| Structured 02516.182 (30 stations) | Yes | Rays implicit in spherical storage | No | **No** | Yes, MGA Z55 |
+| NavVis E57 25199 Ampol | Yes, with normals | No | No | **Yes** | Yes, MGA Z55 |
+| NavVis raw 25409_S | **No** | Yes | Raw DNG only | No | **No** |
+
+No single dataset carries everything. The only end-to-end comparison test
+available today is **NavVis E57 25199 versus the Ampol IFC**, using
+nearest-surface distance.

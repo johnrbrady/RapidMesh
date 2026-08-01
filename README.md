@@ -17,7 +17,11 @@ Never decimate first.** Everything else follows from that.
 
 ## Status
 
-Working end to end on synthetic fixtures. Not yet run on real client data.
+Working end to end on synthetic fixtures. **First run against real client data
+2 Aug 2026** — the reader works; the QA metric does not. See
+`FINDING-002-QA-DEFINITION.md`.
+
+### Synthetic fixtures, against analytic ground truth
 
 ```
              0.180 deg sampling     0.090 deg sampling     budget
@@ -31,6 +35,29 @@ Deviation is measured against **analytic geometry**, not against the input
 points — so it cannot be flattered by fitting the instrument's own noise. The
 fixture carries 2 mm range sigma and the mesh comes out below it, because a
 triangle averages three noisy vertices.
+
+### Real data
+
+**There is no real-data fidelity figure yet, and these numbers must not be
+quoted as one.** Real scans have no analytic truth to compare against, and the
+point-to-mesh metric is currently degenerate: with no decimation every retained
+sample *is* a mesh vertex, so 99.5% of distances are exactly zero. Fixing the
+QA definition is phase 1.
+
+What the first real run did establish:
+
+| | `02516.182_6` | `02516.182_1` |
+|---|---|---|
+| Points | 2,951,950 | 14,548,765 |
+| Lattice | 2746 × 1075 | 6095 × 2387 |
+| Tier | `e57-rowcol` | `e57-rowcol` |
+| Read time | 1.1 s | 6.9 s |
+| Peak RSS | 356 MB | **1,418 MB** |
+| Angular step | 0.1311° | 0.0591° |
+
+All 30 structured stations read at the exact `rowcol` tier. Native sampling is
+**2.98× finer than Cairn's fixed grid** on the high-resolution stations. Memory
+is the near-term problem: 1.4 GB for one station against a 512 MB target.
 
 Built: native structured-E57 reader, band-addressable native lattice,
 edge-preserving despeckle, cross-station occlusion carving with parallax
