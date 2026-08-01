@@ -1,48 +1,88 @@
-# HANDOVER.md — RapidMesh, cold start
+# HANDOVER.md — RapidMesh cold start
 
 Opening brief for an implementation session. Assumes no prior context.
 
 Written 2 August 2026, after the first run of RapidMesh against real client
-data.
+data and the architecture review that followed.
+
+---
+
+## 0. Paste this to start a session
+
+```
+Read these in full before doing anything, in this order:
+
+  CLAUDE.md
+  docs/HANDOVER.md
+
+They are the charter and the cold-start brief. The charter names the remaining
+documents and the order of authority. Re-read CLAUDE.md at the start of every
+session.
+
+Cairn repo (phase 0 only):  [PATH TO pointcloud-viewer]
+Reference data:             H:\Sample   read-only, never committed
+
+Start at phase 0a. Stop at the end of phase 1 and report the measured numbers.
+```
 
 ---
 
 ## 1. Read order
 
-1. `CLAUDE.md` — charter. Every session.
-2. `00-PRODUCT-DEFINITION.md` — highest authority.
-3. `ARCHITECTURE.md` — how the code is put together and why.
-4. `docs/DATA-INVENTORY.md` — measured facts about the real sample files.
-5. `FINDING-002-QA-DEFINITION.md` — **why phase 1 is what it is.**
-6. `RAPIDMESH-REVIEW-FINDINGS.md` — external review. Requirements, not
-   commentary.
-7. `docs/adr/ADR-001` … `ADR-005`.
-8. `REVIEW-CAIRN-MESHING.md`, `FINDING-001-PDAL-QUANTISATION.md`,
-   `CAIRN-MESH-MEMORY-ISSUE.md` — Cairn context.
+| # | Document | Why |
+|---|---|---|
+| 1 | `CLAUDE.md` | Charter. Every session |
+| 2 | `00-PRODUCT-DEFINITION.md` | Highest authority |
+| 3 | `ARCHITECTURE.md` | How the code is put together and why |
+| 4 | `docs/DATA-INVENTORY.md` | Measured facts about the real sample files |
+| 5 | `FINDING-002-QA-DEFINITION.md` | Why phase 1 is what it is |
+| 6 | `FINDING-003-GEOMETRIC-TAIL.md` | The open p99.9 question and its isolation matrix |
+| 7 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review. Requirements, not commentary |
+| 8 | `docs/adr/ADR-001` … `ADR-007` | Decisions taken, with reasoning |
+| 9 | `REVIEW-CAIRN-MESHING.md`, `FINDING-001-PDAL-QUANTISATION.md`, `CAIRN-MESH-MEMORY-ISSUE.md` | Cairn context |
 
 **Where the code disagrees with these documents, report the conflict and
 stop.** Do not resolve it silently.
 
+---
+
 ## 2. What this project is
 
 Terrestrial laser scan in, lightweight streamable surface out, plus a numerical
-report of how far an imported BIM model sits from the scan evidence. The mesh
-makes it usable; **the comparison report is what gets sold**.
+report of how far an imported BIM model sits from the scan evidence.
+
+**The mesh makes it usable. The comparison report makes it billable.**
+
+Two scan families. **TLS is primary** and carries the competitive claim; NavVis
+is second. **Meshing is per station; comparison and reporting are per site**
+(`ADR-005`).
 
 Destination: integration into Cairn 3D at phase 7, behind a feature flag,
 alongside the existing loader, legacy `.cmh` assets and old projects untouched.
 Until then RapidMesh neither imports Cairn nor is imported by it.
 
+Cintoo and TurboMesh are a **public capability benchmark only**. Nothing is
+copied or examined. We may say RapidMesh is *intended* to compete; we may not
+say it does until benchmark evidence exists.
+
+---
+
 ## 3. What already exists — this is not a greenfield project
 
-~2,400 lines of working, tested Python. **21 tests pass.** The synthetic bench
-reproduces its documented behaviour.
+~2,400 lines of working, tested Python. **21 tests pass.** Git history:
+
+```
+3ceaa21  Isolate the p99.9 cause, observation-set interface, tile boundaries
+da0a8fe  Incorporate review: endpoint safety, memory budget, parity targets
+8a5bab4  Merge architecture session: real-data findings, NavVis, comparison
+07cccfb  Baseline: RapidMesh as at 1 Aug 2026, before architecture merge
+```
 
 ```
 src/rapidmesh/   e57_reader (637) · synthetic (406) · filters (367) · grid (341)
                  triangulate (291) · qa (266) · types (227) · pipeline (152) · cli (127)
 tests/           test_pipeline · test_e57_reader · conftest
-tools/           bench_synthetic · check_laz_precision · e57_xml · inspect
+tools/           bench_synthetic · check_laz_precision · e57_xml · e57_inventory · smoke
 ```
 
 **Built and working:** structured E57 reader with three lattice tiers
@@ -52,59 +92,71 @@ cross-station occlusion carving with parallax restore, discontinuity-aware
 triangulation, area-based island culling, oriented normals, analytic synthetic
 fixtures, CLI (`probe` / `mesh` / `bench`).
 
-**Not built:** decimation, RMX container, texture, LOD chain, chunked reading,
-and **the entire comparison engine** — IFC import, BVH, modes A/B/D, heat map,
-site-level report. That last group is the billable half of the product.
+**Not built:** decimation, RMX container, texture, LOD chain, chunked/streamed
+processing, and **the entire comparison engine** — IFC import, BVH, modes
+A/B/D, heat map, site-level report. That last group is the billable half.
+
+---
 
 ## 4. What the first real-data run found
-
-Run on 2 Aug 2026. Detail in `FINDING-002-QA-DEFINITION.md`.
 
 **Good.** The reader works on real client data. All 30 structured stations
 classify as `e57-rowcol`, the exact tier. The NavVis export correctly degrades
 to `e57-projected`. The reader's measured angular step (0.0591°) matches the
-figure derived independently from the E57 XML footer. The invalid-return
-question is settled: `MIN_RANGE = 0.3` drops 14.2% on the outdoor high-res
-station and 0.5% on the enclosed medium one, exactly as expected.
+figure derived independently from the E57 XML footer. `MIN_RANGE = 0.3` drops
+14.2% of cells on the outdoor high-res station and 0.5% on the enclosed medium
+one, which settles the invalid-return question.
 
-**Bad, and this sets phase 1.**
+| Station | Points | Lattice | Read | Peak RSS | Step |
+|---|---|---|---|---|---|
+| `02516.182_6` | 2,951,950 | 2746 × 1075 | 1.1 s | 356 MB | 0.1311° |
+| `02516.182_1` | 14,548,765 | 6095 × 2387 | 6.9 s | **1,418 MB** | 0.0591° |
 
-```
-deviation  rms=50.84 mm  p99.9=165.07 mm  max=8724.90 mm  <=2mm=99.63%
-```
+**Three problems, each with its own document.**
 
-Against a 2 mm commitment. It is **not** a meshing failure. Triangle edges max
-at 0.51 m in 5.76 million, so nothing is bridging. The RMS is produced entirely
-by island-culled samples being measured against a mesh that correctly excludes
-them — `pipeline.py:109` passes `grid.scan.xyz`, which still contains them.
+**`FINDING-002` — the QA metric is wrong, and on real data it is degenerate.**
+Reported RMS is 50.84 mm against a 2 mm commitment. Not a meshing failure:
+triangle edges max at 0.51 m in 5.76 million, so nothing bridges. The RMS comes
+entirely from island-culled samples measured against a mesh that correctly
+excludes them (`pipeline.py:109` passes `grid.scan.xyz`). Underneath that, p50
+through p99.5 are all **exactly 0.000 mm**, because with no decimation every
+retained sample *is* a mesh vertex.
 
-Underneath that is the deeper issue: **p50, p90, p99 and p99.5 are all exactly
-0.000 mm.** With no decimation, every retained sample *is* a mesh vertex, so
-point-to-mesh distance is trivially zero. The metric currently asks whether
-points are vertices of a mesh built from those points.
+**`ADR-006` — the memory target was not achievable.** A finished
+full-resolution mesh for the high-res station is **628.9 MB of output alone**;
+the whole site is **397 M triangles, 10.21 GB**. Chunked reading alone does not
+fix this. Full resolution is a processing intermediate, never a delivery
+format, and decimation is therefore structural rather than a tuning knob.
 
-**Memory.** 1,418 MB reading one 14.5 M-point station; 1,747 MB for the full
-pipeline. Target is 512 MB.
+**`FINDING-003` — the p99.9 tail is geometric, and the cause is unknown.**
+Stated exactly: **passes the 25 mm default-tolerance budget and fails the 10 mm
+minimum-tolerance budget** (3.55 mm against 3.2 mm). Measured: at zero range
+noise with carving disabled, p99.9 is still 12.89 mm. Noise moves it ~5%;
+carving ~5%. Noise and carving are eliminated; **the responsible stage is not
+identified.** The whole tail sits in walls and floor; doors, the column and the
+handrail are exact.
+
+---
 
 ## 5. Phase 0 — Cairn, and only this
 
 Repo: `pointcloud-viewer`, branch `navvis-phase3-vvp-meshing`. Remediation of a
 live fault, not integration. Full account in `CAIRN-MESH-MEMORY-ISSUE.md`.
 
-**This is a production availability issue, not a performance issue.** The
-kernel killed uvicorn, taking down every user's session, not just one job.
+**This is a production availability issue.** The kernel killed uvicorn, taking
+down every user's session, not one job.
 
 ### 0a — Endpoint safety. Do this first; it is hours, not days.
 
-Automatic meshing was removed from uploads and **stays removed**. But two
-routes remain live and reachable by direct call:
+Automatic meshing was removed from uploads and **stays removed**. Two routes
+remain live and reachable by direct call:
 
 - `routers/models.py build_meshes` — loads every scan in a project
   **simultaneously**
 - `routers/models.py build_vantage_meshes` — may load an entire registered
   cloud
 
-Their frontend buttons were deleted. **That is not protection.** curl, a test,
+Their frontend buttons were deleted. **That is not protection.** curl, a test
 or a future UI still reaches them.
 
 Disable or authorise-gate both **at the server**. Do not wait for isolation.
@@ -116,107 +168,148 @@ proven by test. No ordinary request path can reach `mesher.py`.
 
 1. **Subprocess-isolate the mesh step**, matching the existing `subprocess.run`
    pattern for PDAL and PotreeConverter in `backend/converter.py`.
-2. **`RLIMIT_AS` per workload, not one global value.** The three paths are
-   different workloads: one station, every scan in a project, and a whole
-   registered cloud. One limit either strangles the small path or fails to
-   protect against the large one.
-3. **Remove the redundant copy.** `load_points` ends with
+2. **Three memory controls, kept distinct.** `RLIMIT_AS` bounds **virtual
+   address space and does not enforce RSS** — never write that it does.
+
+   | Control | Bounds | Failure | Role |
+   |---|---|---|---|
+   | `RLIMIT_AS`, calibrated | Address space | `MemoryError`, catchable | Graceful abort with a traceback and a clean failure status |
+   | RSS watchdog on `/proc/self/status` `VmRSS` | Resident | Voluntary exit | The measured gate |
+   | Job-specific cgroup | Resident | SIGKILL | Hard boundary. **0b stretch, not entry requirement** |
+
+3. **Limits are per workload, not one global value.** One station, every scan in
+   a project, and a whole registered cloud are three different workloads. A
+   single limit either strangles the small path or fails to protect the large.
+4. **Remove the redundant copy.** `load_points` ends with
    `.T.astype(np.float64)` on an array already f64. NumPy copies by default —
    **1.37 GB of pure waste** on the 56,950,017-point NavVis file. Use
    `copy=False` or drop the cast. **Do not narrow to f32**; the f64 is
    deliberate and load-bearing at MGA magnitudes.
-4. **Pre-flight size/point-count ceiling** before spawning.
-5. **No automatic retry loop.** A failed oversized job must not respawn itself.
+5. **Pre-flight size / point-count ceiling** before spawning.
+6. **No automatic retry loop.**
 
 **Gate 0b — all must pass:** the 1.77 GB file fails its own job only;
 `/api/health` answers 200 throughout, verified by polling during the run; other
 users can view other projects; the source scan remains available; the project
-shows an explicit failure status; no retry loop; `dmesg` shows the child
-killed, not uvicorn; a regression test proven to fail against the pre-fix code
-first; full existing gate re-run (pytest, ruff, `mypy --strict`, Playwright).
+shows an explicit failure status; no retry loop; `dmesg` shows the child killed,
+not uvicorn; `RLIMIT_AS` plus the RSS watchdog demonstrably protect uvicorn
+under the real container limit; a regression test proven to fail against the
+pre-fix code first; full existing gate re-run (pytest, ruff, `mypy --strict`,
+Playwright).
 
-Confirm every path against the current repository. Line numbers here are from
-1 Aug 2026 and may have moved.
+Confirm every path against the current repository. Line numbers in these
+documents are from 1 Aug 2026 and may have moved.
+
+---
 
 ## 6. Phase 1 — start here in this repo
 
-**Do not build decimation.** It was previously first and has been moved to
-phase 3, because there is currently no trustworthy real-data metric to
-decimate against.
+**Do not build decimation.** It was first; it is now 3b, because there is no
+trustworthy real-data metric to decimate against.
 
-**1a. QA rework.** Three separate reports, per `RAPIDMESH-REVIEW-FINDINGS.md`
-§1:
+### 1a — QA rework
+
+Three separate reports (`RAPIDMESH-REVIEW-FINDINGS.md` §1):
 
 - **Retained-surface fidelity** — point-to-mesh over samples actually
   represented in the mesh. Excludes despeckle, carve **and island** removals.
 - **Filtering and coverage ledger** — retained, despeckled, carved,
-  island-culled, restored, no-return, otherwise excluded. Every input sample
-  accounted for exactly once.
+  island-culled, restored, no-return, otherwise excluded. Every input sample in
+  exactly one category, summing to the input count.
 - **Mesh-to-source deviation** — sample the finished triangles, measure back to
   source points. The only measure that detects invented surface, and the only
   one that says anything on real data before decimation exists. **Build this
-  one first.**
+  first.**
 
-Each report states which dataset is the source of truth and whether figures are
-exact or sampled.
+Every report states its source of truth, whether figures are exact or sampled,
+source hash, version, settings, exclusions, processing time and peak memory.
 
-**1b. Streamed and chunked processing.** `pye57.read_scan_raw` materialises
-whole scans. But chunked *reading* alone does not solve the problem: a finished
-full-resolution mesh for the high-res station is **628.9 MB of output on its
-own** (`docs/adr/ADR-006`). The whole pipeline must stream:
+### 1b — Streamed and chunked processing
+
+`pye57.read_scan_raw` materialises whole scans. Chunked *reading* alone is not
+enough: the finished mesh is 628.9 MB on its own. The pipeline must stream:
 
 ```
 read band -> filter -> triangulate -> QA -> write tile -> release band
 ```
 
-The band interface in `grid.py` is already the right shape. Two budgets, tested
-separately: **working memory ≤ 512 MB** excluding incrementally written output,
-and **peak RSS ≤ 1.5 GB** enforced by `RLIMIT_AS`.
+The band interface in `grid.py` is already the right shape. Cross-band overlap
+discipline matters: triangulation overlap 1, despeckle halo 1. The wrong
+overlap leaves a one-row seam, subtle enough to ship by accident.
 
-**Gate 1 — all must pass:**
+Two budgets, tested separately: **working memory ≤ 512 MB** excluding
+incrementally written output, and **measured peak RSS ≤ 1.5 GB**.
+
+### 1c — The `FINDING-003` isolation matrix
+
+Run at the **fine 0.090° sampling** that produced 3.55 mm, not the coarse
+setting used so far.
+
+Vary one at a time: noise (0, 1, 2, 3, 5 mm sigma) · carving on/off · parallax
+restore on/off · island culling on/off · `max_incidence_deg` sweep.
+
+Report: walls and floors **separately**; residuals grouped by incidence angle,
+range and distance from the nearest depth discontinuity; coordinates and
+triangle IDs for the worst 0.1%; a heat map of those residuals.
+
+The outcome decides the fix, and **nothing is reprioritised before it**:
+
+| If | Then |
+|---|---|
+| Tail disappears with carving off and clusters at silhouettes | Promote silhouette-aware carving |
+| It tracks `max_incidence_deg` | Prioritise incidence-aware triangulation |
+| Worst triangles join different analytic surfaces | Fix boundary connectivity and discontinuity handling |
+| Geometry is valid but the metric misattributes it | Fix the truth metric, not the mesher |
+
+### 1d — Clean-checkout smoke gate
+
+`tools/smoke.py` exists and passes. Keep it in CI. It catches stdlib shadowing
+in `tools/` and tools that will not run from their documented location. It
+exists because `tools/inspect.py` shadowed stdlib `inspect` and broke every
+script run from `tools/`.
+
+### Gate 1 — all must pass
 
 - [ ] Real-data retained-surface **and mesh-to-source** figures for both
       `02516.182_6.e57` and `02516.182_1.e57`
-- [ ] Filtering ledger balances: every input sample in exactly one category,
-      summing to the input count
-- [ ] Working memory ≤ 512 MB and peak RSS ≤ 1.5 GB on the 14.5 M-point
-      station, asserted in a test
+- [ ] Filtering ledger balances: every input sample in exactly one category
+- [ ] Working memory ≤ 512 MB and measured peak RSS ≤ 1.5 GB on the
+      14.5 M-point station, asserted in a test
 - [ ] Output written incrementally; no full-resolution mesh held in memory
-- [ ] All 30 structured stations process without error, both lattice
-      resolutions, including the 4 without colour
+- [ ] **Geometric-tail cause identified by stage** (`FINDING-003`)
+- [ ] All 30 structured stations process, both resolutions, including the 4
+      without colour
 - [ ] Coordinate precision test at real MGA Zone 55 values
-- [ ] Every report states its source of truth, whether figures are exact or
-      sampled, source hash, version, settings, exclusions, time and peak memory
-- [ ] **`FINDING-003` isolation matrix run, and the geometric-tail cause
-      identified by stage.** Do not reprioritise filtering or triangulation
-      work before it
-- [ ] Clean-checkout smoke gate: CLI, benchmark and inventory tools all run
-      from their documented locations on a fresh clone
+- [ ] `tools/smoke.py` passes from a fresh clone
 - [ ] `CLAUDE.md` §5 and §9 updated
 
-Then stop and report the numbers.
+**Then stop and report the numbers.**
 
-## 6A. After that, in order
+---
+
+## 7. After that, in order
 
 Full gates in `00-PRODUCT-DEFINITION.md` §8.
 
 | Phase | Deliverable |
 |---|---|
-| **2** | Real-data baseline, Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first** — if Cairn quantises to 1 cm, the comparison is against a handicapped opponent and the report must say so |
-| **3a** | Comparison vertical slice: mode A only, one station against the IFC, JSON out, no heat map. Cheap, and it de-risks the commercial premise early |
-| **3b** | Error-bounded decimation, LOD chain, tiled incremental writing |
+| **2** | Real-data baseline, Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first** — if Cairn quantises to 1 cm the comparison is against a handicapped opponent and the report must say so. Also obtain the scanner identity and registration report |
+| **3a** | Comparison vertical slice: mode A only, one station against the IFC, JSON out, no heat map. Built on the **observation-set interface** (`ADR-007`), with the **decimation-invariance test** in place |
+| **3b** | Error-bounded decimation, LOD chain, tiled incremental writing, tile-size benchmark |
 | **4** | RMX, browser first paint, progressive refinement, texture |
 | **5** | Site-level comparison: modes B and D, heat map both targets, full report |
 | **6** | NavVis B1, then B2 |
 | **7** | Cairn integration |
 
-## 7. Reference data
+---
+
+## 8. Reference data
 
 `H:\Sample` — **client data. Read-only. Never committed, at any time.**
 
 ```
 Structured\02516.182_{1..30}.e57                        TLS, 30 stations, 5.3 GB
-Navvis e57\25199_Ampol_Tallarook_250501-registered.e57  1.77 GB
+Navvis e57\25199_Ampol_Tallarook_250501-registered.e57  1.77 GB, 56,950,017 pts
 Navvis raw\2025-09-11_01.03.56\                         3.0 GB, rec-v4
 Model\25199S - Ampol Tallarook Southbound.ifc           12.2 MB, IFC2X3
 ```
@@ -233,10 +326,12 @@ designing any test.
 Phases 0 and 1 touch only the structured set. **Do not open the raw recording
 before phase 6.**
 
-## 8. Traps, all confirmed in the real files
+---
+
+## 9. Traps, all confirmed in the real files
 
 1. **MGA northing in f32 has a 0.5 m ULP.** The sample IFC places at
-   `5896381927.` mm. Twenty times the 25 mm tolerance. f64 until localised.
+   `5896381927.` mm — twenty times the 25 mm tolerance. f64 until localised.
 2. **The sample model's `IfcSite` declares London** (51°30'23"N 0°07'37"W).
    Revit's untouched default. IFC2X3 has no `IfcMapConversion`. Georeference
    from the placement chain only.
@@ -245,18 +340,43 @@ before phase 6.**
 5. **`images2D` is empty on all 31 sample E57s.** No panoramas anywhere.
 6. **Scanner make and model are not recoverable** from these headers. Do not
    assert Trimble or Faro on the basis of this dataset.
-7. **Synthetic numbers are not real-data numbers.** `README.md`'s 1.00 mm RMS
-   is against analytic truth on fixtures. There is no real-data equivalent yet.
+7. **The fixture's 2 mm sigma is a test parameter**, not a property of
+   02516.182. The instrument is unknown.
+8. **Synthetic numbers are not real-data numbers.** `README.md`'s 1.00 mm RMS
+   is against analytic truth on fixtures.
+9. **`RLIMIT_AS` does not enforce RSS.** Never write that it does.
+10. **Never feed a display mesh to the comparison engine** (`ADR-007`).
 
-## 9. Rules of engagement
+---
+
+## 10. Rules of engagement
 
 1. **Measure before claiming.** A number and the command that produced it.
-2. **New tests must be proven to fail against the old code first.**
-3. **Report conflicts, do not resolve them silently.**
-4. **No deferred capability may be claimed.**
-5. **No client data in the repository. Ever.**
-6. **Python only.** No Rust or C++ until a hotspot is proven by measurement.
-7. **Do not touch Cairn beyond phase 0.**
-8. **Update `CLAUDE.md` §5 and §9** in the change that completes a phase or
-   resolves a blocker.
-9. Commit in reviewable steps. The repo has a git baseline as of 2 Aug 2026.
+2. **Do not attribute a cause without isolating the stage.** The p99.9 tail was
+   nearly blamed on grazing incidence from a single per-feature line.
+3. **New tests must be proven to fail against the old code first.**
+4. **Report conflicts, do not resolve them silently.**
+5. **No deferred capability may be claimed.** Name the missing data instead.
+6. **No client data in the repository. Ever.**
+7. **Python only.** No Rust or C++ until a hotspot is proven by measurement.
+8. **Do not touch Cairn beyond phase 0.**
+9. **Do not write documentation instead of code.** Every phase ends with a
+   measurement, not a report about a measurement.
+10. **Update `CLAUDE.md` §5 and §9** in the change that completes a phase or
+    resolves a blocker.
+11. Commit in reviewable steps.
+
+---
+
+## 11. Blocked on John
+
+Neither can be resolved from the files. Both gate phase 2.
+
+- **Scanner identity for 02516.182:** make, model, serial, resolution and
+  quality settings, calibration state.
+- **Registration report:** software and method, station-to-station residuals,
+  target and checkpoint residuals, control-network accuracy, max and RMS
+  registration error, any excluded or weakly constrained stations.
+
+Until these arrive, no minimum defensible tolerance can be stated for the
+reference dataset, and the fixture noise stays a documented assumption.
