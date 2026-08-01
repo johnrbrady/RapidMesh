@@ -67,7 +67,7 @@ code being finished.
 | Phase | Deliverable | Status |
 |---|---|---|
 | 0a | **Endpoint safety.** Disable/gate `build_meshes` + `build_vantage_meshes` at the server. Frontend removal is not protection | **DONE** 2 Aug 2026 — Cairn `b514f4b`. Both 404 unless `CAIRN_ENABLE_MESH_ROUTES=1`; gate test proven to fail against the pre-fix code first |
-| 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | **IN PROGRESS** |
+| 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | **CODE COMPLETE, GATE NOT CLOSED** — Cairn `df71a98` + `12244e9`. Isolation proven (`workerPid != os.getpid()`, proven to fail in-process first); `RLIMIT_AS` and the VmRSS watchdog both demonstrated firing on Linux; f64 copy removed, 24.0 B/point measured. **Outstanding: the 1.77 GB file on a 3 GB container, `/api/health` polled, `dmesg`** — see §9 item 13 |
 | 1 | QA rework (3 reports) + streamed/chunked processing | NOT STARTED |
 | 2 | Real-data baseline, Cairn vs RapidMesh. Confirm `FINDING-001` first | NOT STARTED |
 | 3a | Comparison vertical slice: mode A, one station vs IFC, JSON only | NOT STARTED |
@@ -149,6 +149,7 @@ ever need to meet.** Fixed acceptance test.
 | 10 | Per-station output scales package size with station count, not site area | Browser first paint and package-size targets. Measure at phase 4 |
 | 11 | Scanner identity and registration report for 02516.182 not obtained | Any statement about minimum defensible tolerance for the reference data. Phase 2 |
 | 12 | Combination method for minimum defensible tolerance undefined | The computed project-specific floor. Different statistics, different confidence levels; do not simply add them |
+| 13 | **Gate 0b's deployment half not run.** Needs the 1.77 GB NavVis file pushed through a 3 GB-capped container with `/api/health` polled throughout and `dmesg` showing the child killed rather than uvicorn | Closing phase 0b. The code is in and the memory controls are demonstrated on Linux (WSL), but a control demonstrated in isolation is not the same as an outage that did not happen. Docker Desktop was not running on the dev box |
 
 ## 10. Reference data
 
