@@ -68,7 +68,7 @@ code being finished.
 |---|---|---|
 | 0a | **Endpoint safety.** Disable/gate `build_meshes` + `build_vantage_meshes` at the server. Frontend removal is not protection | **DONE** 2 Aug 2026 — Cairn `b514f4b`. Both 404 unless `CAIRN_ENABLE_MESH_ROUTES=1`; gate test proven to fail against the pre-fix code first |
 | 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | **DONE** 2 Aug 2026 — Cairn `df71a98`, `12244e9`, `36c120d`, `1772595`. Closed against the real 1.77 GB Ampol file in a 3 GB-capped Docker container (see §9's former item 13, now resolved): `/api/health` 200 throughout (88/88 authenticated polls, zero anomalies), container/uvicorn never restarted, worker PID differs from uvicorn's, `RLIMIT_AS` and the RSS watchdog each independently demonstrated firing on the same file under different limit configs, source scan stayed `ready` and immediately retryable, no partial mesh output accepted, no zombie process, cancellation and timeout both proven. **Live testing found and fixed a real bug**: per-task worker failures (e.g. the `MemoryError` this exact file produces) were silently dropped by both routes — neither `meshError` nor any manifest change resulted. Fixed in `1772595`, proven to fail against the pre-fix code first. A second finding, `36c120d`: the routes-enabled flag is a rollout control, not an authorisation control: both routes now also require a signed-in project admin (accounts mode only; token and open mode refused) |
-| 1 | QA rework (3 reports) + streamed/chunked processing | NOT STARTED |
+| 1 | QA rework (3 reports) + streamed/chunked processing + isolation matrix (1c) + smoke gate (1d) | **IN PROGRESS.** 1c done 2 Aug 2026: `tools/isolation_matrix.py`, full results in `FINDING-003-GEOMETRIC-TAIL.md`. 1d (`tools/smoke.py`) already passes. 1a (QA rework, 3 reports) and 1b (streamed/chunked processing) **not started** |
 | 2 | Real-data baseline, Cairn vs RapidMesh. Confirm `FINDING-001` first | NOT STARTED |
 | 3a | Comparison vertical slice: mode A, one station vs IFC, JSON only | NOT STARTED |
 | 3b | Error-bounded decimation, LOD chain, tiled incremental writing | NOT STARTED |
@@ -110,7 +110,7 @@ ever need to meet.** Fixed acceptance test.
 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review. Requirements, not commentary |
 | `FINDING-001-PDAL-QUANTISATION.md` | Cairn likely quantising imports to 1 cm |
 | `FINDING-002-QA-DEFINITION.md` | The deviation report measures the wrong thing |
-| `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 tail is geometric; cause not yet identified |
+| `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 tail is range noise, correctly propagated — not a mesher defect. Resolved by the isolation matrix, 2 Aug 2026 |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's mesher does |
 | `CAIRN-MESH-MEMORY-ISSUE.md` | The production defect phase 0 fixes |
 | `docs/adr/ADR-001` … `ADR-007` | Decisions taken |
@@ -145,9 +145,8 @@ ever need to meet.** Fixed acceptance test.
 | 6 | NavVis raw has no point cloud, no georeferencing, unstitched panoramas | Phase 6 |
 | 7 | Station-to-station registration residuals not supplied | Any future fused display surface |
 | 8 | FINDING-001 unconfirmed against a real Cairn LAZ | Phase 2 baseline interpretation. If Cairn quantises to 1 cm, the baseline is against a handicapped opponent and must say so |
-| 9 | **Passes the 25 mm default-tolerance budget and fails the 10 mm minimum-tolerance budget.** Tail is geometric; noise and carving eliminated; **stage not yet identified** | Phase 1 isolation matrix. See `FINDING-003` |
 | 10 | Per-station output scales package size with station count, not site area | Browser first paint and package-size targets. Measure at phase 4 |
-| 11 | Scanner identity and registration report for 02516.182 not obtained | Any statement about minimum defensible tolerance for the reference data. Phase 2 |
+| 11 | Scanner identity and registration report for 02516.182 not obtained | Any statement about minimum defensible tolerance for the reference data. Phase 2. **Now the whole story, not one input among several**: `FINDING-003`'s isolation matrix showed RapidMesh's own geometric error is ≈0 mm and the entire reported tail is propagated instrument noise — the 2 mm sigma is a placeholder, and the real figure is exactly what this item is waiting on |
 | 12 | Combination method for minimum defensible tolerance undefined | The computed project-specific floor. Different statistics, different confidence levels; do not simply add them |
 
 ## 10. Reference data

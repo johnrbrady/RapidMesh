@@ -240,26 +240,33 @@ overlap leaves a one-row seam, subtle enough to ship by accident.
 Two budgets, tested separately: **working memory ≤ 512 MB** excluding
 incrementally written output, and **measured peak RSS ≤ 1.5 GB**.
 
-### 1c — The `FINDING-003` isolation matrix
+### 1c — The `FINDING-003` isolation matrix — **DONE, 2 August 2026**
 
-Run at the **fine 0.090° sampling** that produced 3.55 mm, not the coarse
-setting used so far.
+`tools/isolation_matrix.py`, run at the verified fine 0.090°/0.09002° sampling
+(1334 × 4000, checked at runtime — the script refuses to run at any other
+resolution). All required variables swept: noise 0/1/2/3/5 mm, carving on/off,
+parallax restore on/off, island culling on/off, `max_incidence_deg` sweep
+70–85°. Walls and floor reported separately throughout; full breakdowns by
+incidence angle, range and discontinuity-cell-distance; worst-0.1% coordinates
+and triangle IDs; a heat map per condition. 155 MB of results
+(`out/isolation_matrix/`, gitignored) plus the full write-up in
+`FINDING-003-GEOMETRIC-TAIL.md`.
 
-Vary one at a time: noise (0, 1, 2, 3, 5 mm sigma) · carving on/off · parallax
-restore on/off · island culling on/off · `max_incidence_deg` sweep.
+**Outcome:** none of the first three rows of the decision table held — carving
+off, restore off and island off each changed walls/floor by ≤ 0.02 mm;
+`max_incidence_deg` was bit-for-bit identical from 78° to 85°; residuals were
+flat across every discontinuity-distance bucket. Zero noise gave **exactly**
+0.00 mm on both walls and floor, and the tail tracked injected noise almost
+exactly at every level tested. **RapidMesh's own geometric error is ≈ 0 mm;
+the entire reported tail is correctly propagated instrument noise**, not a
+mesher defect of any kind. Full reasoning and the decision table applied
+against real numbers are in `FINDING-003-GEOMETRIC-TAIL.md`.
 
-Report: walls and floors **separately**; residuals grouped by incidence angle,
-range and distance from the nearest depth discontinuity; coordinates and
-triangle IDs for the worst 0.1%; a heat map of those residuals.
-
-The outcome decides the fix, and **nothing is reprioritised before it**:
-
-| If | Then |
-|---|---|
-| Tail disappears with carving off and clusters at silhouettes | Promote silhouette-aware carving |
-| It tracks `max_incidence_deg` | Prioritise incidence-aware triangulation |
-| Worst triangles join different analytic surfaces | Fix boundary connectivity and discontinuity handling |
-| Geometry is valid but the metric misattributes it | Fix the truth metric, not the mesher |
+This does not close the acceptance-test gap — 3.47 mm still exceeds the
+3.2 mm mesher-only budget at the assumed 2 mm noise sigma — but there is
+nothing left to fix in the mesher to close it. What was previously
+`CLAUDE.md` §9 open item 9 is now folded into item 11: the real instrument
+noise figure is the only thing that can move this number.
 
 ### 1d — Clean-checkout smoke gate
 
@@ -276,12 +283,15 @@ script run from `tools/`.
 - [ ] Working memory ≤ 512 MB and measured peak RSS ≤ 1.5 GB on the
       14.5 M-point station, asserted in a test
 - [ ] Output written incrementally; no full-resolution mesh held in memory
-- [ ] **Geometric-tail cause identified by stage** (`FINDING-003`)
+- [x] **Geometric-tail cause identified by stage** (`FINDING-003`) — **done
+      2 Aug 2026**: propagated instrument noise, not a mesher defect. See 1c
+      above
 - [ ] All 30 structured stations process, both resolutions, including the 4
       without colour
 - [ ] Coordinate precision test at real MGA Zone 55 values
-- [ ] `tools/smoke.py` passes from a fresh clone
-- [ ] `CLAUDE.md` §5 and §9 updated
+- [x] `tools/smoke.py` passes from a fresh clone — verified 2 Aug 2026 after
+      `pip install -e ".[e57,dev]"` (was not installed in this environment)
+- [x] `CLAUDE.md` §5 and §9 updated — this pass
 
 **Then stop and report the numbers.**
 
