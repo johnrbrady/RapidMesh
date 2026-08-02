@@ -12,7 +12,7 @@ Never decimate first.** Everything else follows from that.
 | --- | --- |
 | `00-PRODUCT-DEFINITION.md` | What is being built and the numbers it commits to. Read first. |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's `mesher.py` already does, and the six real gaps. |
-| `FINDING-001-PDAL-QUANTISATION.md` | **Cairn is snapping every scan to a 1 cm grid at import.** Affects the point cloud too, not just the mesh. One-line fix. |
+| `FINDING-001-PDAL-QUANTISATION.md` | **Cairn is likely snapping every scan to a 1 cm grid at import** — derived from PDAL's documented default, not yet confirmed against a real Cairn LAZ. Would affect the point cloud too, not just the mesh, if confirmed. One-line fix. |
 | `ARCHITECTURE.md` | How the code is put together and why. |
 
 ## Status

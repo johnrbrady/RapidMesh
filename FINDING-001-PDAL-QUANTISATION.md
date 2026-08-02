@@ -1,10 +1,17 @@
-# Finding 001 — Cairn is quantising every scan to 1 cm before Potree ever sees it
+# Finding 001 — Cairn is likely quantising E57 imports to 1 cm
 
-**Date:** 31 July 2026
-**Severity:** High. Affects the point cloud, the mesh, and every measurement.
+**Date:** 31 July 2026. **Wording revised 2 Aug 2026** per
+`RAPIDMESH-REVIEW-FINDINGS.md` §6.1: unconfirmed against a real file, so
+neither the title nor the body may state it as settled.
+**Severity:** High if confirmed. Would affect the point cloud, the mesh, and
+every measurement.
 **Effort to fix:** One line in `backend/converter.py`.
-**Status:** Verified against PDAL's documentation. **Needs confirming against a
-real Cairn LAZ** with `tools/check_laz_precision.py` before acting.
+**Status:** Derived from PDAL's documented default and not yet run against a
+real Cairn LAZ. **Confirmation required** with `tools/check_laz_precision.py`
+before any of this is acted on, restated as settled, or used to justify a
+code change. The command and its actual output belong in this document as
+evidence the moment that run happens — until then this is a documented
+hypothesis, not a finding.
 
 ---
 
@@ -19,9 +26,12 @@ Yes. But the loss is not in Potree, and the fix is upstream of it.
 
 ## Potree is not the problem
 
-PotreeConverter 2.x is **lossless**. It does not thin the cloud; it distributes
-every point across octree levels, coarse ones for distant viewing and the full
-set in the leaves. Cairn invokes it with no flags at all
+The current PotreeConverter invocation does not appear to deliberately thin
+the point count. It distributes points across octree levels, coarse ones for
+distant viewing and the full set in the leaves, rather than discarding any —
+but output counts, attributes and coordinate precision through this specific
+invocation still require verification before "lossless" is stated as fact
+(`RAPIDMESH-REVIEW-FINDINGS.md` §6.2). Cairn invokes it with no flags at all
 (`backend/converter.py`):
 
 ```python
@@ -62,13 +72,19 @@ PDAL's LAS writer default:
 >
 > — https://pdal.io/en/latest/stages/writers.las.html
 
-**0.01 metres. One centimetre.** Every point in every Cairn project imported
-from E57 is snapped to a 1 cm lattice at the moment of import.
+**0.01 metres. One centimetre.** If this default is genuinely in force, every
+point in every Cairn project imported from E57 would be snapped to a 1 cm
+lattice at the moment of import — but that is exactly what §6.1 says is not
+yet confirmed against a real Cairn LAZ, and the sentence must be read that
+way until it is.
 
-A Trimble X7 is specified at roughly 2 mm range accuracy. Cairn is currently
-storing its output about five times coarser than the instrument measured it,
-and there is no way to recover it afterwards — the LAZ is the only copy the
-pipeline consumes.
+The 30 structured sample stations declare no `sensorVendor`
+(`docs/DATA-INVENTORY.md` §1.6), so the instrument, its specification and its
+calibration state are not recoverable from these files. Do not name a
+scanner make or model here; the point stands without one. If a source
+instrument's specified range accuracy is known for a given project, comparing
+it against this quantisation step is the right check to make, on that
+project's own evidence.
 
 ---
 
@@ -81,12 +97,29 @@ pipeline consumes.
 | Mesh quality is disappointing | `mesher.py` reads the same LAZ, so it inherits the quantisation |
 | Measurements disagree slightly with the source scan | Every endpoint moved by up to 5 mm |
 
-It also puts a hard floor under RapidMesh: a 2 mm RMS target
-(`00-PRODUCT-DEFINITION.md` §4) is **arithmetically impossible** from a 1 cm
-quantised source. This is independent confirmation that RapidMesh reading the
-E57 directly, and never touching the LAZ, is the right architecture — but Cairn
-should be fixed regardless, because the point cloud has the same problem and
-Cairn ships today.
+**Corrected argument** (`RAPIDMESH-REVIEW-FINDINGS.md` §7 — the original
+"arithmetically impossible" framing here was wrong and is retracted). A
+1 cm-quantised LAZ cannot reliably preserve 2 mm geometric fidelity relative
+to the original E57 or the underlying real surface, even though a mesh may
+still report a low deviation when measured against the same quantised LAZ. A
+mesh built from quantised points can fit those same quantised points to well
+under 2 mm — it would only be inaccurate relative to the E57, the real
+surface, or the scanner's own unquantised coordinates, not relative to the
+degraded LAZ it was actually built from. This is exactly why the QA report
+must state which dataset it is treating as the source of truth
+(`FINDING-002-QA-DEFINITION.md` makes the identical point about a different
+metric).
+
+**Measurement impact, stated precisely.** Each measurement endpoint may move
+independently by up to 5 mm under 1 cm quantisation. For a distance measured
+between two independently displaced endpoints, the worst-case total error
+approaches 10 mm, not 5 mm.
+
+This is a reason to prefer RapidMesh reading the E57 directly and never
+touching the LAZ — but that architectural preference does not depend on this
+finding being confirmed, and Cairn's own quantisation should be checked and
+fixed on its own merits regardless, because the point cloud Cairn ships today
+would have the identical problem if the default is genuinely in force.
 
 ---
 
@@ -138,10 +171,15 @@ int32 the format uses — PDAL will error or wrap. Setting offset to `auto` make
 it the minimum of each dimension, so only the *extent* of the scan has to fit,
 which for a 100 m station is 1,000,000 units. Comfortable.
 
-0.0001 m is 0.1 mm — twenty times finer than the instrument, which is the right
-side of the line to be on. It costs nothing: LAZ compression is on the
-differences between neighbouring points, not their absolute magnitude, so file
-size barely moves.
+0.0001 m is 0.1 mm — twenty times finer than a typical terrestrial scanner's
+range accuracy, which is the right side of the line to be on. It is expected
+to have a small file-size impact, which must be confirmed on representative
+scans before this is called free (`RAPIDMESH-REVIEW-FINDINGS.md` §8). LAZ
+compresses the differences between neighbouring points, not their absolute
+magnitude, so the effect should be small — but "should be" is not a
+measurement, and §8's own list of representative scans to test against
+(internal room, façade, large external station, RGB, MGA coordinates,
+multi-station project) is the way to make it one.
 
 ### Also worth setting while you are in there
 
