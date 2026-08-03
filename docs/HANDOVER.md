@@ -2,6 +2,11 @@
 
 Opening brief for an implementation session. Assumes no prior context.
 
+> **Pause notice (3 August 2026):** Phase 1 is **PARTIAL — PAUSED** while Cairn
+> 3D is completed and released. Do not follow the older "start here" wording
+> below until Cairn is stable and resumption is approved. The authoritative
+> restart boundary is `docs/PROJECT-PAUSE-HANDOVER.md`.
+
 Written 2 August 2026, after the first run of RapidMesh against real client
 data and the architecture review that followed.
 
@@ -22,7 +27,8 @@ session.
 Cairn repo (phase 0 only):  [PATH TO pointcloud-viewer]
 Reference data:             H:\Sample   read-only, never committed
 
-Start at phase 0a. Stop at the end of phase 1 and report the measured numbers.
+Do not resume work until Cairn 3D is released and stable. Then start at Phase
+1a exactly as specified in docs/PROJECT-PAUSE-HANDOVER.md.
 ```
 
 ---

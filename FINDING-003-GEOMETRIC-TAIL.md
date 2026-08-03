@@ -9,8 +9,8 @@ Re-run at the correct fine 0.090° sampling the matrix specifies, the picture
 inverts: **noise is not eliminated — it is confirmed as the whole story**, and
 none of carving, parallax restoration, island culling, or `max_incidence_deg`
 in the range that matters explain any part of the tail.
-**Severity:** Downgraded from "cause unknown" to "understood, and not a mesher
-defect." The acceptance-test failure itself is unchanged and still real — see
+**Severity:** Downgraded from "cause unknown" to "understood for this planar
+fixture." The acceptance-test failure itself is unchanged and still real — see
 §"What this does and does not mean" below.
 **Status:** **Isolation matrix run in full, per the specification this
 document laid out.** Every branch of the decision table below is checked
@@ -144,7 +144,7 @@ the ones that decide the finding.
 | `max_incidence_deg` = 82° (default) | 1.26 mm | 3.47 mm | 0.78 mm | 2.37 mm |
 | `max_incidence_deg` = 85° | 1.26 mm | 3.47 mm | 0.78 mm | 2.37 mm |
 
-**The headline result: at zero noise, both walls and floor read exactly
+**The headline result for this fixture: at zero noise, both walls and floor read exactly
 0.00 mm — RMS, p99.9 and max.** Not small; zero. The earlier "12.89 mm at zero
 noise" finding (Measurement 1, above) was real and honestly measured, but at
 a coarser sampling than this document's own title names as the one that
@@ -217,8 +217,9 @@ budget's own reasoning was correct: at a 2 mm-sigma instrument, propagated
 noise alone consumes more than the 3.2 mm mesher-only sub-budget, before
 RapidMesh's own geometry contributes anything at all.
 
-**Does mean:** there is no mesher defect to find and fix here. Every filter
-stage and every triangulation parameter tested behaves correctly. Further
+**Does mean:** this matrix found no mesher defect in the tested planar fixture.
+The tested filter stages and triangulation parameters do not materially explain
+its tail. Further
 engineering effort aimed at "closing the gap" between 3.47 mm and 3.2 mm by
 tuning carving, restoration, island culling or incidence handling would be
 chasing noise, not signal — the isolation matrix is the evidence for that,
