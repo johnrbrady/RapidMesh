@@ -5,9 +5,17 @@
 > Highest authority document. Where any other file disagrees with this one,
 > this one wins and the other file is wrong.
 >
-> Owner: John Brady. Established 31 July 2026. Revised 2 August 2026.
+> Owner: John Brady. Established 31 July 2026. Revised 15 August 2026.
 
-**Revision note (2 Aug 2026).** Three approved changes and one correction:
+**Revision note (15 Aug 2026).** RapidMesh resumed as a separate project with a
+new primary outcome: a Cairn-aligned multiresolution surface that can be
+switched and overlaid against the original point cloud without spatial
+movement. E57, LAS and LAZ are required inputs. Scan-to-model comparison moves
+later and is surveyor/admin QC only, never a client-facing capability.
+Combined-project representation is open for investigation. See
+`SPATIAL-CONTRACT.md` and `docs/adr/ADR-008`.
+
+**Superseded revision note (2 Aug 2026).** Three approved changes and one correction:
 NavVis mobile scan data is now in scope (§5); model-to-scan comparison is now
 the primary commercial deliverable (§3A); comparison and reporting move to
 site level while meshing stays per station (§5, `docs/adr/ADR-005`); and the
@@ -18,14 +26,13 @@ quality claims in §4 are narrowed to what has actually been measured
 
 ## 1. The product, in one sentence
 
-**RapidMesh converts terrestrial laser scan data into a survey-fidelity,
-streamable, textured mesh at the scanner's own sampling resolution, and
-measures an imported BIM model against the original scan evidence, reporting
-both how far the mesh deviates from the source points and how far the model
-deviates from what was measured.**
+**RapidMesh converts Cairn-supported E57, LAS and LAZ point data into a
+survey-fidelity, streamable multiresolution surface that remains spatially
+locked to the original point cloud; it later provides private surveyor/admin
+QC comparison against imported models.**
 
-It is a library and a command-line tool. It is not a viewer, not a server, and
-not a Cairn feature. It becomes a Cairn feature later, once it is proven.
+It is a library and a command-line tool. It is not a server and is not yet a
+Cairn feature. Integration requires proof plus separate explicit approval.
 
 ---
 
@@ -34,14 +41,11 @@ not a Cairn feature. It becomes a Cairn feature later, once it is proven.
 Separate repository. Separate package. **Zero imports from Cairn, in either
 direction, until integration is explicitly approved.**
 
-Cairn's roadmap continues unaffected. Cairn keeps shipping `backend/mesher.py`
-until RapidMesh beats it on measured numbers, not on opinion.
-
-When RapidMesh wins, integration is three call-site swaps —
-`conversion.run_conversion`, `routers/models.py build_meshes`, and an RMX
-loader alongside the existing CMH1 loader in `frontend/src/scans.ts`. Old
-projects keep their `.cmh` files and keep working. See
-`REVIEW-CAIRN-MESHING.md` §7.
+Cairn is read-only reference material during RapidMesh development. RapidMesh
+does not alter Cairn's V1 scope and Cairn must not depend on RapidMesh until
+integration is separately approved. The integration shape is re-established
+from Cairn's then-current architecture rather than assumed from historical
+call sites.
 
 **One exception, and it is not integration.** `CAIRN-MESH-MEMORY-ISSUE.md`
 documents a live production fault: `backend/mesher.py` reads whole clouds
@@ -52,10 +56,18 @@ Cairn before integration is approved.
 
 ---
 
-## 3. The one design decision everything else follows from
+## 3. The design decisions everything else follows from
+
+**Spatial truth first.** The complete source-to-project transform is explicit,
+reversible and tested before reconstruction or simplification. The governing
+coordinate rules are in `SPATIAL-CONTRACT.md`.
 
 **Mesh at the scanner's native lattice, then decimate to a measured tolerance.
-Never decimate first.**
+Never decimate first — where a native lattice exists.**
+
+Structured E57 carries that lattice. LAS and LAZ do not, so they use a separate
+evidence-preserving reconstruction path and must never be described as native-
+lattice input.
 
 Cairn's mesher bins to a fixed 2048×1024 grid before it makes a single
 triangle, applied blindly and before any geometry is understood. Every quality
@@ -86,16 +98,15 @@ that way. A blanket "6.9× more detail" is not supportable on this dataset. See
 
 ---
 
-## 3A. The commercial deliverable
+## 3A. Private surveyor/admin QC
 
-The mesh is what makes the product usable. **The comparison report is what
-makes it billable.** A surveyor must be able to hand a client:
+Scan-to-model comparison is a later QC capability for a surveying firm's
+surveyors and administrators. It is not shown or delivered to client accounts
+or anonymous share holders. The result remains traceable to source observations
+and never upgrades a RapidMesh display surface into survey evidence.
 
-> "Across 165 modelled walls, 91.4% of scanned surface sits within ±25 mm of
-> the model. These 14 elements are outside tolerance, worst case 87 mm. 6.2%
-> of modelled surface was not observed and is excluded from these figures."
-
-Everything in §4 exists to make that sentence true and defensible.
+Everything in §4 exists to make QC numbers defensible when this later phase is
+built. It does not move ahead of the aligned multiresolution surface.
 
 ### The heat map
 
@@ -252,13 +263,15 @@ implied.
 
 ### 5.1 Scan families
 
-| | Pipeline A — **TLS, primary** | Pipeline B — NavVis |
-|---|---|---|
-| Input | Structured terrestrial E57 | B1 registered E57 · B2 raw `rec-v4` |
-| Method | Native lattice | B1 points + supplied normals · B2 accumulate from raw sweeps |
+| | Pipeline A — **structured TLS** | Pipeline B — **unstructured point data** | Pipeline C — NavVis |
+|---|---|---|---|
+| Input | Structured terrestrial E57 | LAS, LAZ and unstructured E57 | C1 registered E57 · C2 raw `rec-v4` |
+| Method | Native lattice | Evidence-preserving reconstruction, to be selected by measurement | C1 points + supplied normals · C2 accumulate from raw sweeps |
 
-**TLS is the primary family.** It is built first, carries the competitive
-claim, and accounts for 30 of the 31 sample scan files.
+**Structured TLS is the first implemented family**, but all three Cairn point-
+cloud formats are required product inputs. Different evidence gets a different
+front half and converges only after each format has an honest surface candidate
+and provenance record.
 
 NavVis was previously out of scope. That is **superseded by approved product
 change, 2 Aug 2026.** NavVis gets its own ingestion and reconstruction path and
@@ -267,30 +280,31 @@ shares no assumption that is true only of static structured scans. See
 
 ### 5.2 In scope
 
-- Structured E57 as the primary input. It carries the scanner lattice.
+- E57, LAS and LAZ inputs. Structured E57 preserves its scanner lattice;
+  unstructured inputs do not claim one.
 - Terrestrial static scanners. **Note:** the 30 sample stations declare no
   `sensorVendor`, so make and model are not recoverable from them. Do not
   assert Trimble or Faro on the basis of this dataset.
-- **Per-station meshing.** One station in, one mesh out.
+- Per-station/source evidence geometry remains available even if a later
+  combined display representation is selected.
 - Cross-station data used for occlusion carving (removing transients). Never
   merged into the output geometry.
-- **Site-level comparison and reporting** across all stations as one evidence
-  set. New, per `docs/adr/ADR-005`.
-- IFC2X3 / IFC4 model import, comparison modes A, B and D, tolerance heat map.
+- Later surveyor/admin-only site-level QC comparison across all stations as one
+  evidence set, per `docs/adr/ADR-005` and `ADR-008`.
+- Later IFC2X3 / IFC4 model import, comparison modes A, B and D, tolerance heat map.
 - Texture baked from the scan's own RGB or its panorama. **Optional:** 4 of 30
   sample stations carry no RGB, and `images2D` is empty on all 31 sample E57s.
 - LOD chain produced by decimation, not by re-binning.
-- A deviation report per station **and** a comparison report per site.
+- A mesh-fidelity report per station; later, a private QC report per site.
 
 ### 5.3 Explicitly out of scope
 
-- **Merging stations into one continuous walkable mesh.** Per-station isolation
-  is deliberate: it avoids registration and seam-blending entirely, and fusing
-  would make registration error indistinguishable from model error. The
-  trade-off — no seamless site surface — is accepted. Comparison and reporting
-  are site-level regardless; only the geometry stays per station. Revisit
-  condition and full reasoning in `docs/adr/ADR-005`.
-- Rendering. RapidMesh produces files; something else displays them.
+- Choosing a combined-project representation before investigation. Coordinated
+  per-station display, a fused display-only surface, or both remain candidates.
+  A fused surface can never become numerical evidence or hide registration
+  disagreement.
+- A production viewer. RapidMesh produces files; the Phase 4 engineering
+  alignment view is a validation harness, not a client application.
 - Point cloud storage or conversion. That is Potree's job inside Cairn.
 - Registration or re-registration. RapidMesh consumes registered data and never
   modifies it.
@@ -308,7 +322,7 @@ what is missing.
 | Georeferencing of raw NavVis output | Blocked | Surveyed coordinates for anchors TDS4–TDS10; `anchor_poses.txt` is empty |
 | Panoramas, texture from imagery | Blocked | Stitched panoramas. Raw recording has 196 unstitched DNG, `processed_panoramas: 0` |
 | Scanner-ray comparison (mode B) validation | Blocked | A model for site 02516.182 |
-| Fused site surface for display | Blocked | Measured station-to-station registration residuals |
+| Combined-project representation | Investigation open | Evidence comparing per-station coordination, fused display-only output, or both; registration residuals where fusion is evaluated |
 | Scanner make/model detection | Blocked | Files that declare `sensorVendor` |
 
 ---
@@ -381,14 +395,14 @@ being finished.
 |---|---|---|
 | **0a** | **Endpoint safety, today.** Disable or authorise-gate `build_meshes` and `build_vantage_meshes` at the server, not the frontend. Automatic meshing stays off | Both routes return 403/404 to an unauthorised direct call, proven by test. No route can reach `mesher.py` from an ordinary request |
 | **0b** | Job isolation. Child process, per-workload `RLIMIT_AS`, pre-flight ceiling, no retry loop | 1.77 GB file fails its own job; `/api/health` 200 throughout; other projects viewable; scan preserved; explicit failure status; `dmesg` shows the child killed, not uvicorn |
-| **1** | QA rework (§6) + streamed/chunked processing + **the `FINDING-003` isolation matrix** + a clean-checkout smoke gate | Real-data retained-surface, ledger and mesh-to-source figures for both sample resolutions; ledger balances to the sample; working memory ≤ 512 MB and measured peak RSS ≤ 1.5 GB on the 14.5 M-point station; the geometric-tail cause **identified by stage**; CLI, benchmark and inventory tools all run from a clean checkout |
-| **2** | Real-data baseline: Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first.** Obtain the scanner identity and registration report | Both numbers published with the commands that produced them; LAZ quantisation status stated; scanner and registration evidence recorded, or their absence recorded |
-| **3a** | **Comparison vertical slice.** Mode A only, one station against the IFC, JSON out, no heat map, no site aggregation. Built on the **observation-set interface** (`docs/adr/ADR-007`) | A signed deviation number per model element, traceable to scan **observations**, georeferencing checks passing on the real IFC, and the **decimation-invariance test in place** |
-| **3b** | Error-bounded decimation + LOD chain + tiled incremental writing | Every LOD within its stated deviation budget on real data; §4.1 met; memory budgets held with output streamed, per `docs/adr/ADR-006` |
-| **4** | RMX container, browser first paint, progressive refinement, texture | First paint ≤ 1 s at 10 Mbit under the §11 test contract; 30-station site navigable at a stated frame rate; package size beats Cairn at equal or better measured fidelity |
-| **5** | Site-level comparison: modes B and D, heat map both targets, full report | Heat map matches its own JSON exactly; grey correct on known-occluded surfaces; element attribution correct; denominators documented |
+| **0c** | Spatial contract and transform foundation | Full rigid pose, units and rebasing chain documented and tested; rotation/axis/scale/precision regressions pass; repository gates green |
+| **1** | QA rework (§6) + streamed/chunked processing + **the completed `FINDING-003` isolation matrix** + clean-checkout gate | Real-data bidirectional figures and balanced ledger; working memory ≤ 512 MB and measured peak RSS ≤ 1.5 GB; incremental output; tools run from a clean checkout |
+| **2** | E57/LAS/LAZ ingestion parity and real-data baseline | Each required format either passes its explicit input gate or reports unsupported; source quantisation and provenance preserved; Cairn comparison uses the same source and metric where valid |
+| **3** | Error-bounded decimation + LOD chain + tiled incremental writing | Every LOD remains spatially locked and within its stated deviation budget on real data; §4.1 and seam-local gates pass |
+| **4** | RMX container, progressive browser loader, engineering alignment view and texture | Points/RapidMesh switching and overlay pass the `SPATIAL-CONTRACT.md` view matrix; first paint and navigation targets measured; package size compared honestly |
+| **5** | Surveyor/admin QC comparison: vertical slice, then modes B and D, heat map and report | Observation-backed JSON and heat map agree; grey and attribution correct; QC routes and controls absent for client audiences |
 | **6** | NavVis B1, then B2 | Per `docs/adr/ADR-003`, `ADR-004` |
-| **7** | Cairn integration | Legacy projects open; RapidMesh disableable; export restrictions enforced; comparison UI performs |
+| **7** | Cairn integration | Legacy projects open; RapidMesh disableable; export restrictions enforced; QC absent for client audiences |
 
 **Two ordering decisions worth defending.**
 
@@ -396,12 +410,13 @@ Phase 0 splits. Isolation is real engineering and takes time; the two live
 routes are a production availability risk *today*. Disabling them is hours of
 work and does not depend on isolation being finished.
 
-Phase 3a exists because the comparison report is the commercial deliverable and
-would otherwise sit behind decimation, RMX and browser streaming — three
-substantial phases — before anyone learns whether it works. A thin slice is
-cheap (BVH plus nearest-surface distance) and can run against the existing
-full-resolution mesh. It is far better to discover an IFC georeferencing or
-correspondence problem at phase 3 than at phase 5.
+Phase 0c was inserted because the spatial review found an incomplete rigid
+transform hidden by identity-only tests. Geometry, LOD and output work must not
+continue on an ambiguous coordinate contract.
+
+Comparison moved behind the aligned multiresolution surface by John's decision
+of 15 August 2026. Its observation-set architecture remains valid and prevents
+later QC numbers from depending on a display mesh.
 
 ---
 
@@ -484,14 +499,13 @@ Every row records the command that produced it and the commit it ran at.
 
 ---
 
-## 8C. Comparison engine — what must be defined, and when
+## 8C. QC comparison engine — what must be defined, and when
 
-The comparison report is the commercial differentiator, so its behaviour is
-product definition rather than implementation detail. But specifying all of it
-before writing any of it is documentation instead of code, which §7 forbids.
-Split accordingly.
+The comparison engine is a later surveyor/admin QC capability. Its numerical
+source remains original observations under `ADR-007`; it never consumes a
+display mesh and never appears for client-facing audiences.
 
-**Decide before phase 3a, because these change the architecture:**
+**Decide before the phase 5 vertical slice, because these change the architecture:**
 
 1. **Site-level observation selection** across stations — nearest, best
    incidence angle, shortest range, or a combination. Documented, testable,
@@ -502,8 +516,7 @@ Split accordingly.
    percentage *of*, and which samples are excluded from it.
 4. **Attribution** — element, storey and category, from IFC `GlobalId`.
 
-**Decide during phase 5, with measurement, because a guess now would be
-arbitrary:**
+**Decide during phase 5 with measurement, because a guess now would be arbitrary:**
 
 model and scan coordinate validity checks · normal-angle acceptance ·
 overlapping and contradictory observations · ambiguous correspondence ·
@@ -515,14 +528,13 @@ Each is answered in the report it appears in, with the rule stated.
 
 ---
 
-## 8D. Unified site mesh — deferred, not cancelled
+## 8D. Combined-project representation — investigation open
 
-Per-station geometry is the correct first release: it preserves the original
-evidence and cannot hide registration error (`docs/adr/ADR-005`).
-
-A seamless display surface is part of the expected experience of comparable
-products and stays on the roadmap. It remains deferred until station-to-station
-registration residuals can be measured and reported.
+Per-station geometry preserves original evidence and cannot hide registration
+error (`docs/adr/ADR-005`). A seamless display surface may improve the expected
+experience. John has deliberately left the choice open pending investigation
+of alignment truth, seams, registration uncertainty, package size, first paint
+and interaction behaviour.
 
 **Condition, non-negotiable:** a future unified surface is **display only**. It
 never produces numbers, and it never replaces or obscures the per-station
@@ -535,6 +547,7 @@ evidence that measurements are traced to.
 | Document | Role |
 |---|---|
 | `00-PRODUCT-DEFINITION.md` | This file. Highest authority |
+| `SPATIAL-CONTRACT.md` | Coordinate, transform, precision and alignment authority |
 | `ARCHITECTURE.md` | Technical design |
 | `docs/DATA-INVENTORY.md` | Measured facts about the sample data. Never guess where this has a number |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's mesher does, and the real gaps |
@@ -543,7 +556,7 @@ evidence that measurements are traced to.
 | `FINDING-002-QA-DEFINITION.md` | The deviation report measures the wrong thing |
 | `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 tail is geometric; cause not yet identified |
 | `CAIRN-MESH-MEMORY-ISSUE.md` | The production defect phase 0 fixes |
-| `docs/adr/ADR-001` … `ADR-007` | Decisions taken, with reasoning |
+| `docs/adr/ADR-001` … `ADR-008` | Decisions taken, with reasoning |
 | `docs/HANDOVER.md` | Cold-start brief for an implementation session |
 | `CLAUDE.md` | Charter. Read every session |
 

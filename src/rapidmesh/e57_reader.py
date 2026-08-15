@@ -26,18 +26,19 @@ Everything degrades; nothing silently pretends. `probe()` reports which tier a
 file will land in without reading a single point, so a site's scans can be
 triaged before committing to hours of processing.
 
-Known limit (v0.1)
-------------------
-`pye57.read_scan_raw` materialises a whole scan's fields at once. A 100 M-point
-scan with XYZ + RGB + intensity is roughly 2.4 GB in flight. A chunked reader
-is planned; until then `read_scan` accepts `max_points` and subsamples on the
-lattice (keeping whole rows/columns, never random points, so the lattice
-structure survives) rather than dying.
+Memory-safe boundary
+--------------------
+`iter_raw_chunks` drives libE57's compressed-vector reader repeatedly into
+fixed-capacity buffers. It is the bounded-memory ingestion primitive for the
+streamed band pipeline. The convenience `read_scan` path still materialises a
+whole scan and is therefore explicitly not the production path for large
+stations.
 """
 
 from __future__ import annotations
 
 import math
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -55,6 +56,17 @@ _XYZ = ("cartesianX", "cartesianY", "cartesianZ")
 _SPHERICAL = ("sphericalRange", "sphericalAzimuth", "sphericalElevation")
 _ROWCOL = ("rowIndex", "columnIndex")
 _RGB = ("colorRed", "colorGreen", "colorBlue")
+_SUPPORTED_FIELDS = frozenset(
+    _XYZ
+    + _SPHERICAL
+    + _ROWCOL
+    + _RGB
+    + (
+        "intensity",
+        "cartesianInvalidState",
+        "sphericalInvalidState",
+    )
+)
 
 # Points closer than this to the scanner origin are not returns. PDAL and
 # several exporters write no-return cells as a point AT the origin, which on
@@ -92,6 +104,46 @@ class ScanProbe:
             f"lattice={self.source.value}  rgb={'y' if self.has_rgb else 'n'}  "
             f"intensity={'y' if self.has_intensity else 'n'}"
         )
+
+
+@dataclass(frozen=True)
+class RawChunk:
+    """One copied slice of an E57 compressed-vector stream.
+
+    Arrays are owned by the chunk. libE57 reuses its destination buffers on
+    the next read, so yielding views would silently mutate previously yielded
+    chunks and make concurrent band assembly impossible.
+    """
+
+    offset: int
+    count: int
+    data: Mapping[str, Any]
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(getattr(value, "nbytes", 0)) for value in self.data.values())
+
+
+@dataclass(frozen=True)
+class RawRowBand:
+    """A row-major raw band with explicit non-overlapping ownership.
+
+    ``data`` includes up to ``halo`` neighbouring rows on both sides.
+    Consumers emit results only for ``core_row_start <= row < core_row_stop``;
+    that ownership rule makes the repeated halo evidence available without
+    double-counting samples or triangles.
+    """
+
+    core_row_start: int
+    core_row_stop: int
+    data_row_start: int
+    data_row_stop: int
+    data: Mapping[str, Any]
+    buffered_points_before_emit: int
+
+    @property
+    def nbytes(self) -> int:
+        return sum(int(getattr(value, "nbytes", 0)) for value in self.data.values())
 
 
 def probe(path: str | Path) -> list[ScanProbe]:
@@ -142,6 +194,159 @@ def read_scan(
     return _build(raw, pose, sid, max_points)
 
 
+def iter_raw_chunks(
+    path: str | Path,
+    index: int = 0,
+    chunk_points: int = 1_000_000,
+    fields: tuple[str, ...] | None = None,
+) -> Iterator[RawChunk]:
+    """Yield fixed-capacity raw point chunks without materialising the scan.
+
+    This is deliberately a raw-stream API. Turning arbitrary compressed-vector
+    chunks directly into separate lattices would estimate different angular
+    steps per chunk and create seams. The next layer groups this stream into
+    row bands with one-row overlap before filtering and triangulation.
+    """
+    import pye57
+
+    if chunk_points <= 0:
+        raise ValueError("chunk_points must be positive")
+    e57 = pye57.E57(str(path))
+    if not 0 <= index < e57.scan_count:
+        raise IndexError(f"scan {index} out of range (file has {e57.scan_count})")
+    header = e57.get_header(index)
+    available = tuple(_header_fields(header))
+    selected = (
+        tuple(field for field in available if field in _SUPPORTED_FIELDS)
+        if fields is None
+        else fields
+    )
+    missing = sorted(set(selected) - set(available))
+    unsupported = sorted(set(selected) - _SUPPORTED_FIELDS)
+    if missing:
+        raise ValueError(f"scan does not carry requested fields: {missing}")
+    if unsupported:
+        raise ValueError(f"unsupported E57 fields requested: {unsupported}")
+    if not selected:
+        raise ValueError("scan has no supported point fields")
+
+    arrays, buffers = e57.make_buffers(selected, chunk_points)
+    reader = header.points.reader(buffers)
+    offset = 0
+    try:
+        while True:
+            count = int(reader.read())
+            if count <= 0:
+                break
+            # Copy only the filled prefix; the destination arrays are reused by
+            # the next reader.read() call.
+            data = {field: array[:count].copy() for field, array in arrays.items()}
+            yield RawChunk(offset=offset, count=count, data=data)
+            offset += count
+    finally:
+        reader.close()
+
+
+def iter_row_bands(
+    chunks: Iterator[RawChunk],
+    *,
+    row_min: int,
+    row_stop: int,
+    band_rows: int = 256,
+    halo: int = 1,
+) -> Iterator[RawRowBand]:
+    """Group a row-major raw stream into bounded, overlapping row bands.
+
+    This function is format-independent and performs no geometry conversion.
+    It establishes the seam discipline used by streamed E57 processing:
+    filtering may inspect both halo rows, triangulation may inspect the row
+    below, and only the core owns output. Input that is not row-major is
+    rejected rather than silently producing incomplete bands.
+    """
+    import numpy as np
+
+    if band_rows <= 0:
+        raise ValueError("band_rows must be positive")
+    if halo < 0:
+        raise ValueError("halo must be non-negative")
+    if row_stop < row_min:
+        raise ValueError("row_stop must not precede row_min")
+
+    buffered: dict[str, Any] = {}
+    core_start = row_min
+    last_row: int | None = None
+
+    def append(chunk: RawChunk) -> None:
+        nonlocal last_row
+        if "rowIndex" not in chunk.data:
+            raise ValueError("row-band assembly requires rowIndex")
+        row = np.asarray(chunk.data["rowIndex"])
+        if row.size != chunk.count:
+            raise ValueError("chunk count does not match rowIndex length")
+        if row.size and (
+            np.any(np.diff(row.astype(np.int64)) < 0)
+            or (last_row is not None and int(row[0]) < last_row)
+        ):
+            raise ValueError("E57 point stream is not row-major")
+        if row.size:
+            last_row = int(row[-1])
+        if buffered and set(buffered) != set(chunk.data):
+            raise ValueError("raw chunk fields changed within the stream")
+        for field, values in chunk.data.items():
+            array = np.asarray(values)
+            if array.shape[0] != chunk.count:
+                raise ValueError(f"chunk count does not match {field} length")
+            buffered[field] = (
+                array.copy()
+                if field not in buffered
+                else np.concatenate((buffered[field], array))
+            )
+
+    def ready(eof: bool) -> bool:
+        if not buffered or core_start >= row_stop:
+            return False
+        row = np.asarray(buffered["rowIndex"])
+        core_stop = min(core_start + band_rows, row_stop)
+        need_row = min(core_stop + halo, row_stop) - 1
+        return eof or (row.size > 0 and int(row[-1]) >= need_row)
+
+    def take() -> RawRowBand | None:
+        nonlocal buffered, core_start
+        row = np.asarray(buffered["rowIndex"])
+        core_stop = min(core_start + band_rows, row_stop)
+        data_start = max(row_min, core_start - halo)
+        data_stop = min(row_stop, core_stop + halo)
+        chosen = (row >= data_start) & (row < data_stop)
+        band_data = {field: np.asarray(values)[chosen].copy() for field, values in buffered.items()}
+
+        next_keep_from = max(row_min, core_stop - halo)
+        keep = row >= next_keep_from
+        buffered = {field: np.asarray(values)[keep] for field, values in buffered.items()}
+        old_start = core_start
+        core_start = core_stop
+        if not np.any(chosen):
+            return None
+        return RawRowBand(
+            core_row_start=old_start,
+            core_row_stop=core_stop,
+            data_row_start=data_start,
+            data_row_stop=data_stop,
+            data=band_data,
+            buffered_points_before_emit=int(row.size),
+        )
+
+    for chunk in chunks:
+        append(chunk)
+        while ready(eof=False):
+            band = take()
+            if band is not None:
+                yield band
+    while ready(eof=True):
+        band = take()
+        if band is not None:
+            yield band
+
+
 def _build(
     raw: dict[str, Any],
     pose: ScanPose,
@@ -162,9 +367,14 @@ def _build(
     xyz_local, rng = _resolve_frame(xyz_local, rng, raw, pose, valid)
     row, col, lattice = _lattice(raw, xyz_local, rng, valid)
 
+    source_sample_count = int(valid.size)
+    dropped_no_return = int(np.count_nonzero(~valid))
     keep = valid
+    dropped_other = 0
     if max_points is not None and int(keep.sum()) > max_points:
-        keep = keep & _lattice_stride(row, col, lattice, int(keep.sum()), max_points)
+        stride_keep = _lattice_stride(row, col, lattice, int(keep.sum()), max_points)
+        dropped_other = int(np.count_nonzero(valid & ~stride_keep))
+        keep = keep & stride_keep
 
     row, col = row[keep].astype(np.int32), col[keep].astype(np.int32)
     xyz_local = xyz_local[keep].astype(np.float32)
@@ -186,6 +396,10 @@ def _build(
             rgb=rgb,
             intensity=intensity,
             station_id=station_id,
+            sample_id=np.nonzero(keep)[0].astype(np.int64),
+            source_sample_count=source_sample_count,
+            dropped_no_return=dropped_no_return,
+            dropped_other=dropped_other,
         )
     )
 
@@ -231,7 +445,7 @@ def _resolve_frame(xyz: Any, rng: Any, raw: dict[str, Any], pose: ScanPose, vali
 
     The E57 standard puts a scan's cartesian points in the **scan-local** frame,
     with `pose` mapping local to world. Not every exporter obeys it: writing
-    already-transformed world coordinates alongside a non-identity pose is a
+    already-transformed project coordinates alongside a non-identity pose is a
     known interoperability wart, and it is catastrophic here — every angle in
     the pipeline is measured from the scanner origin, so a scan whose points are
     offset by the pose produces a wrong lattice, wrong incidence thresholds, and
@@ -240,7 +454,8 @@ def _resolve_frame(xyz: Any, rng: Any, raw: dict[str, Any], pose: ScanPose, vali
     The discriminator is a physical property of a rotating-head scanner: it
     sweeps a **vertical plane** per head position, so within one lattice column
     every sample must share the same azimuth. Under the correct frame that
-    spread is essentially zero; under a shifted origin it is large and obvious.
+    spread is essentially zero; under a translated or rotated project frame it
+    is large and obvious. Recovery applies the full inverse rigid pose.
 
     Only checkable when the file carries row/column indices, which is also the
     only case where the lattice is precise enough for the error to matter.
@@ -254,7 +469,10 @@ def _resolve_frame(xyz: Any, rng: Any, raw: dict[str, Any], pose: ScanPose, vali
     if not all(f in raw for f in _ROWCOL):
         return xyz, rng
     t = np.asarray(pose.translation, np.float64)
-    if float(np.linalg.norm(t)) < 0.01:
+    rotation = np.asarray(pose.rotation, np.float64)
+    if float(np.linalg.norm(t)) < 0.01 and np.allclose(
+        rotation, np.eye(3), rtol=1e-12, atol=1e-12
+    ):
         return xyz, rng
 
     col = np.asarray(raw["columnIndex"], np.int64)
@@ -264,15 +482,16 @@ def _resolve_frame(xyz: Any, rng: Any, raw: dict[str, Any], pose: ScanPose, vali
     if idx.size < 64:
         return xyz, rng
 
+    project_encoded_as_local = pose.world_to_local(xyz)
     as_local = _column_azimuth_spread(xyz[idx], col[idx])
-    as_world = _column_azimuth_spread(xyz[idx] - t, col[idx])
+    as_world = _column_azimuth_spread(project_encoded_as_local[idx], col[idx])
 
     # Require a decisive margin. A borderline result means the test did not
     # discriminate — a partial-FOV scan, or a station whose pose translation is
     # small relative to the scene — and silently rewriting coordinates on weak
     # evidence would be worse than the problem.
     if as_world < as_local * 0.2:
-        out = (xyz - t).astype(np.float64)
+        out = project_encoded_as_local.astype(np.float64)
         return out, np.linalg.norm(out, axis=1)
     return xyz, rng
 

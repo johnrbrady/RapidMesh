@@ -261,31 +261,42 @@ def build_mesh(
     remap = np.full(len(scan), -1, np.int64)
     remap[keep_idx] = np.arange(keep_idx.size)
 
-    verts = scan.xyz[keep_idx]
+    local_verts = scan.xyz[keep_idx]
     faces = remap[tris].astype(np.uint32) if len(tris) else np.empty((0, 3), np.uint32)
     rgb = None if scan.rgb is None else scan.rgb[keep_idx]
+    source_sample_id = (
+        keep_idx.astype(np.int64)
+        if scan.sample_id is None
+        else scan.sample_id[keep_idx].astype(np.int64, copy=False)
+    )
 
     normals = None
     if with_normals and len(faces):
         fn = np.cross(
-            verts[faces[:, 1]].astype(np.float64) - verts[faces[:, 0]],
-            verts[faces[:, 2]].astype(np.float64) - verts[faces[:, 0]],
+            local_verts[faces[:, 1]].astype(np.float64) - local_verts[faces[:, 0]],
+            local_verts[faces[:, 2]].astype(np.float64) - local_verts[faces[:, 0]],
         )
-        acc = np.zeros((verts.shape[0], 3), np.float64)
+        acc = np.zeros((local_verts.shape[0], 3), np.float64)
         for col in range(3):
             np.add.at(acc, faces[:, col], fn)
         norm = np.linalg.norm(acc, axis=1, keepdims=True)
         acc /= np.maximum(norm, 1e-12)
-        # Face the scanner. `verts` are offsets FROM the scanner origin, so the
-        # direction back to it is simply -verts.
-        facing = np.einsum("ij,ij->i", acc, -verts.astype(np.float64))
+        # Face the scanner. `local_verts` are offsets from the scanner origin,
+        # so the direction back to it is simply `-local_verts`.
+        facing = np.einsum("ij,ij->i", acc, -local_verts.astype(np.float64))
         acc[facing < 0] *= -1.0
-        normals = acc.astype(np.float32)
+        normals = scan.pose.rotate_local(acc).astype(np.float32)
+
+    # MeshData stores project-axis offsets from a float64 origin. Apply the
+    # scanner rotation here, exactly once, and only then narrow to float32.
+    project_offsets = scan.pose.rotate_local(local_verts).astype(np.float32)
 
     return MeshData(
         origin=scan.pose.translation.astype(np.float64),
-        vertices=verts.astype(np.float32),
+        vertices=project_offsets,
         triangles=faces,
+        source_pose=scan.pose,
         normals=normals,
         rgb=rgb,
+        source_sample_id=source_sample_id,
     )

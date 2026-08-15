@@ -12,12 +12,15 @@ the numeric core has to stay testable without a native build toolchain.
 
 from __future__ import annotations
 
+import math
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
 from rapidmesh import e57_reader, synthetic
 from rapidmesh.pipeline import mesh_station
-from rapidmesh.types import LatticeSource
+from rapidmesh.types import LatticeSource, ScanPose
 
 pye57 = pytest.importorskip("pye57", reason="E57 reading is an optional extra")
 
@@ -31,7 +34,14 @@ def fixture_scan() -> synthetic.SyntheticScan:
     return synthetic.generate(rows=ROWS, cols=COLS, seed=5)
 
 
-def _write(path, scan, points) -> None:  # type: ignore[no-untyped-def]
+ROTATED_QUATERNION = np.array([math.sqrt(0.5), 0.0, 0.0, math.sqrt(0.5)])
+ROTATED_MATRIX = np.array(
+    [[0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, 1.0]], dtype=np.float64
+)
+ROTATED_TRANSLATION = np.array([1000.125, -2000.25, 50.5], dtype=np.float64)
+
+
+def _write(path, scan, points, rotation=None) -> None:  # type: ignore[no-untyped-def]
     """Write one structured scan with row/column indices and colour."""
     data = {
         "cartesianX": points[:, 0].astype(np.float64),
@@ -47,7 +57,7 @@ def _write(path, scan, points) -> None:  # type: ignore[no-untyped-def]
     f.write_scan_raw(
         data,
         name="STATION_A",
-        rotation=np.array([1.0, 0.0, 0.0, 0.0]),
+        rotation=np.array([1.0, 0.0, 0.0, 0.0]) if rotation is None else rotation,
         translation=np.asarray(scan.pose.translation, np.float64),
     )
     f.close()
@@ -69,6 +79,18 @@ def world_file(tmp_path_factory, fixture_scan):  # type: ignore[no-untyped-def]
     s = fixture_scan.scan
     _write(p, s, s.pose.local_to_world(s.xyz))
     return p
+
+
+@pytest.fixture(scope="module")
+def rotated_files(tmp_path_factory, fixture_scan):  # type: ignore[no-untyped-def]
+    pose = ScanPose(translation=ROTATED_TRANSLATION, rotation=ROTATED_MATRIX)
+    scan = replace(fixture_scan.scan, pose=pose)
+    folder = tmp_path_factory.mktemp("e57-rotated")
+    local_path = folder / "local.e57"
+    project_path = folder / "project.e57"
+    _write(local_path, scan, scan.xyz.astype(np.float64), ROTATED_QUATERNION)
+    _write(project_path, scan, pose.local_to_world(scan.xyz), ROTATED_QUATERNION)
+    return local_path, project_path
 
 
 def test_probe_identifies_the_structured_grid(local_file) -> None:  # type: ignore[no-untyped-def]
@@ -121,6 +143,18 @@ def test_world_coordinate_export_is_detected_and_corrected(world_file, local_fil
     assert np.allclose(bad.xyz, good.xyz, atol=1e-5)
 
 
+def test_rotated_project_coordinate_export_uses_full_inverse_pose(rotated_files) -> None:  # type: ignore[no-untyped-def]
+    local_path, project_path = rotated_files
+    local = e57_reader.read_scan(local_path, 0)
+    recovered = e57_reader.read_scan(project_path, 0)
+
+    assert np.allclose(local.pose.rotation, ROTATED_MATRIX, atol=1e-12)
+    assert np.allclose(recovered.pose.rotation, ROTATED_MATRIX, atol=1e-12)
+    # The test writer re-encodes the transformed coordinates, so allow its
+    # sub-0.1 mm round-trip quantisation while still catching a lost rotation.
+    assert np.allclose(recovered.xyz, local.xyz, atol=1e-4)
+
+
 def test_meshes_from_a_real_file(local_file) -> None:  # type: ignore[no-untyped-def]
     """End to end: file on disk in, mesh with a deviation figure out."""
     scan = e57_reader.read_scan(local_file, 0)
@@ -144,3 +178,29 @@ def test_lattice_stride_keeps_structure_not_random_points(local_file) -> None:  
     rows = np.unique(scan.row)
     gaps = np.unique(np.diff(rows))
     assert gaps.size <= 2, f"row spacing is irregular: {gaps[:10]}"
+
+
+def test_raw_chunk_reader_is_complete_ordered_and_bounded(local_file) -> None:  # type: ignore[no-untyped-def]
+    chunk_points = 7_777
+    chunks = list(
+        e57_reader.iter_raw_chunks(
+            local_file,
+            chunk_points=chunk_points,
+            fields=("cartesianX", "rowIndex", "columnIndex"),
+        )
+    )
+    full = pye57.E57(str(local_file)).read_scan_raw(0)
+
+    assert sum(chunk.count for chunk in chunks) == len(full["cartesianX"])
+    assert all(chunk.count <= chunk_points for chunk in chunks)
+    assert [chunk.offset for chunk in chunks] == [
+        sum(c.count for c in chunks[:i]) for i in range(len(chunks))
+    ]
+    for field in ("cartesianX", "rowIndex", "columnIndex"):
+        joined = np.concatenate([np.asarray(chunk.data[field]) for chunk in chunks])
+        assert np.array_equal(joined, full[field])
+
+    # The first chunk owns its data: later reads must not mutate it through a
+    # reused libE57 destination buffer.
+    first_before = np.asarray(chunks[0].data["cartesianX"]).copy()
+    assert np.array_equal(chunks[0].data["cartesianX"], first_before)

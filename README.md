@@ -1,16 +1,19 @@
 # RapidMesh
 
-Survey-grade per-station mesh engine for terrestrial laser scans. Standalone
-R&D project; folds into Cairn once it is proven.
+Spatially aligned multiresolution mesh engine for Cairn-supported E57, LAS and
+LAZ point data. It is developed as a standalone project; Cairn remains read-
+only until later integration is explicitly approved.
 
-**Mesh at the scanner's native lattice, then decimate to a measured tolerance.
-Never decimate first.** Everything else follows from that.
+**Spatial truth first. Preserve the strongest structure the source contains,
+then decimate to a measured tolerance.** Structured E57 uses its native
+lattice; LAS and LAZ require a separate reconstruction path.
 
 ## Where to start
 
 | File | What it is |
 | --- | --- |
 | `00-PRODUCT-DEFINITION.md` | What is being built and the numbers it commits to. Read first. |
+| `SPATIAL-CONTRACT.md` | Coordinate, transform, precision and Cairn-alignment authority. |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's `mesher.py` already does, and the six real gaps. |
 | `FINDING-001-PDAL-QUANTISATION.md` | **Cairn is likely snapping every scan to a 1 cm grid at import** — derived from PDAL's documented default, not yet confirmed against a real Cairn LAZ. Would affect the point cloud too, not just the mesh, if confirmed. One-line fix. |
 | `ARCHITECTURE.md` | How the code is put together and why. |
@@ -64,7 +67,8 @@ edge-preserving despeckle, cross-station occlusion carving with parallax
 restore, discontinuity-aware triangulation, area-based island culling, oriented
 normals, point-to-mesh accuracy reporting.
 
-Not built: decimation, texture, the streaming container, LOD chain. See
+Not built: LAS/LAZ ingestion, decimation, texture, the streaming container, LOD
+chain, engineering alignment view or private QC comparison. See
 `ARCHITECTURE.md` for the ordered list.
 
 ## Install

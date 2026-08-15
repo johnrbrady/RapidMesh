@@ -1,9 +1,10 @@
 """
-RapidMesh — survey-grade per-station mesh engine for terrestrial laser scans.
+RapidMesh — spatially aligned multiresolution point-cloud mesh engine.
 
-Read 00-PRODUCT-DEFINITION.md before this package. The one decision everything
-here follows from: mesh at the scanner's native lattice, then decimate to a
-measured tolerance. Never decimate first.
+Read 00-PRODUCT-DEFINITION.md and SPATIAL-CONTRACT.md before this package.
+Spatial truth comes first; preserve the strongest source structure, then
+decimate to a measured tolerance. The current implemented front half is
+structured E57; required LAS/LAZ support is not yet built.
 
 Nothing at module scope imports numpy, scipy or pye57, so `import rapidmesh`
 works on a bare interpreter and `deps` can report what is actually installed.

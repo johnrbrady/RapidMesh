@@ -80,6 +80,10 @@ def sort_row_major(scan: StructuredScan) -> StructuredScan:
         rgb=None if scan.rgb is None else scan.rgb[order],
         intensity=None if scan.intensity is None else scan.intensity[order],
         station_id=scan.station_id,
+        sample_id=None if scan.sample_id is None else scan.sample_id[order],
+        source_sample_count=scan.source_sample_count,
+        dropped_no_return=scan.dropped_no_return,
+        dropped_other=scan.dropped_other,
     )
 
 
@@ -99,6 +103,10 @@ def select(scan: StructuredScan, keep: npt.NDArray[np.bool_]) -> StructuredScan:
         rgb=None if scan.rgb is None else scan.rgb[keep],
         intensity=None if scan.intensity is None else scan.intensity[keep],
         station_id=scan.station_id,
+        sample_id=None if scan.sample_id is None else scan.sample_id[keep],
+        source_sample_count=scan.source_sample_count,
+        dropped_no_return=scan.dropped_no_return,
+        dropped_other=scan.dropped_other,
     )
 
 

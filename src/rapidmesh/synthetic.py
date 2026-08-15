@@ -159,10 +159,10 @@ def generate(
     az = -math.pi + np.arange(cols, dtype=np.float64) * az_step
     el = el_min + np.arange(rows, dtype=np.float64) * el_step
 
-    row_i, col_i = np.meshgrid(
+    row_grid, col_grid = np.meshgrid(
         np.arange(rows, dtype=np.int64), np.arange(cols, dtype=np.int64), indexing="ij"
     )
-    row_i, col_i = row_i.ravel(), col_i.ravel()
+    row_i, col_i = row_grid.ravel(), col_grid.ravel()
 
     A = az[col_i]
     E = el[row_i]
@@ -223,6 +223,9 @@ def generate(
             rgb=_shade(surf[valid]),
             intensity=None,
             station_id=station_id,
+            sample_id=np.nonzero(valid)[0].astype(np.int64),
+            source_sample_count=int(valid.size),
+            dropped_no_return=int(np.count_nonzero(~valid)),
         )
     )
 

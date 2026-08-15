@@ -1,5 +1,5 @@
 """
-Accuracy measurement — the artefact that makes "survey-grade" a fact.
+Mesh-fidelity measurement — evidence about the derived surface, not survey accuracy.
 
 Nobody in this market ships a deviation figure with their mesh. For a product
 sold to surveying firms that is the gap worth walking into: a number beats an
@@ -49,6 +49,19 @@ if TYPE_CHECKING:
     I64 = npt.NDArray[np.int64]
 
 
+def sha256_file(path: str, chunk_bytes: int = 4 * 1024 * 1024) -> str:
+    """Hash a source incrementally without materialising it or exposing its path."""
+    import hashlib
+
+    if chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be positive")
+    digest = hashlib.sha256()
+    with open(path, "rb") as source:
+        while block := source.read(chunk_bytes):
+            digest.update(block)
+    return digest.hexdigest()
+
+
 def deviation_report(
     mesh: MeshData,
     points: F32,
@@ -58,20 +71,128 @@ def deviation_report(
 ) -> DeviationReport:
     """Point-to-mesh distance statistics, in metres.
 
-    `points` are offsets from the same origin as `mesh.vertices` — scanner-
-    local, not project coordinates. Mixing the two frames produces a deviation
-    of several hundred kilometres, which is at least an unmistakable failure.
+    `points` are project-axis offsets from the same origin as `mesh.vertices`.
+    Scanner-local points must be rotated through their `ScanPose` first. This
+    convention matches `SPATIAL-CONTRACT.md` and makes a dropped rotation fail
+    as an alignment error rather than remaining internally self-consistent.
 
     Subsampled to `max_samples` because the statistics converge long before the
     cost does; half a million points pins an RMS to well under a tenth of a
     millimetre. Sampling is uniform random rather than a lattice stride, so a
     periodic artefact cannot hide between the samples.
     """
+    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed)
+    return _summarise(
+        d,
+        metric="retained-source-to-mesh",
+        population=int(points.shape[0]),
+        exact=points.shape[0] <= max_samples,
+        source_of_truth="retained source observations",
+    )
+
+
+def mesh_to_source_report(
+    mesh: MeshData,
+    source_points: F32,
+    max_samples: int = 500_000,
+    seed: int = 0,
+) -> DeviationReport:
+    """Sample finished triangle interiors and measure to source observations.
+
+    Point-to-mesh alone cannot detect a triangle invented across a doorway or
+    occlusion: all three vertices may be original samples while the triangle's
+    interior represents empty space. This reverse-direction measure exposes
+    that failure. Each selected triangle contributes a deterministic uniform
+    interior sample; when the triangle count exceeds ``max_samples``, triangle
+    selection is area-weighted so the result estimates surface-area error.
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    population = mesh.triangle_count
+    if population == 0 or source_points.shape[0] == 0 or max_samples <= 0:
+        return _summarise(
+            np.empty(0, np.float64),
+            metric="mesh-to-retained-source",
+            population=population,
+            exact=False,
+            source_of_truth="retained source observations",
+        )
+
+    verts = mesh.vertices.astype(np.float64)
+    tris = mesh.triangles.astype(np.int64)
+    tri_verts = verts[tris]
+    cross = np.cross(tri_verts[:, 1] - tri_verts[:, 0], tri_verts[:, 2] - tri_verts[:, 0])
+    area = 0.5 * np.linalg.norm(cross, axis=1)
+    good = area > 0.0
+    tri_ids = np.nonzero(good)[0]
+    if tri_ids.size == 0:
+        return _summarise(
+            np.empty(0, np.float64),
+            metric="mesh-to-retained-source",
+            population=population,
+            exact=False,
+            source_of_truth="retained source observations",
+        )
+
+    rs = np.random.default_rng(seed)
+    # Draw with replacement in proportion to triangle area. This is uniform
+    # over the continuous mesh surface; one sample per triangle would
+    # overweight a dense patch of tiny faces and underweight a large invented
+    # bridge. Small meshes still receive enough interior samples to make a
+    # single bad face observable, bounded by the caller's cap.
+    n = min(max_samples, max(int(tri_ids.size), min(10_000, max_samples)))
+    weights = area[tri_ids]
+    chosen = rs.choice(tri_ids, size=n, replace=True, p=weights / weights.sum())
+
+    # sqrt transform gives a uniform point over triangle area.
+    u = np.sqrt(rs.random(chosen.size))
+    v = rs.random(chosen.size)
+    tv = tri_verts[chosen]
+    samples = (
+        (1.0 - u)[:, None] * tv[:, 0]
+        + (u * (1.0 - v))[:, None] * tv[:, 1]
+        + (u * v)[:, None] * tv[:, 2]
+    )
+    tree = cKDTree(source_points.astype(np.float64))
+    d, _ = tree.query(samples, k=1, workers=-1)
+    return _summarise(
+        np.asarray(d, np.float64),
+        metric="mesh-to-retained-source",
+        population=population,
+        # Even one sample per triangle is a sampled interior, not an exact
+        # supremum over continuous surface area.
+        exact=False,
+        source_of_truth="retained source observations",
+    )
+
+
+def _summarise(
+    d: F64,
+    *,
+    metric: str,
+    population: int,
+    exact: bool,
+    source_of_truth: str,
+) -> DeviationReport:
+    """Build one consistently-labelled deviation report."""
     import numpy as np
 
-    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed)
     if d.size == 0:
-        return DeviationReport(0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        return DeviationReport(
+            0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            metric=metric,
+            population=population,
+            exact=exact,
+            source_of_truth=source_of_truth,
+        )
     return DeviationReport(
         sampled_points=int(d.size),
         rms=float(np.sqrt(np.mean(d * d))),
@@ -81,6 +202,10 @@ def deviation_report(
         maximum=float(d.max()),
         within_2mm=float(np.mean(d <= 0.002)),
         within_5mm=float(np.mean(d <= 0.005)),
+        metric=metric,
+        population=population,
+        exact=exact,
+        source_of_truth=source_of_truth,
     )
 
 
@@ -99,7 +224,15 @@ def truth_report(
     """
     import numpy as np
 
-    return deviation_report(mesh, truth_points.astype(np.float32), max_samples, k, seed)
+    points = truth_points.astype(np.float32)
+    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed)
+    return _summarise(
+        d,
+        metric="analytic-truth-to-mesh",
+        population=int(points.shape[0]),
+        exact=points.shape[0] <= max_samples,
+        source_of_truth="analytic fixture geometry",
+    )
 
 
 def distances(

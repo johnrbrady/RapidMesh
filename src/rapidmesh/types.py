@@ -22,7 +22,7 @@ Design notes that are easy to get wrong and expensive to discover later:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     I32 = npt.NDArray[np.int32]
     U8 = npt.NDArray[np.uint8]
     U16 = npt.NDArray[np.uint16]
+    I64 = npt.NDArray[np.int64]
     BOOL = npt.NDArray[np.bool_]
 
 
@@ -64,11 +65,47 @@ class ScanPose:
     translation: F64            # (3,)
     rotation: F64               # (3, 3), orthonormal
 
-    def local_to_world(self, local: F32) -> F64:
+    def __post_init__(self) -> None:
+        """Reject a pose that is not a finite, right-handed rigid transform."""
+        import numpy as np
+
+        translation = np.asarray(self.translation, dtype=np.float64)
+        rotation = np.asarray(self.rotation, dtype=np.float64)
+        if translation.shape != (3,):
+            raise ValueError("scan-pose translation must have shape (3,)")
+        if rotation.shape != (3, 3):
+            raise ValueError("scan-pose rotation must have shape (3, 3)")
+        if not np.all(np.isfinite(translation)) or not np.all(np.isfinite(rotation)):
+            raise ValueError("scan pose must be finite")
+        if not np.allclose(rotation @ rotation.T, np.eye(3), rtol=1e-9, atol=1e-9):
+            raise ValueError("scan-pose rotation must be orthonormal")
+        if not np.isclose(np.linalg.det(rotation), 1.0, rtol=1e-9, atol=1e-9):
+            raise ValueError("scan-pose rotation must be right-handed with determinant +1")
+
+    def rotate_local(self, local: F32 | F64) -> F64:
+        """Scanner-local vectors -> project-axis vectors, without translation."""
+        import numpy as np
+
+        out: F64 = np.asarray(local, dtype=np.float64) @ np.asarray(
+            self.rotation, dtype=np.float64
+        ).T
+        return out
+
+    def local_to_world(self, local: F32 | F64) -> F64:
         """(N,3) scanner-local offsets -> (N,3) absolute project coordinates."""
         import numpy as np
 
-        out: F64 = local.astype(np.float64) @ self.rotation.T + self.translation
+        out: F64 = self.rotate_local(local) + np.asarray(self.translation, dtype=np.float64)
+        return out
+
+    def world_to_local(self, world: F64) -> F64:
+        """Absolute project coordinates -> scanner-local offsets."""
+        import numpy as np
+
+        shifted = np.asarray(world, dtype=np.float64) - np.asarray(
+            self.translation, dtype=np.float64
+        )
+        out: F64 = shifted @ np.asarray(self.rotation, dtype=np.float64)
         return out
 
 
@@ -131,6 +168,10 @@ class StructuredScan:
     rgb: U8 | None = None       # (N,3)
     intensity: U16 | None = None  # (N,)
     station_id: str = ""
+    sample_id: I64 | None = None  # stable index in the source sample stream
+    source_sample_count: int | None = None
+    dropped_no_return: int = 0
+    dropped_other: int = 0
 
     def __len__(self) -> int:
         return int(self.row.shape[0])
@@ -147,17 +188,20 @@ class StructuredScan:
 class MeshData:
     """A finished mesh, still in memory.
 
-    Positions are offsets from `origin`; add `origin` for project coordinates.
-    Normals are kept as data and never baked into `rgb` — see
-    `00-PRODUCT-DEFINITION.md` §7.
+    Positions are project-axis offsets from `origin`; add `origin` for project
+    coordinates. The source pose is retained for provenance, not applied again
+    by the renderer. Normals use the same project axes and are never baked into
+    `rgb` — see `SPATIAL-CONTRACT.md`.
     """
 
     origin: F64                 # (3,) f64 anchor
-    vertices: F32               # (V,3) offsets from origin
+    vertices: F32               # (V,3) project-axis offsets from origin
     triangles: npt.NDArray[np.uint32]  # (T,3)
+    source_pose: ScanPose | None = None
     normals: F32 | None = None  # (V,3) unit
     rgb: U8 | None = None       # (V,3) unmodified scan colour
     uv: F32 | None = None       # (V,2) texture coordinates, once texturing lands
+    source_sample_id: I64 | None = None  # source observation represented by each vertex
 
     @property
     def vertex_count(self) -> int:
@@ -172,9 +216,9 @@ class MeshData:
 class DeviationReport:
     """Point-to-mesh accuracy, in metres.
 
-    This is the artefact that lets us use the words "survey-grade" without
-    lying. `00-PRODUCT-DEFINITION.md` §4 states the budgets these are checked
-    against; nothing here decides pass/fail, it only measures.
+    This measures mesh fidelity to its stated source. It does not establish
+    survey accuracy. `00-PRODUCT-DEFINITION.md` §4 states the budgets these are
+    checked against; nothing here decides pass/fail, it only measures.
     """
 
     sampled_points: int
@@ -185,10 +229,15 @@ class DeviationReport:
     maximum: float
     within_2mm: float           # fraction of sampled points
     within_5mm: float
+    metric: str = "point-to-mesh"
+    population: int = 0
+    exact: bool = False
+    source_of_truth: str = "source observations"
 
     def summary(self) -> str:
         return (
-            f"n={self.sampled_points}  rms={self.rms * 1000:.2f} mm  "
+            f"{self.metric}  n={self.sampled_points}/{self.population or self.sampled_points}  "
+            f"{'exact' if self.exact else 'sampled'}  rms={self.rms * 1000:.2f} mm  "
             f"p99.9={self.p99_9 * 1000:.2f} mm  max={self.maximum * 1000:.2f} mm  "
             f"<=2mm={self.within_2mm * 100:.2f}%"
         )
@@ -196,32 +245,90 @@ class DeviationReport:
 
 @dataclass(frozen=True)
 class FilterStats:
-    """What each cleanup stage removed. Reported per scan so a threshold that
-    is quietly eating door frames shows up as a number instead of a complaint
-    three weeks later."""
+    """Exclusive final dispositions plus non-exclusive processing events.
+
+    Every source sample must finish in exactly one of ``retained`` or the
+    ``dropped_*`` fields. ``restored_from_carve`` is deliberately an event,
+    not a disposition: a restored sample ultimately belongs to ``retained``
+    (or a later exclusion), so counting it in both columns would make an
+    apparently detailed ledger that cannot balance.
+    """
 
     input_points: int
+    retained: int = 0
     dropped_no_return: int = 0
     dropped_despeckle: int = 0
-    dropped_mover_sweep: int = 0
     dropped_mover_carve: int = 0
     dropped_island: int = 0
+    dropped_other: int = 0
+    restored_from_carve: int = 0
 
     @property
     def total_dropped(self) -> int:
         return (
             self.dropped_no_return
             + self.dropped_despeckle
-            + self.dropped_mover_sweep
             + self.dropped_mover_carve
             + self.dropped_island
+            + self.dropped_other
         )
+
+    @property
+    def accounted(self) -> int:
+        return self.retained + self.total_dropped
+
+    @property
+    def balanced(self) -> bool:
+        return self.accounted == self.input_points
+
+    def require_balanced(self) -> None:
+        if not self.balanced:
+            raise ValueError(
+                "filter ledger does not balance: "
+                f"input={self.input_points}, accounted={self.accounted}"
+            )
 
     def summary(self) -> str:
         n = max(self.input_points, 1)
         return (
-            f"in={self.input_points}  no-return={self.dropped_no_return}  "
-            f"speckle={self.dropped_despeckle}  sweep={self.dropped_mover_sweep}  "
+            f"in={self.input_points}  retained={self.retained}  "
+            f"no-return={self.dropped_no_return}  speckle={self.dropped_despeckle}  "
             f"carve={self.dropped_mover_carve}  island={self.dropped_island}  "
-            f"({self.total_dropped / n * 100:.2f}% removed)"
+            f"other={self.dropped_other}  restored-event={self.restored_from_carve}  "
+            f"({self.total_dropped / n * 100:.2f}% removed; "
+            f"balanced={'yes' if self.balanced else 'NO'})"
         )
+
+
+@dataclass(frozen=True)
+class QAReportMetadata:
+    """Reproduction context required around every exported QA report."""
+
+    source_sha256: str
+    rapidmesh_version: str
+    settings: tuple[tuple[str, str], ...]
+    exclusions: tuple[str, ...]
+    processing_seconds: float
+    peak_rss_bytes: int | None
+
+    def __post_init__(self) -> None:
+        digest = self.source_sha256.lower()
+        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+            raise ValueError("source_sha256 must be a 64-character hexadecimal digest")
+
+
+@dataclass(frozen=True)
+class StationQAReport:
+    """The three Phase 1 reports and their shared evidence envelope."""
+
+    retained_surface: DeviationReport | None
+    filtering_ledger: FilterStats
+    mesh_to_source: DeviationReport | None
+    metadata: QAReportMetadata
+    lattice_source: str
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-ready structure without station names or coordinates."""
+        out = asdict(self)
+        out["metadata"]["settings"] = dict(self.metadata.settings)
+        return out

@@ -1,8 +1,13 @@
 # RapidMesh — architecture
 
-Read `00-PRODUCT-DEFINITION.md` first. This file explains how the code is put
-together and why each piece is where it is. `REVIEW-CAIRN-MESHING.md` explains
-what it is being built against.
+Read `00-PRODUCT-DEFINITION.md`, then `SPATIAL-CONTRACT.md`. This file explains
+how the code is put together and why each piece is where it is.
+`REVIEW-CAIRN-MESHING.md` is historical Cairn comparison evidence, not an
+integration instruction.
+
+**Revised 15 Aug 2026.** Spatially locked multiresolution output is now first;
+E57, LAS and LAZ are required; private QC comparison moves later. The existing
+native-lattice design remains the structured-E57 front half.
 
 **Revised 2 Aug 2026.** The five decisions below are unchanged and remain the
 core of the design. Added: real-data measurements (§Measured performance),
@@ -14,11 +19,11 @@ isolation.
 ## Shape of the whole system
 
 ```
-  TLS structured E57 ──► Pipeline A   native lattice, per station
+  TLS structured E57 ──► Pipeline A   native lattice
                               │
-  NavVis registered E57 ─► B1  │      points + supplied normals
+  LAS / LAZ / unstructured ─► B       evidence-preserving reconstruction
                               │
-  NavVis raw rec-v4 ─────► B2  │      accumulate from raw sweeps
+  NavVis registered/raw ────► C       supplied normals / raw sweeps
                               │
                   ┌───────────▼────────────┐
                   │  Shared back half      │
@@ -27,14 +32,17 @@ isolation.
                   └───────────┬────────────┘
                               │
                   ┌───────────▼────────────┐
-                  │  Comparison engine     │  SITE level, all stations
-                  │  IFC · BVH · modes     │  as one evidence set
-                  │  A/B/D · heat map      │  (docs/adr/ADR-005)
+                  │ RMX + alignment view   │  spatial lock first
+                  └───────────┬────────────┘
+                              │ later
+                  ┌───────────▼────────────┐
+                  │ Private QC comparison  │  surveyor/admin only
                   └────────────────────────┘
 ```
 
-**Meshing is per station. Comparison and reporting are per site.** That split
-is deliberate and is the subject of `docs/adr/ADR-005`.
+Meshing is currently per station. The combined-project display representation
+is open for investigation under `ADR-008`; later QC remains site-level and
+observation-backed under `ADR-005` and `ADR-007`.
 
 ---
 
@@ -62,7 +70,8 @@ is deliberate and is the subject of `docs/adr/ADR-005`.
   [decimate] .................. NOT YET BUILT — quadric, deviation-budgeted
         |
         v
-  triangulate.build_mesh ...... compact, oriented normals, untouched colour
+  triangulate.build_mesh ...... full pose -> project-axis offsets, oriented
+        |                       normals, untouched colour
         |
         v
   qa.deviation_report ......... the number that ships with the mesh
@@ -78,7 +87,8 @@ analytic ground truth and prints the scorecard.
 | Module | Responsibility | Depends on |
 | --- | --- | --- |
 | `types.py` | Dataclasses. No numpy at runtime. | — |
-| `e57_reader.py` | Structured E57 -> `StructuredScan`. Lattice detection. | pye57 |
+| `e57_reader.py` | Structured E57 -> `StructuredScan`. Lattice and full-pose handling. | pye57 |
+| future format adapters | LAS/LAZ and unstructured E57 -> observation/surface input | format-specific |
 | `synthetic.py` | Ray-cast fixtures with analytic ground truth. | — |
 | `grid.py` | `ScanGrid` (CSR bands) and `CoarseRangeGrid` (carving). | types |
 | `filters.py` | Despeckle, carve, parallax restore. | grid |
@@ -206,14 +216,15 @@ grid's resolution tracks the scan's own rather than sitting at a fixed
 
 ## Coordinate and precision rules
 
-Non-negotiable, and every one of them derived from a real failure mode present
-in the sample data (`docs/DATA-INVENTORY.md`).
+`SPATIAL-CONTRACT.md` is authoritative. The implementation summary is:
 
 | Rule | Reason |
 |---|---|
-| World coordinates stay f64 until localised to a station or tile origin | MGA northing 5,896,382 m has an f32 ULP of **0.5 m**, twenty times the 25 mm tolerance |
+| Project coordinates stay f64 until localised to a station or tile origin | Far-from-origin f32 coordinates cannot preserve millimetres |
 | f32 only for offsets from a local origin | At ±100 m, f32 resolution is ~8 µm. Ample |
-| The localising subtraction happens in f64 | Casting first reintroduces the error it avoids |
+| Rotation/localising subtraction happens in f64 | Casting first reintroduces the error it avoids |
+| Stored mesh offsets use project axes | `v = float32(local @ R.T)` and `project = origin + v`; a renderer does not apply `R` again |
+| Source pose remains provenance | Losing rotation makes a locally correct mesh wrong against Cairn |
 | Units are metres internally, declared explicitly | The sample IFC is in **millimetres**; the E57s are in metres |
 | Georeference from the IFC placement chain only | The sample model's `IfcSite` declares 51°30'23"N 0°07'37"W — **London**, Revit's untouched default. IFC2X3 has no `IfcMapConversion` |
 | RGB is optional | 4 of 30 sample stations carry none |
@@ -296,10 +307,10 @@ implemented. The latter is cheaper and comes first.
 
 ---
 
-## Comparison engine — not built
+## Private QC comparison engine — not built
 
-The billable half of the product (`00-PRODUCT-DEFINITION.md` §3A). None of it
-exists in the codebase today.
+A later surveyor/admin-only capability (`00-PRODUCT-DEFINITION.md` §3A).
+None of it exists in the codebase today.
 
 **Model import.** IFC2X3 and IFC4, tessellated to triangles in f64, localised
 to a site origin, BVH over the result. Preserve `GlobalId`, element type, name,
@@ -425,7 +436,7 @@ Two budgets, separately tested on the largest real station:
 | Budget | Value |
 |---|---|
 | Processing working memory, excluding incrementally written output | **≤ 512 MB** |
-| Peak process RSS, enforced by `RLIMIT_AS` | **≤ 1.5 GB** |
+| Peak process RSS, measured by the RSS watchdog | **≤ 1.5 GB** |
 
 Memory is recovered by chunking, streaming, tiling and removing verified
 duplicate allocations. **Never** by narrowing world coordinates to f32.
@@ -434,38 +445,44 @@ duplicate allocations. **Never** by narrowing world coordinates to f32.
 
 ## Not built yet, in priority order
 
-**Reordered 2 Aug 2026.** Decimation was first. It is now third, because
-`FINDING-002` showed there is no trustworthy real-data number to decimate
-against, and measurement without a valid metric is not measurement.
+**Reordered 15 Aug 2026 under ADR-008.** Spatial truth and a Cairn-aligned
+multiresolution surface precede private QC comparison.
 
-1. **QA rework — three reports.** Retained-surface fidelity (excluding
-   island-culled samples), a filtering ledger where every input sample is
-   accounted for exactly once, and **mesh-to-source deviation**. The third is
-   the only one that detects invented surface, and the only one that says
-   anything at all on real data before decimation exists. See
-   `FINDING-002-QA-DEFINITION.md` and `RAPIDMESH-REVIEW-FINDINGS.md` §1.
-2. **Chunked E57 reading.** Measured at 1,418 MB for a 14.5 M-point station
-   against a 512 MB target; a 100 M-point scan is roughly 7× worse.
-   `max_points` currently strides the lattice as a stopgap. The band interface
-   is already the right shape for the fix.
-3. **Quadric decimation with a deviation budget.** The largest remaining
+1. **Spatial contract and transform foundation.** Complete rigid pose,
+   rebasing, normal transforms and independent axis/rotation/precision tests.
+2. **QA rework — metric cores complete.** Retained-surface fidelity excludes
+   every final removal, the exclusive filtering ledger balances to the source
+   count, restoration is a separate event, and sampled **mesh-to-source
+   deviation** detects invented triangle interiors. The evidence envelope
+   carries source digest, version, settings, exclusions, timing, peak-memory
+   status and lattice provenance. Real-data figures remain gated by streaming.
+3. **Streamed E57 processing — ingestion foundation complete, geometry open.**
+   libE57 now reads into fixed-capacity chunks and an explicit core/halo
+   assembler produces bounded row bands. The current `mesh_station` path still
+   materialises scan and mesh; band-local filtering, triangulation, QA and
+   incremental output are the remaining production-memory work.
+4. **LAS/LAZ and unstructured-E57 adapters.** Preserve per-axis quantisation,
+   provenance and units; select reconstruction by measurement rather than
+   pretending a scanner lattice survived.
+5. **Quadric decimation with a deviation budget.** The largest remaining
    quality-per-byte win. Everything above produces one vertex per sample, so a
    blank wall costs as much as a cornice. Blocked behind item 1: the budget
    needs a metric that works.
-4. **The comparison engine.** IFC import, BVH, modes A/B/D, site-level heat map
-   and report. Not started, and it is the billable half of the product.
-5. **The RMX container.** Positions as f32 offsets from an f64 origin
-   (non-negotiable, product definition §7), normals, colour, UVs, an LOD chain,
-   and spatial tiling for view-dependent streaming.
-6. **Texture baking.** Decouples colour resolution from triangle count, which
+6. **The RMX container and engineering alignment view.** Positions as f32
+   offsets from an f64 origin (`SPATIAL-CONTRACT.md`), normals, colour, UVs, an
+   LOD chain, and spatial tiling for view-dependent streaming.
+7. **Texture baking.** Decouples colour resolution from triangle count, which
    is what makes aggressive decimation viable without the result looking flat.
    Note that `images2D` is empty on all 31 sample E57s, so scan RGB is the only
    available source today.
-7. **Silhouette-aware carving.** Carving is least reliable exactly where the
+8. **Private QC comparison.** IFC import, BVH, modes A/B/D, site-level heat map
+   and report for surveyors/admins only. The engine consumes observations, not
+   the display mesh.
+9. **Silhouette-aware carving.** Carving is least reliable exactly where the
    querying scan has a depth discontinuity, and the residual false positives in
    the synthetic table are concentrated there. Suppressing the test near
    discontinuities should take the false-positive rate down another order of
    magnitude.
-8. **NavVis B1, then B2.** Per `docs/adr/ADR-003` and `ADR-004`.
-9. **Rust kernels.** Only after the algorithm stops changing. The band
+10. **NavVis registered, then raw.** Per `docs/adr/ADR-003` and `ADR-004`.
+11. **Rust kernels.** Only after the algorithm stops changing. The band
    interface is already the right boundary for it.

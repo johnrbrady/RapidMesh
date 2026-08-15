@@ -1,7 +1,14 @@
 # RapidMesh project pause handover
 
-**Holding date:** 3 August 2026. **State:** Phase 1 is **PARTIAL — PAUSED**.
-Resume only after Cairn 3D is released and stable.
+> **Superseded 15 August 2026.** John explicitly resumed RapidMesh as a
+> separate project under `docs/adr/ADR-008`. Cairn remains read-only and
+> integration remains deferred. Current work starts with
+> `SPATIAL-CONTRACT.md` and Phase 0c in `CLAUDE.md`; the remainder of this file
+> records the verified 3 August holding state and is not a current stop order.
+
+**Holding date:** 3 August 2026. **Historical state:** Phase 1 was
+**PARTIAL — PAUSED**. The holding instruction was to wait for Cairn stability;
+the 15 August decision above supersedes it.
 
 ## Boundary and holding state
 

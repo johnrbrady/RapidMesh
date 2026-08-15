@@ -1,6 +1,7 @@
 # ADR-005 — Per-station meshes, site-level comparison and reporting
 
-**Status:** Accepted
+**Status:** Accepted for evidence geometry and site-level QC; combined-project
+display choice reopened by `ADR-008`
 **Date:** 2 August 2026
 **Amends:** `00-PRODUCT-DEFINITION.md` §5, which places station merging out of
 scope. That remains true for **geometry**. It is now explicitly false for

@@ -24,10 +24,19 @@ from typing import TYPE_CHECKING
 from .filters import clean
 from .grid import CoarseRangeGrid, ScanGrid
 from .triangulate import build_mesh, cull_islands, triangulate
-from .types import DeviationReport, FilterStats, LatticeInfo, MeshData, StructuredScan
+from .types import (
+    DeviationReport,
+    FilterStats,
+    LatticeInfo,
+    MeshData,
+    QAReportMetadata,
+    StationQAReport,
+    StructuredScan,
+)
 
 if TYPE_CHECKING:
-    pass
+    import numpy as np
+    import numpy.typing as npt
 
 
 @dataclass
@@ -39,7 +48,9 @@ class MeshResult:
     stats: FilterStats
     lattice: LatticeInfo
     deviation: DeviationReport | None = None
+    mesh_to_source: DeviationReport | None = None
     timings: dict[str, float] = field(default_factory=dict)
+    settings: dict[str, float | int | bool] = field(default_factory=dict)
     station_id: str = ""
 
     def summary(self) -> str:
@@ -50,12 +61,48 @@ class MeshResult:
             f"mesh       {self.mesh.vertex_count:,} verts  {self.mesh.triangle_count:,} tris",
         ]
         if self.deviation:
-            lines.append(f"deviation  {self.deviation.summary()}")
+            lines.append(f"retained   {self.deviation.summary()}")
+        if self.mesh_to_source:
+            lines.append(f"reverse    {self.mesh_to_source.summary()}")
         if self.timings:
             total = sum(self.timings.values())
             parts = "  ".join(f"{k}={v:.2f}s" for k, v in self.timings.items())
             lines.append(f"time       {total:.2f}s  ({parts})")
         return "\n".join(lines)
+
+    def evidence_report(
+        self, source_sha256: str, peak_rss_bytes: int | None = None
+    ) -> StationQAReport:
+        """Package all QA outputs with reproducibility metadata.
+
+        Station identity and coordinates are intentionally absent. The source
+        digest is the join to an authorised evidence register.
+        """
+        from . import __version__
+
+        metadata = QAReportMetadata(
+            source_sha256=source_sha256,
+            rapidmesh_version=__version__,
+            settings=tuple(
+                (key, str(value)) for key, value in sorted(self.settings.items())
+            ),
+            exclusions=(
+                "no-return",
+                "despeckled",
+                "carved",
+                "island-culled",
+                "otherwise-excluded",
+            ),
+            processing_seconds=sum(self.timings.values()),
+            peak_rss_bytes=peak_rss_bytes,
+        )
+        return StationQAReport(
+            retained_surface=self.deviation,
+            filtering_ledger=self.stats,
+            mesh_to_source=self.mesh_to_source,
+            metadata=metadata,
+            lattice_source=self.lattice.source.value,
+        )
 
 
 def mesh_station(
@@ -79,7 +126,7 @@ def mesh_station(
     range sigma. 12 mm suits a 2 mm-sigma scanner. Too low perforates flat
     surfaces at close range; too high starts bridging genuine thin gaps.
     """
-    from .qa import deviation_report
+    from .qa import deviation_report, mesh_to_source_report
 
     t: dict[str, float] = {}
 
@@ -89,24 +136,40 @@ def mesh_station(
 
     t0 = time.perf_counter()
     grid = ScanGrid.build(cleaned)
-    tris = triangulate(
+    tris_before_cull = triangulate(
         grid, max_incidence_deg=max_incidence_deg, noise_floor=noise_floor
     )
     t["triangulate"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     if min_component_area > 0:
-        tris = cull_islands(grid.scan.xyz, tris, min_area=min_component_area)
+        tris = cull_islands(
+            grid.scan.xyz, tris_before_cull, min_area=min_component_area
+        )
+    else:
+        tris = tris_before_cull
     t["cull"] = time.perf_counter() - t0
 
     t0 = time.perf_counter()
     mesh = build_mesh(grid.scan, tris)
     t["assemble"] = time.perf_counter() - t0
 
+    used_before_cull = _used_vertices(len(grid.scan), tris_before_cull)
+    used_final = _used_vertices(len(grid.scan), tris)
+
     dev = None
+    reverse = None
     if measure and mesh.triangle_count:
+        import numpy as np
+
         t0 = time.perf_counter()
-        dev = deviation_report(mesh, grid.scan.xyz, max_samples=measure_samples)
+        retained_offsets = grid.scan.pose.rotate_local(
+            grid.scan.xyz[used_final]
+        ).astype(np.float32)
+        dev = deviation_report(mesh, retained_offsets, max_samples=measure_samples)
+        reverse = mesh_to_source_report(
+            mesh, retained_offsets, max_samples=measure_samples
+        )
         t["measure"] = time.perf_counter() - t0
 
     # Samples that survived filtering but ended up in no triangle disappear in
@@ -116,19 +179,46 @@ def mesh_station(
     # than left unaccounted for.
     stats = FilterStats(
         input_points=stats.input_points,
+        retained=int(used_final.sum()),
+        dropped_no_return=stats.dropped_no_return,
         dropped_despeckle=stats.dropped_despeckle,
         dropped_mover_carve=stats.dropped_mover_carve,
-        dropped_island=max(len(grid.scan) - mesh.vertex_count, 0),
+        dropped_island=int((used_before_cull & ~used_final).sum()),
+        dropped_other=stats.dropped_other + int((~used_before_cull).sum()),
+        restored_from_carve=stats.restored_from_carve,
     )
+    stats.require_balanced()
 
     return MeshResult(
         mesh=mesh,
         stats=stats,
         lattice=cleaned.lattice,
         deviation=dev,
+        mesh_to_source=reverse,
         timings=t,
+        settings={
+            "max_incidence_deg": max_incidence_deg,
+            "noise_floor": noise_floor,
+            "min_component_area": min_component_area,
+            "despeckle": despeckle,
+            "measure": measure,
+            "measure_samples": measure_samples,
+        },
         station_id=scan.station_id,
     )
+
+
+def _used_vertices(
+    n: int, tris: npt.NDArray[np.int64]
+) -> npt.NDArray[np.bool_]:
+    """Boolean source-membership mask for a triangle array."""
+    import numpy as np
+
+    out = np.zeros(n, dtype=bool)
+    array = np.asarray(tris)
+    if array.size:
+        out[array.ravel()] = True
+    return out
 
 
 def carve_grids(scans: list[StructuredScan], exclude: str, nearest: int = 2) -> list[CoarseRangeGrid]:

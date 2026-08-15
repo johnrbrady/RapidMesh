@@ -303,23 +303,38 @@ def clean(
         current = select(grid.scan, keep)
 
     if others:
-        drop = ~carve_movers(
+        initial_drop = ~carve_movers(
             current,
             others,
             clear_margin=float(kwargs.get("clear_margin", 0.4)),
             relative_margin=float(kwargs.get("relative_margin", 1.02)),
             min_votes=int(kwargs.get("min_votes", 1)),
         )
-        if restore and np.any(drop):
+        drop = initial_drop
+        if restore and np.any(initial_drop):
             drop = restore_parallax_carve(
                 ScanGrid.build(current),
                 drop,
                 min_support=int(kwargs.get("restore_support", 5)),
             )
+            stats_kw["restored_from_carve"] = int(
+                np.count_nonzero(initial_drop & ~drop)
+            )
         stats_kw["dropped_mover_carve"] = int(np.count_nonzero(drop))
         current = select(current, ~drop)
 
-    return current, FilterStats(input_points=n0, **stats_kw)  # type: ignore[arg-type]
+    source_count = scan.source_sample_count
+    input_points = (
+        source_count
+        if source_count is not None
+        else n0 + scan.dropped_no_return + scan.dropped_other
+    )
+    return current, FilterStats(
+        input_points=input_points,
+        dropped_no_return=scan.dropped_no_return,
+        dropped_other=scan.dropped_other,
+        **stats_kw,
+    )
 
 
 # --------------------------------------------------------------------------

@@ -2,10 +2,11 @@
 
 Opening brief for an implementation session. Assumes no prior context.
 
-> **Pause notice (3 August 2026):** Phase 1 is **PARTIAL — PAUSED** while Cairn
-> 3D is completed and released. Do not follow the older "start here" wording
-> below until Cairn is stable and resumption is approved. The authoritative
-> restart boundary is `docs/PROJECT-PAUSE-HANDOVER.md`.
+> **Resume notice (15 August 2026):** John explicitly resumed RapidMesh as a
+> separate project. Cairn remains read-only and integration remains deferred.
+> Read `SPATIAL-CONTRACT.md` and start at Phase 0c in `CLAUDE.md`; the older
+> phase narrative below remains useful historical context where it does not
+> conflict with `ADR-008`.
 
 Written 2 August 2026, after the first run of RapidMesh against real client
 data and the architecture review that followed.
@@ -27,8 +28,8 @@ session.
 Cairn repo (phase 0 only):  [PATH TO pointcloud-viewer]
 Reference data:             H:\Sample   read-only, never committed
 
-Do not resume work until Cairn 3D is released and stable. Then start at Phase
-1a exactly as specified in docs/PROJECT-PAUSE-HANDOVER.md.
+RapidMesh has resumed outside Cairn. Start at Phase 0c in CLAUDE.md and keep
+Cairn read-only until integration is explicitly approved.
 ```
 
 ---
@@ -39,13 +40,14 @@ Do not resume work until Cairn 3D is released and stable. Then start at Phase
 |---|---|---|
 | 1 | `CLAUDE.md` | Charter. Every session |
 | 2 | `00-PRODUCT-DEFINITION.md` | Highest authority |
-| 3 | `ARCHITECTURE.md` | How the code is put together and why |
-| 4 | `docs/DATA-INVENTORY.md` | Measured facts about the real sample files |
-| 5 | `FINDING-002-QA-DEFINITION.md` | Why phase 1 is what it is |
-| 6 | `FINDING-003-GEOMETRIC-TAIL.md` | The open p99.9 question and its isolation matrix |
-| 7 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review. Requirements, not commentary |
-| 8 | `docs/adr/ADR-001` … `ADR-007` | Decisions taken, with reasoning |
-| 9 | `REVIEW-CAIRN-MESHING.md`, `FINDING-001-PDAL-QUANTISATION.md`, `CAIRN-MESH-MEMORY-ISSUE.md` | Cairn context |
+| 3 | `SPATIAL-CONTRACT.md` | Coordinate, precision and alignment authority |
+| 4 | `ARCHITECTURE.md` | How the code is put together and why |
+| 5 | `docs/DATA-INVENTORY.md` | Measured facts about the real sample files |
+| 6 | `FINDING-002-QA-DEFINITION.md` | Why phase 1 is what it is |
+| 7 | `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 isolation matrix |
+| 8 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review. Requirements, not commentary |
+| 9 | `docs/adr/ADR-001` … `ADR-008` | Decisions taken, with reasoning |
+| 10 | `REVIEW-CAIRN-MESHING.md`, `FINDING-001-PDAL-QUANTISATION.md`, `CAIRN-MESH-MEMORY-ISSUE.md` | Cairn history and reference only |
 
 **Where the code disagrees with these documents, report the conflict and
 stop.** Do not resolve it silently.
@@ -54,18 +56,17 @@ stop.** Do not resolve it silently.
 
 ## 2. What this project is
 
-Terrestrial laser scan in, lightweight streamable surface out, plus a numerical
-report of how far an imported BIM model sits from the scan evidence.
-
-**The mesh makes it usable. The comparison report makes it billable.**
+E57, LAS or LAZ in; a lightweight streamable multiresolution surface out,
+spatially locked to the original Cairn point cloud. Private surveyor/admin QC
+comparison comes later and is never client-facing.
 
 Two scan families. **TLS is primary** and carries the competitive claim; NavVis
 is second. **Meshing is per station; comparison and reporting are per site**
 (`ADR-005`).
 
-Destination: integration into Cairn 3D at phase 7, behind a feature flag,
-alongside the existing loader, legacy `.cmh` assets and old projects untouched.
-Until then RapidMesh neither imports Cairn nor is imported by it.
+Destination: separately approved future integration into Cairn, with old
+projects preserved. Until then RapidMesh neither imports Cairn nor is imported
+by it, and Cairn is read-only reference material.
 
 Cintoo and TurboMesh are a **public capability benchmark only**. Nothing is
 copied or examined. We may say RapidMesh is *intended* to compete; we may not
@@ -98,9 +99,9 @@ cross-station occlusion carving with parallax restore, discontinuity-aware
 triangulation, area-based island culling, oriented normals, analytic synthetic
 fixtures, CLI (`probe` / `mesh` / `bench`).
 
-**Not built:** decimation, RMX container, texture, LOD chain, chunked/streamed
-processing, and **the entire comparison engine** — IFC import, BVH, modes
-A/B/D, heat map, site-level report. That last group is the billable half.
+**Not built:** LAS/LAZ ingestion, decimation, RMX container, texture, LOD chain,
+chunked/streamed processing, the engineering alignment view, and the later
+private QC comparison engine.
 
 ---
 
@@ -309,13 +310,12 @@ Full gates in `00-PRODUCT-DEFINITION.md` §8.
 
 | Phase | Deliverable |
 |---|---|
-| **2** | Real-data baseline, Cairn vs RapidMesh, same file, same metric. **Confirm or refute `FINDING-001` first** — if Cairn quantises to 1 cm the comparison is against a handicapped opponent and the report must say so. Also obtain the scanner identity and registration report |
-| **3a** | Comparison vertical slice: mode A only, one station against the IFC, JSON out, no heat map. Built on the **observation-set interface** (`ADR-007`), with the **decimation-invariance test** in place |
-| **3b** | Error-bounded decimation, LOD chain, tiled incremental writing, tile-size benchmark |
-| **4** | RMX, browser first paint, progressive refinement, texture |
-| **5** | Site-level comparison: modes B and D, heat map both targets, full report |
+| **2** | E57/LAS/LAZ ingestion parity and a comparable real-data baseline |
+| **3** | Error-bounded decimation, LOD chain, tiled incremental writing and tile-size benchmark |
+| **4** | RMX, progressive loader, engineering alignment view and texture |
+| **5** | Surveyor/admin-only QC comparison vertical slice, then site-level modes B and D |
 | **6** | NavVis B1, then B2 |
-| **7** | Cairn integration |
+| **7** | Separately approved Cairn integration |
 
 ---
 
