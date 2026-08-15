@@ -1,17 +1,43 @@
-# Finding 001 — Cairn is likely quantising E57 imports to 1 cm
+# Finding 001 — Cairn was quantising E57 imports to 1 cm. Confirmed, and fixed in Cairn
 
 **Date:** 31 July 2026. **Wording revised 2 Aug 2026** per
-`RAPIDMESH-REVIEW-FINDINGS.md` §6.1: unconfirmed against a real file, so
-neither the title nor the body may state it as settled.
-**Severity:** High if confirmed. Would affect the point cloud, the mesh, and
-every measurement.
-**Effort to fix:** One line in `backend/converter.py`.
-**Status:** Derived from PDAL's documented default and not yet run against a
-real Cairn LAZ. **Confirmation required** with `tools/check_laz_precision.py`
-before any of this is acted on, restated as settled, or used to justify a
-code change. The command and its actual output belong in this document as
-evidence the moment that run happens — until then this is a documented
-hypothesis, not a finding.
+`RAPIDMESH-REVIEW-FINDINGS.md` §6.1, which barred the title and body from
+stating this as settled while it was unconfirmed against a real file. **That
+constraint is discharged** — see the status below. It was the right constraint,
+and it held until the evidence arrived.
+**Severity:** High. Affected the point cloud, the mesh, and every measurement.
+**Effort to fix:** One line in `backend/converter.py`. That is what it took.
+**Status: CONFIRMED, AND FIXED IN CAIRN.** Cairn confirmed PDAL's documented
+0.01 default was genuinely in force and changed `e57_to_laz` to write at scale
+**0.001** on all three axes with `offset_x/y/z=auto`. The in-code comment is
+dated 4 Aug 2026; the change landed in commit `59dbe02` (5 Aug 2026). This
+document's original body, written while the hypothesis was still open, is left
+below unaltered as the record of the reasoning — read it as history, not as
+current status.
+
+**Two differences between what this document proposed and what Cairn did, both
+deliberate:**
+
+- **Scale.** This finding proposed 0.0001 m (0.1 mm). Cairn chose **0.001 m
+  (1 mm)**, on the grounds that it matches PotreeConverter's own octree
+  quantisation — so the LAZ sidecar is no longer the limiting term, which was
+  the actual defect. Below 1 mm the octree, not the sidecar, becomes the floor.
+- **Evidence.** Cairn did not confirm this with `tools/check_laz_precision.py`.
+  It confirmed it by round-tripping a synthetic six-decimal test coordinate
+  through `pdal translate` and observing it return truncated to two decimals,
+  with header scales of 0.01 on all three axes. That is the same fact by a
+  different route, and it settles the question the §6.1 wording was protecting
+  against.
+
+`offset_*=auto` was adopted as this document argued, and for the reason this
+document gave: at scale 0.001 an MGA northing needs an integer that overflows
+LAS's int32 unless each file is re-based on its own data.
+
+**What remains open.** The fix applies to new imports only. Anything converted
+before it is permanently quantised in its LAZ; recovery is a reimport from the
+retained raw E57, not a re-survey. Any Phase 2 baseline drawn from a pre-fix
+import is a baseline against a handicapped opponent and must say so — see
+`CLAUDE.md` §9 item 8.
 
 ---
 

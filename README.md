@@ -15,7 +15,7 @@ lattice; LAS and LAZ require a separate reconstruction path.
 | `00-PRODUCT-DEFINITION.md` | What is being built and the numbers it commits to. Read first. |
 | `SPATIAL-CONTRACT.md` | Coordinate, transform, precision and Cairn-alignment authority. |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's `mesher.py` already does, and the six real gaps. |
-| `FINDING-001-PDAL-QUANTISATION.md` | **Cairn is likely snapping every scan to a 1 cm grid at import** — derived from PDAL's documented default, not yet confirmed against a real Cairn LAZ. Would affect the point cloud too, not just the mesh, if confirmed. One-line fix. |
+| `FINDING-001-PDAL-QUANTISATION.md` | **Cairn was snapping every scan to a 1 cm grid at import. Confirmed, and fixed in Cairn** (writer moved to 1 mm scale with auto offsets, commit `59dbe02`, 5 Aug 2026). Affected the point cloud too, not just the mesh. Imports made before the fix stay quantised until reimported. |
 | `ARCHITECTURE.md` | How the code is put together and why. |
 
 ## Status

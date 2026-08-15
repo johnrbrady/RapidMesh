@@ -171,6 +171,35 @@ mesher's fixed acceptance test, not an open-ended accuracy chase.
 
 Maximum deviation is always reported and never capped.
 
+**Split reporting — DEC-006.** *Project-lead decision, 15 August 2026
+(project-lead decisions register): the 10 mm-floor acceptance test is
+split-reported. Mesher acceptance applies to RapidMesh's own contribution,
+measured by the noise-isolated method; the propagated instrument-noise term is
+reported separately beside it; the end-to-end figure is still reported and is
+re-baselined when the real instrument sigma arrives.*
+
+**The budgets in the table above do not change.** What the decision fixes is
+*which measured quantity* is tested against them, and that all three quantities
+are published together — never one standing in for another.
+
+| Reported quantity | Measured how | Tested against the budgets above |
+|---|---|---|
+| **RapidMesh's own contribution** | Noise-isolated, by the `FINDING-003-GEOMETRIC-TAIL.md` isolation-matrix method | **Yes. This is the mesher's acceptance test** |
+| **Propagated observation noise** | The same sweep at the source's declared — or, failing that, explicitly assumed — range sigma | No. Reported separately, beside it, with the sigma named |
+| **End-to-end deviation** | Both terms together, as the surveyor encounters them | No, but always reported, and never omitted because it is the larger number |
+
+Two things this is not. It is **not** a widening: no budget moves, and a
+mesher-only figure over 3.2 mm still fails (§4.3 records exactly that failure
+and its wording is unchanged). It is **not** a claim that the end-to-end figure
+is acceptable — only that it is a different quantity, and attributing it wholly
+to the mesher was the misattribution `FINDING-003` corrected.
+
+**Pending evidence:** the end-to-end figure's re-baseline is blocked on the real
+instrument sigma for the reference dataset, which has not been obtained
+(`CLAUDE.md` §9 item 11). Until it arrives, every end-to-end figure states the
+sigma it assumed and that the assumption is a test parameter, not a measured
+property of any real instrument.
+
 ### 4.1a Minimum defensible tolerance — computed, not asserted
 
 The 10 mm floor is a **global product minimum**, not a claim that 10 mm is
@@ -188,6 +217,21 @@ basis:
 - registration and control/georeferencing uncertainty
 - comparison sampling contribution
 - whether the selected tolerance is supported by the available evidence
+
+**DEC-006 governs the second term here as well** *(project-lead decision,
+15 August 2026, project-lead decisions register: mesher acceptance is the
+noise-isolated own-contribution figure, the propagated-noise term is reported
+separately beside it, and the end-to-end figure is still reported and
+re-baselined on the real sigma).* RapidMesh's contribution enters this
+computation **noise-isolated**. Propagated observation noise belongs to the
+instrument-uncertainty term and is never folded into RapidMesh's, in either
+direction — doing so would either flatter the mesher or charge it for the
+instrument, and the split exists to make both impossible.
+
+Where the instrument sigma is undeclared it is a **missing input** under the
+rule below, not a number to assume. For the reference dataset that is exactly
+where it stands today, and it is the same pending evidence the §4.1 end-to-end
+re-baseline waits on.
 
 **Do not simply add RMS, p99.9, registration residuals and survey accuracy.**
 They are different statistics at different confidence levels. The combination
@@ -246,12 +290,26 @@ Best synthetic result 1.00 mm RMS / 3.55 mm p99.9. Budget at the 25 mm default
 is 8.0 mm p99.9 (pass, with margin); at the 10 mm floor it is 3.2 mm (fail, by
 11%).
 
-**Measured, not assumed:** the tail is geometric, not stochastic. At zero range
-noise with carving disabled, p99.9 is still 12.89 mm at coarse sampling. Range
-noise moves it about 5%; carving moves it about 5%. The responsible stage is
-**not yet identified**, and an isolation matrix is a phase 1 deliverable. See
-`FINDING-003-GEOMETRIC-TAIL.md`. Do not attribute a cause before that run
-completes, and do not quietly widen the 3.2 mm budget.
+**Measured, not assumed:** the isolation matrix has been run
+(`FINDING-003-GEOMETRIC-TAIL.md`, 2 Aug 2026), and it inverts the earlier
+reading. At the fine 0.090° sampling the finding specifies, **RapidMesh's own
+geometric contribution to this fixture is ≈ 0 mm** — walls and floor both read
+exactly 0.00 mm RMS, p99.9 and max at zero injected noise. **The reported tail
+tracks the injected noise and nothing else:** p99.9 rises 0.00 → 2.23 → 3.47 →
+4.40 → 5.99 mm as range sigma rises 0 → 1 → 2 → 3 → 5 mm, while carving,
+parallax restore and island culling each move it by ≤ 0.02 mm and
+`max_incidence_deg` is bit-for-bit identical across 78–85°. The earlier
+"12.89 mm at zero noise" figure was honestly measured but taken at a coarser
+sampling, where binning error swamped the noise signal.
+
+This is a result about **one synthetic planar fixture at an assumed 2 mm range
+sigma**, not a universal zero-error claim and not a property of any real
+dataset. The 2 mm sigma is a documented test parameter; the reference data's
+actual instrument is unknown (`CLAUDE.md` §9 item 11). **Do not quietly widen
+the 3.2 mm budget.** The verdict above is unchanged: the gap to the 10 mm floor
+is real, and this finding says it is dominated by propagated observation noise
+rather than by mesher defect — which is a statement about where the budget
+goes, not permission to enlarge it.
 
 Until §6's QA rework lands, **no real-data fidelity claim may be made.** The
 targets stand; the evidence for them is narrower than this document previously
@@ -322,7 +380,7 @@ what is missing.
 | Georeferencing of raw NavVis output | Blocked | Surveyed coordinates for anchors TDS4–TDS10; `anchor_poses.txt` is empty |
 | Panoramas, texture from imagery | Blocked | Stitched panoramas. Raw recording has 196 unstitched DNG, `processed_panoramas: 0` |
 | Scanner-ray comparison (mode B) validation | Blocked | A model for site 02516.182 |
-| Combined-project representation | Investigation open | Evidence comparing per-station coordination, fused display-only output, or both; registration residuals where fusion is evaluated |
+| Combined-project representation | **Scheduled — phase 3** (DEC-007) | Evidence comparing per-station coordination, fused display-only output, or both; registration residuals where fusion is evaluated |
 | Scanner make/model detection | Blocked | Files that declare `sensorVendor` |
 
 ---
@@ -396,13 +454,26 @@ being finished.
 | **0a** | **Endpoint safety, today.** Disable or authorise-gate `build_meshes` and `build_vantage_meshes` at the server, not the frontend. Automatic meshing stays off | Both routes return 403/404 to an unauthorised direct call, proven by test. No route can reach `mesher.py` from an ordinary request |
 | **0b** | Job isolation. Child process, per-workload `RLIMIT_AS`, pre-flight ceiling, no retry loop | 1.77 GB file fails its own job; `/api/health` 200 throughout; other projects viewable; scan preserved; explicit failure status; `dmesg` shows the child killed, not uvicorn |
 | **0c** | Spatial contract and transform foundation | Full rigid pose, units and rebasing chain documented and tested; rotation/axis/scale/precision regressions pass; repository gates green |
-| **1** | QA rework (§6) + streamed/chunked processing + **the completed `FINDING-003` isolation matrix** + clean-checkout gate | Real-data bidirectional figures and balanced ledger; working memory ≤ 512 MB and measured peak RSS ≤ 1.5 GB; incremental output; tools run from a clean checkout |
-| **2** | E57/LAS/LAZ ingestion parity and real-data baseline | Each required format either passes its explicit input gate or reports unsupported; source quantisation and provenance preserved; Cairn comparison uses the same source and metric where valid |
-| **3** | Error-bounded decimation + LOD chain + tiled incremental writing | Every LOD remains spatially locked and within its stated deviation budget on real data; §4.1 and seam-local gates pass |
-| **4** | RMX container, progressive browser loader, engineering alignment view and texture | Points/RapidMesh switching and overlay pass the `SPATIAL-CONTRACT.md` view matrix; first paint and navigation targets measured; package size compared honestly |
-| **5** | Surveyor/admin QC comparison: vertical slice, then modes B and D, heat map and report | Observation-backed JSON and heat map agree; grey and attribution correct; QC routes and controls absent for client audiences |
-| **6** | NavVis B1, then B2 | Per `docs/adr/ADR-003`, `ADR-004` |
-| **7** | Cairn integration | Legacy projects open; RapidMesh disableable; export restrictions enforced; QC absent for client audiences |
+| **1** | QA rework (§6) + streamed/chunked processing + **the completed `FINDING-003` isolation matrix** + clean-checkout gate. Design-first: halo calculus, two-pass island finalisation, versioned intermediate tile contract v0, determinism spec. Also the per-station observation store phase 5 later consumes | **Streamed ≡ in-memory equivalence on fixtures, exact** — mesh, ledger and both QA directions identical to `pipeline.mesh_station`; every source sample carries exactly one final disposition and the ledger balances on every station, with halo evidence never double-counted; output independent of chunk and band size per the determinism spec; no row seam, **including the azimuth wrap seam**; no full-resolution mesh in memory; working memory ≤ 512 MB and peak (`VmHWM`-class) RSS ≤ 1.5 GB on the 14.5 M-point station, asserted in tests; both QA directions on authorised real data at both reference resolutions; all 30 structured stations process, including the 4 without colour; coordinate precision at real MGA-magnitude values; existing tests green; smoke gate from a fresh clone |
+| **2a** | **Ingestion contract and Cairn baseline** — on the critical path. LAS/LAZ ingestion contract, honest unsupported reporting, and a Cairn-vs-RapidMesh baseline on the same structured E57s. No reconstruction R&D here | Each required format either passes its explicit input gate or reports "surface reconstruction not yet supported" with the missing capability named; per-axis scale/offset preserved and quantisation reported; no unrecorded coordinate change; baseline rows committed to `benchmarks/` with their commands and commit ids, recording which Cairn converter version produced the LAZ |
+| **3** | Error-bounded decimation + LOD chain + tiled incremental writing. **ITEM-001, the combined-project investigation, runs inside this phase** | Every LOD spatially locked and within its declared budgets on real data — **magnitude and bias**, the bias budget flat and tiny at every level; guaranteed per-tile error bounds reported beside sampled percentiles; no cracks or T-junctions; seam-local maxima pass; deterministic re-runs; fine-feature survival thresholds met; output size competitive at **equal measured fidelity** against the 2a baseline; ITEM-001 decision memo delivered |
+| **4** | **Streamable container decided by benchmark**, progressive browser loader, engineering alignment view. The container and manifest make the QC-only / client-audience tier distinction structural | No visible or measurable switch displacement across the full `SPATIAL-CONTRACT.md` view matrix, at every LOD transition; large-coordinate and rotated-project cases pass; first paint ≤ 1 s under the defined 10 Mbit and stated-latency contract, per scenario; frame rate and GPU memory on named hardware **including a mid-range phone and a tablet**; progressive refinement stable with the worst streaming frame recorded; failed and missing tiles degrade safely |
+| **2b** | **LAS/LAZ and unstructured-E57 reconstruction** — parallel to or after phase 4, not on the first-release critical path | Format-specific gates pass; quantisation, local spacing, method, parameters and bidirectional residuals reported; "no native lattice: surface topology inferred" stated; cross-format alignment of the same observations within quantisation plus a stated budget; unsupported inputs identified and refused cleanly |
+| **5** | Surveyor/admin QC comparison: vertical slice, then modes B and D, heat map and report. **Entry criterion:** the IFC toolchain licence position answered in writing before the dependency is introduced | Observation-backed JSON and heat map agree; grey and attribution correct; decimation-invariance test in place before the engine grows; QC routes and controls absent for client audiences |
+| **6** | NavVis B1. B2 deferred past the first release and re-estimated when scheduled | Per `docs/adr/ADR-003`, `ADR-004`. No mover-removal claim for B1; no invented georeferencing; map-frame output labelled as such |
+| **7** | Cairn integration | Legacy projects open; RapidMesh disableable; failed jobs preserve the source project; API health under large jobs; permissions enforced server-side; QC absent and export restrictions enforced for client audiences, **tested per denial**; upgrade and rollback proven; 30-concurrent-viewer tile-serving probe passes |
+
+**First release, and why the numbering is not the order.** The first release is
+**Points ↔ RapidMesh through Cairn for structured terrestrial E57 only**
+(*DEC-003, project-lead decision 15 August 2026, project-lead decisions
+register*). Execution order is therefore **0a → 0b → 0c → 1 → 2a → 3 → 4 → 7**,
+with **2b**, **5** and **6** after it, alongside the hardening subset a pilot
+needs. Phase 2 split because the ingestion contract and the Cairn baseline are
+needed early and cheaply, while reconstruction for formats with no native
+lattice is open-ended research that must not sit on the critical path.
+LAS and LAZ remain required product inputs throughout — until 2b they are
+accepted, validated and honestly reported unsupported, never silently given
+structured-E57 fidelity.
 
 **Two ordering decisions worth defending.**
 
@@ -417,6 +488,29 @@ continue on an ambiguous coordinate contract.
 Comparison moved behind the aligned multiresolution surface by John's decision
 of 15 August 2026. Its observation-set architecture remains valid and prevents
 later QC numbers from depending on a display mesh.
+
+**Three decisions that shape the phases above**, each a project-lead decision
+of 15 August 2026 recorded in the project-lead decisions register:
+
+- **DEC-004** — client audiences receive decimated, error-bounded LODs only;
+  the full-resolution tier is surveyor/admin QC only and per-vertex source
+  identity never leaves the server. Structural in the phase 4
+  container/manifest, enforced server-side with per-denial tests at phase 7.
+- **DEC-005** — the streamable container is decided by benchmark, not
+  preference: phase 3 builds against a draft versioned RapidMesh manifest, and
+  early phase 4 benchmarks standard payloads (glTF + meshopt-class, decoders
+  self-hosted) against a bespoke binary on the real reference station for size,
+  browser decode time and implementation effort, committing on the numbers and
+  recording the result as an ADR. A bespoke format is chosen only if the
+  standard route fails a stated gate. **The name "RMX" is no longer assumed**;
+  the manifest is RapidMesh's regardless of which container wins.
+- **DEC-007** — a display-only site-level coarse tier is pre-approved subject
+  to phase 3 measurement (§8D).
+
+Texture baking and silhouette-aware carving carry **no phase number**: both
+follow the first release, texture by sequencing and carving because
+`FINDING-003` left no measured need for it. Neither may be claimed until it is
+scheduled and built.
 
 ---
 
@@ -482,13 +576,13 @@ stdlib `inspect` and broke every script run from `tools/`.
 |---|---|
 | Source size, point count, lattice tier | Now |
 | Layered noise sweep: 0, 1, 2, 3, 5 mm sigma, layers 1–4 | Phase 1 |
-| Tile-size sweep: memory, output size, locked-boundary %, seam-local max deviation, cracks, decimation ratio, LOD0 bytes and decode time | Phase 3b |
+| Tile-size sweep: memory, output size, locked-boundary %, seam-local max deviation, cracks, decimation ratio, LOD0 bytes and decode time | Phase 3 |
 | Processing time, peak RSS, working memory | Phase 1 |
 | RMS, p99.9, max — retained-surface **and** mesh-to-source | Phase 1 |
 | Filtering ledger completeness | Phase 1 |
-| Cairn vs RapidMesh on the same file | Phase 2 |
-| Output size, compression ratio | Phase 3b |
-| Fine-feature survival; opening and occlusion preservation | Phase 3b |
+| Cairn vs RapidMesh on the same file | Phase 2a |
+| Output size, compression ratio | Phase 3 |
+| Fine-feature survival; opening and occlusion preservation | Phase 3 |
 | Time to first paint; time to usable detail | Phase 4 |
 | Browser frame rate, GPU memory | Phase 4 |
 | Measurement differences against the original E57 | Phase 4 |
@@ -532,13 +626,21 @@ Each is answered in the report it appears in, with the rule stated.
 
 Per-station geometry preserves original evidence and cannot hide registration
 error (`docs/adr/ADR-005`). A seamless display surface may improve the expected
-experience. John has deliberately left the choice open pending investigation
-of alignment truth, seams, registration uncertainty, package size, first paint
-and interaction behaviour.
+experience. The choice stays open pending investigation of alignment truth,
+seams, registration uncertainty, package size, first paint and interaction
+behaviour — **and that investigation is now scheduled inside phase 3** as
+ITEM-001.
 
-**Condition, non-negotiable:** a future unified surface is **display only**. It
-never produces numbers, and it never replaces or obscures the per-station
-evidence that measurements are traced to.
+**DEC-007** *(project-lead decision, 15 August 2026, project-lead decisions
+register)*: if phase 3's measurements show per-station LOD0s cannot meet the
+1 s site first paint, a fused **display-only** site-level coarse tier is
+approved product behaviour without a further decision round. What is
+pre-approved is the tier, not the conclusion — the measurement still decides
+whether it is built.
+
+**Condition, non-negotiable and unchanged:** a unified surface is **display
+only**, forever. It never produces numbers, and it never replaces or obscures
+the per-station evidence that measurements are traced to.
 
 ---
 
@@ -552,9 +654,9 @@ evidence that measurements are traced to.
 | `docs/DATA-INVENTORY.md` | Measured facts about the sample data. Never guess where this has a number |
 | `REVIEW-CAIRN-MESHING.md` | What Cairn's mesher does, and the real gaps |
 | `RAPIDMESH-REVIEW-FINDINGS.md` | External review, 1 Aug 2026. Requirements, not commentary |
-| `FINDING-001-PDAL-QUANTISATION.md` | Cairn likely quantising E57 imports to 1 cm |
+| `FINDING-001-PDAL-QUANTISATION.md` | Cairn was quantising E57 imports to 1 cm. Confirmed, and fixed in Cairn 4–5 Aug 2026; pre-fix imports stay quantised |
 | `FINDING-002-QA-DEFINITION.md` | The deviation report measures the wrong thing |
-| `FINDING-003-GEOMETRIC-TAIL.md` | The p99.9 tail is geometric; cause not yet identified |
+| `FINDING-003-GEOMETRIC-TAIL.md` | On the tested fine planar fixture the p99.9 tail tracks injected noise and RapidMesh's own geometric contribution is ≈ 0 mm. Not a universal zero-error claim |
 | `CAIRN-MESH-MEMORY-ISSUE.md` | The production defect phase 0 fixes |
 | `docs/adr/ADR-001` … `ADR-008` | Decisions taken, with reasoning |
 | `docs/HANDOVER.md` | Cold-start brief for an implementation session |

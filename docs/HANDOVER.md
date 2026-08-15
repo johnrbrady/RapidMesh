@@ -2,6 +2,20 @@
 
 Opening brief for an implementation session. Assumes no prior context.
 
+> **Superseded for sequencing (16 August 2026).** Phase order, first-release
+> scope and gate content are now governed by the project-lead execution plan
+> (`PLAN.md`, project-lead records, adopted 15 August 2026), which is held
+> outside this repository. Where this document's sequencing disagrees with that
+> plan — §6's Gate 1 checklist, §7's forward phase table, §10 and §11 — **the
+> plan wins**, and `CLAUDE.md` §5 together with `00-PRODUCT-DEFINITION.md` §8
+> carry the reconciled version. Do not plan work from this file.
+>
+> **Its historical content stands and is not superseded:** §3's inventory of
+> what already existed, §4's first real-data findings, §5's Cairn account, §8's
+> dataset facts and §9's traps are unchanged, still accurate, and still the
+> reason the phases are shaped the way they are. Read it for how the project
+> got here, not for what to do next.
+
 > **Resume notice (15 August 2026):** John explicitly resumed RapidMesh as a
 > separate project. Cairn remains read-only and integration remains deferred.
 > Read `SPATIAL-CONTRACT.md` and start at Phase 0c in `CLAUDE.md`; the older
@@ -147,8 +161,13 @@ handrail are exact.
 
 ## 5. Phase 0 — Cairn, and only this
 
-Repo: `pointcloud-viewer`, branch `navvis-phase3-vvp-meshing`. Remediation of a
-live fault, not integration. Full account in `CAIRN-MESH-MEMORY-ISSUE.md`.
+Repo: `pointcloud-viewer`. The phase 0 work was done on branch
+`navvis-phase3-vvp-meshing`, which was **merged to `master` on 6 Aug 2026 as
+`14680f5` and then deleted** — the branch name no longer resolves, and the
+pre-merge commit hashes cited in earlier drafts of this document and of
+`CLAUDE.md` were rebased away with it. The current hashes are in `CLAUDE.md`
+§5, rows 0a and 0b. Remediation of a live fault, not integration. Full account
+in `CAIRN-MESH-MEMORY-ISSUE.md`.
 
 **This is a production availability issue.** The kernel killed uvicorn, taking
 down every user's session, not one job.
