@@ -105,6 +105,69 @@ class MeshResult:
         )
 
 
+class StreamedMeshingNotImplemented(NotImplementedError):
+    """Raised by ``mesh_station_streamed`` until band-local geometry exists.
+
+    PLAN.md §5 item 6 (band-local despeckle/carve/restore with composed halos)
+    is done and lives in ``filters.clean_bands`` / ``filters.iter_clean_bands``.
+    Items 7 (streaming carve-grid build) and 8 (band-local triangulation and
+    island finalisation) are the work still missing, and item 7 is why this
+    entry point cannot yet supply ``others`` without materialising every
+    neighbour scan. This stub must not call ``mesh_station`` and must not
+    synthesise geometry by reassembling bands.
+    """
+
+
+def mesh_station_streamed(
+    scan: StructuredScan,
+    *,
+    band_rows: int,
+    chunk_points: int,
+    halo: int,
+    others: list[CoarseRangeGrid] | None = None,
+    max_incidence_deg: float = 82.0,
+    noise_floor: float = 0.012,
+    min_component_area: float = 0.005,
+    despeckle: bool = True,
+    measure: bool = True,
+    measure_samples: int = 300_000,
+) -> MeshResult:
+    """Streamed entry point for the equivalence harness (PLAN.md §5 item 5).
+
+    Signature accepts the streaming axes ``band_rows``, ``chunk_points`` and
+    ``halo`` so the harness matrix can name configurations before band-local
+    geometry is connected. Raises ``StreamedMeshingNotImplemented`` until
+    PLAN.md §5 items 7 and 8 are implemented. Does not call ``mesh_station``.
+
+    The filtering half is available now: ``filters.iter_clean_bands`` runs
+    despeckle, carve and restore band by band and yields core-owned output,
+    and ``filters.clean_bands`` is the drop-in equivalent of ``filters.clean``.
+    Wiring them in here would still need whole-neighbour carve grids (item 7)
+    and band-local triangulation with two-pass island finalisation (item 8),
+    so this entry point stays a stub rather than becoming a partial pipeline
+    that quietly skips them.
+    """
+    # Signature is the future contract; parameters are reserved until items 7-8.
+    _ = (
+        scan,
+        others,
+        max_incidence_deg,
+        noise_floor,
+        min_component_area,
+        despeckle,
+        measure,
+        measure_samples,
+    )
+    raise StreamedMeshingNotImplemented(
+        "mesh_station_streamed is not implemented: PLAN.md §5 item 6 "
+        "(band-local despeckle/carve/restore with composed halos) is done in "
+        "filters.clean_bands, but this path still requires items "
+        "7 (streaming carve-grid build) and 8 (band-local triangulation "
+        "and island finalisation). band_rows="
+        f"{band_rows} chunk_points={chunk_points} halo={halo}"
+    )
+
+
 def mesh_station(
     scan: StructuredScan,
     others: list[CoarseRangeGrid] | None = None,

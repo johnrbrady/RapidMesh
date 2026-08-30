@@ -30,11 +30,13 @@ Both are pure indexing. Neither filters, triangulates or decides anything.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .types import ScanPose, StructuredScan
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     import numpy as np
     import numpy.typing as npt
 
@@ -107,6 +109,91 @@ def select(scan: StructuredScan, keep: npt.NDArray[np.bool_]) -> StructuredScan:
         source_sample_count=scan.source_sample_count,
         dropped_no_return=scan.dropped_no_return,
         dropped_other=scan.dropped_other,
+    )
+
+
+def select_rows(grid: ScanGrid, row_start: int, row_stop: int) -> StructuredScan:
+    """Contiguous lattice-row subset of a row-major scan, as its own scan.
+
+    Uses the CSR row pointer, so the cost is the size of the band and not the
+    size of the scan — which is the whole point of asking for a band.
+
+    **Absolute lattice rows are preserved.** The returned scan keeps the
+    parent's `lattice`, so `row`/`col` still address the full lattice and a
+    `ScanGrid` built over the result answers `dense_rows` in absolute row
+    coordinates. Ownership therefore stays keyed on `(row, col)` rather than on
+    a position in a band-local array, which is what
+    `PHASE1-HALO-CALCULUS.md` §7 requires.
+
+    Per-sample arrays are **views** into `grid.scan`. Nothing in the band-local
+    filter chain writes through them (`select` copies, and the filter kernels
+    allocate their own masks), so no copy is made here.
+    """
+    r0 = max(0, min(row_start, grid.rows))
+    r1 = max(r0, min(row_stop, grid.rows))
+    scan = grid.scan
+    s, e = int(grid.row_start[r0]), int(grid.row_start[r1])
+    return StructuredScan(
+        row=scan.row[s:e],
+        col=scan.col[s:e],
+        xyz=scan.xyz[s:e],
+        rng=scan.rng[s:e],
+        pose=scan.pose,
+        lattice=scan.lattice,
+        rgb=None if scan.rgb is None else scan.rgb[s:e],
+        intensity=None if scan.intensity is None else scan.intensity[s:e],
+        station_id=scan.station_id,
+        sample_id=None if scan.sample_id is None else scan.sample_id[s:e],
+        source_sample_count=scan.source_sample_count,
+        dropped_no_return=scan.dropped_no_return,
+        dropped_other=scan.dropped_other,
+    )
+
+
+def concat(parts: Sequence[StructuredScan]) -> StructuredScan:
+    """Join band-local scans back into one, preserving order.
+
+    The band pipeline emits one retained scan per band core; the cores tile the
+    lattice in increasing row order, so concatenating them in band order
+    reproduces row-major order without a re-sort.
+
+    Scan-level attributes are taken from the first part and every other part
+    must agree, because a disagreement means two different stations were
+    joined — a silent corruption otherwise.
+    """
+    import numpy as np
+
+    if not parts:
+        raise ValueError("concat requires at least one scan")
+    head = parts[0]
+    for other in parts[1:]:
+        if other.lattice != head.lattice or other.station_id != head.station_id:
+            raise ValueError("cannot concatenate scans from different stations")
+        if (other.rgb is None) != (head.rgb is None):
+            raise ValueError("cannot concatenate scans with mixed rgb presence")
+        if (other.intensity is None) != (head.intensity is None):
+            raise ValueError("cannot concatenate scans with mixed intensity presence")
+        if (other.sample_id is None) != (head.sample_id is None):
+            raise ValueError("cannot concatenate scans with mixed sample_id presence")
+
+    def join(name: str) -> Any:
+        arrays = [getattr(part, name) for part in parts]
+        return np.concatenate(arrays) if len(arrays) > 1 else arrays[0]
+
+    return StructuredScan(
+        row=join("row"),
+        col=join("col"),
+        xyz=join("xyz"),
+        rng=join("rng"),
+        pose=head.pose,
+        lattice=head.lattice,
+        rgb=None if head.rgb is None else join("rgb"),
+        intensity=None if head.intensity is None else join("intensity"),
+        station_id=head.station_id,
+        sample_id=None if head.sample_id is None else join("sample_id"),
+        source_sample_count=head.source_sample_count,
+        dropped_no_return=head.dropped_no_return,
+        dropped_other=head.dropped_other,
     )
 
 

@@ -17,7 +17,21 @@ __version__ = "0.1.0"
 __all__ = [
     "__version__",
     "deps",
+    "mesh_station_streamed",
+    "StreamedMeshingNotImplemented",
 ]
+
+
+def __getattr__(name: str) -> object:
+    """Lazy export of the streamed entry stub (avoids importing numpy at load)."""
+    if name in ("mesh_station_streamed", "StreamedMeshingNotImplemented"):
+        from .pipeline import StreamedMeshingNotImplemented, mesh_station_streamed
+
+        return {
+            "mesh_station_streamed": mesh_station_streamed,
+            "StreamedMeshingNotImplemented": StreamedMeshingNotImplemented,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
 def deps() -> dict[str, bool]:

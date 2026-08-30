@@ -386,6 +386,109 @@ def _cast_mover(scene: RoomScene, o: F64, d: F64, sweep_t: F64) -> F64:
     return np.where(hit & np.isfinite(t) & (t > 1e-6), t, np.inf)
 
 
+@dataclass(frozen=True)
+class HaloWitnessFixture:
+    """Purpose-built halo falsifier (PHASE1-HALO-CALCULUS.md §9).
+
+    Places a mover and a thin restored feature (rail) across a documented
+    band boundary so that the missing lower support row at ``halo=2`` is
+    predicted to change a named keep/restore decision, while ``halo=3``
+    and ``halo=4`` are predicted to match the in-memory reference.
+
+    This package only *builds* the witness. The streamed halo matrix stays
+    required-red until PLAN.md §5 item 6 connects band-local filtering.
+    An ordinary fixture that matches at every halo is not a falsifier;
+    this one is designed so that prediction can be checked when item 6
+    exists.
+    """
+
+    scan: StructuredScan
+    true_range: F64
+    surface: npt.NDArray[np.int32]
+    is_mover: BOOL
+    direction: F64
+    scene: RoomScene
+    # Absolute lattice row that is the first row of band 1 when
+    # ``intended_band_rows`` is used (core boundary between band 0 and 1).
+    band_boundary_row: int
+    intended_band_rows: int
+    # Named decision the missing lower halo row at halo=2 is predicted to flip.
+    predicted_decision_name: str
+    halo_2_changes_decision: bool
+    halo_3_and_4_match: bool
+
+    @property
+    def mover_count(self) -> int:
+        import numpy as np
+
+        return int(np.count_nonzero(self.is_mover))
+
+
+def generate_halo_witness(
+    *,
+    rows: int = 16,
+    cols: int = 360,
+    intended_band_rows: int = 8,
+    seed: int = 23,
+    station_id: str = "halo-witness",
+) -> HaloWitnessFixture:
+    """Build the HALO §9 witness on a small synthetic lattice.
+
+    Geometry choices (documented predictions, not measured results):
+
+    * ``intended_band_rows=8`` on a 16-row lattice puts the sole band boundary
+      at row 8. Band 0 owns rows ``[0, 8)``; band 1 owns ``[8, 16)``.
+    * ``cols=360`` is the smallest full-sweep lattice that still returns the
+      default 30 mm rail (coarser azimuth misses it entirely). The rail is the
+      thin restored feature; the mover supplies carve/restore traffic across
+      the same neighbourhood.
+    * Restore support for a carved-then-restored sample at the last core row
+      of band 0 reaches the triangulation down-row and the filter-chain halo
+      below it; at ``halo=2`` that lowest support row is the one the
+      composed-halo derivation says is missing.
+
+    Predicted decision table (to be checked when item 6 exists):
+
+    | halo | predicted vs in-memory |
+    |------|------------------------|
+    | 2    | differs at restore keep for the boundary-straddling rail sample |
+    | 3, 4 | match |
+
+    The named decision is ``restore_keep_at_band_boundary_rail``.
+    """
+    if intended_band_rows <= 0 or intended_band_rows >= rows:
+        raise ValueError("intended_band_rows must be in 1 .. rows-1")
+    boundary = intended_band_rows
+
+    scene = RoomScene(
+        mover=True,
+        rail_centre=(-2.4, 1.9),
+        rail_radius=0.03,
+    )
+    syn = generate(
+        scene,
+        rows=rows,
+        cols=cols,
+        dropout=0.0,
+        range_noise=0.0,
+        seed=seed,
+        station_id=station_id,
+    )
+    return HaloWitnessFixture(
+        scan=syn.scan,
+        true_range=syn.true_range,
+        surface=syn.surface,
+        is_mover=syn.is_mover,
+        direction=syn.direction,
+        scene=syn.scene,
+        band_boundary_row=boundary,
+        intended_band_rows=intended_band_rows,
+        predicted_decision_name="restore_keep_at_band_boundary_rail",
+        halo_2_changes_decision=True,
+        halo_3_and_4_match=True,
+    )
+
+
 def _shade(surf: npt.NDArray[np.int32]) -> npt.NDArray[np.uint8]:
     """Flat per-surface colour.
 
