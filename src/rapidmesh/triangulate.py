@@ -43,6 +43,7 @@ a lambert term into vertex colour and discarding the normals entirely.
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from .filters import columns_wrap
@@ -92,6 +93,45 @@ def triangulate(
     if not parts:
         return np.empty((0, 3), np.int64)
     return np.concatenate(parts, axis=0)
+
+
+def band_triangle_indices(
+    grid: ScanGrid,
+    core_row_start: int,
+    data_row_stop: int,
+    *,
+    wrap: bool,
+    step: float,
+    tan_limit: float,
+    noise_floor: float = 0.012,
+    min_quality: float = 0.015,
+) -> I64:
+    """Triangles owned by one core, as indices into `grid.scan`.
+
+    The same `_band_triangles` kernel `triangulate` uses, exposed so a streamed
+    producer can run it against a band-local grid without holding the station.
+    Ownership is `PHASE1-HALO-CALCULUS.md` §7: quads are formed from
+    `idx[:-1]` and `idx[1:]`, so passing rows `[core_row_start, core_row_stop]`
+    yields exactly the quads whose **top** row is in `[core_row_start,
+    core_row_stop)` — one row of data below the core, no triangle written twice.
+
+    `wrap`, `step` and `tan_limit` are **scan-level** and must be passed in.
+    Recomputing `columns_wrap` from a band would judge a band of a full sweep
+    as a partial-FOV scan and drop the wrap seam (`PHASE1-HALO-CALCULUS.md` §3);
+    recomputing the angular step from a band is the same class of mistake.
+    """
+    import numpy as np
+
+    idx = grid.dense_rows(core_row_start, data_row_stop)
+    if idx.shape[0] < 2:
+        return np.empty((0, 3), np.int64)
+    parts = _band_triangles(
+        idx, grid.scan.xyz, grid.scan.rng, wrap, step, tan_limit, noise_floor, min_quality
+    )
+    if not parts:
+        return np.empty((0, 3), np.int64)
+    out: I64 = np.concatenate(parts, axis=0)
+    return out
 
 
 def _band_triangles(
@@ -236,8 +276,156 @@ def cull_islands(
 
 
 # --------------------------------------------------------------------------
+# component area — the streamed counterpart of cull_islands' accumulation
+# --------------------------------------------------------------------------
+
+
+# `PHASE1-ISLANDS-FINALISATION.md` §4.1. A float32 carries at most 24
+# significant bits; added to a float64 accumulator no more than 2**(53-24)
+# times larger, the addition does not round, so the sum is exact and every
+# accumulation order gives the identical value.
+EXACTNESS_RATIO_LIMIT = 2**29
+COMPONENT_AREA_VERSION = "component-area-v1"
+
+# Mirrors `cull_islands`' `min_triangles` default (`triangulate.py:197`). It is
+# restated rather than imported because the streamed path applies it to a
+# completed component table rather than to a `np.bincount` over the whole
+# station; `test_stream_islands.py` pins the two together so they cannot drift.
+MIN_COMPONENT_TRIANGLES = 8
+
+
+@dataclass(frozen=True)
+class AreaResult:
+    """`component-area-v1` output, plus the evidence that it is exact."""
+
+    root_ids: I64                   # (C,) canonical roots, ascending
+    areas: npt.NDArray[np.float64]  # (C,) component area, m^2
+    counts: I64                     # (C,) triangles per component
+    smallest_positive: npt.NDArray[np.float64]  # (C,) smallest positive area
+    fallback: npt.NDArray[np.bool_]  # (C,) True where fsum was authoritative
+    max_ratio: float
+    fallback_components: int
+    version: str = COMPONENT_AREA_VERSION
+
+
+def component_area_v1(
+    verts: F32,
+    tris: I64,
+    roots: I64,
+    cell_ids: I64,
+) -> AreaResult:
+    """Component areas under the §4.1 exactness condition, with the fsum fallback.
+
+    Per-triangle area is the same float32 cross/norm expression `cull_islands`
+    uses (`triangulate.py:225-228`), so the summands are bit-identical to the
+    in-memory reference's. What differs is the order they arrive in, and that
+    is exactly what the exactness condition licenses: while
+
+        component total area / smallest positive triangle area  <  2**29
+
+    every float64 addition is exact, so `np.bincount` in streamed order equals
+    `np.bincount` in the in-memory order bit for bit.
+
+    Above the limit the guard `math.fsum` value becomes authoritative and the
+    component is counted in `fallback_components`. `PHASE1-ISLANDS-FINALISATION.md`
+    §4.1 forbids a streamed-only compensated result, so a caller that sees a
+    non-zero fallback count must report it rather than let one path decide.
+    """
+    import numpy as np
+
+    order = _canonical_order(roots, tris, cell_ids)
+    roots_sorted = roots[order]
+    # Reorder the areas, not the triangles: `_triangle_areas` is elementwise, so
+    # the values are identical either way and this avoids a second (T,3) int64.
+    area = _triangle_areas(verts, tris)[order]
+
+    root_ids, inverse = np.unique(roots_sorted, return_inverse=True)
+    counts = np.bincount(inverse, minlength=root_ids.size).astype(np.int64)
+    totals = np.bincount(inverse, weights=area, minlength=root_ids.size)
+
+    # Guard, per component, over the canonical stream.
+    guard = np.zeros(root_ids.size, np.float64)
+    smallest = np.full(root_ids.size, np.inf, np.float64)
+    boundaries = np.searchsorted(inverse, np.arange(root_ids.size + 1))
+    for c in range(root_ids.size):
+        block = area[boundaries[c] : boundaries[c + 1]]
+        guard[c] = math.fsum(block.tolist())
+        positive = block[block > 0.0]
+        if positive.size:
+            smallest[c] = float(positive.min())
+
+    ratios = np.where(np.isfinite(smallest) & (smallest > 0.0), guard / smallest, 0.0)
+    over = ratios >= EXACTNESS_RATIO_LIMIT
+    if np.any(over):
+        totals = totals.copy()
+        totals[over] = guard[over]
+
+    return AreaResult(
+        root_ids=root_ids.astype(np.int64),
+        areas=totals,
+        counts=counts,
+        smallest_positive=np.where(np.isfinite(smallest), smallest, 0.0),
+        fallback=over,
+        max_ratio=float(ratios.max()) if ratios.size else 0.0,
+        fallback_components=int(np.count_nonzero(over)),
+    )
+
+
+def _triangle_areas(verts: F32, tris: I64) -> npt.NDArray[np.float64]:
+    """Exactly `cull_islands`' expression, on float32 vertices."""
+    import numpy as np
+
+    area: npt.NDArray[np.float64] = 0.5 * np.linalg.norm(
+        np.cross(verts[tris[:, 1]] - verts[tris[:, 0]], verts[tris[:, 2]] - verts[tris[:, 0]]),
+        axis=1,
+    )
+    return area
+
+
+def _canonical_order(roots: I64, tris: I64, cell_ids: I64) -> I64:
+    """`(final root, canonical oriented stable-id triple)` order — §4.1 step 2.
+
+    The triple is canonicalised by cyclic rotation only, never by reversal:
+    winding carries orientation (`PHASE1-DETERMINISM-SPEC.md` §4 clause 3).
+    """
+    import numpy as np
+
+    if tris.shape[0] == 0:
+        return np.empty(0, np.int64)
+    triple = cell_ids[tris]
+    # A triangle's three lattice cells are distinct by construction — the quad
+    # corners are different (row, col) pairs — so the lexicographically smallest
+    # rotation is simply the one starting at the smallest id, and `argmin` finds
+    # it. Materialising all three rotations would cost 72 B per triangle for a
+    # result that is one column index wide.
+    pick = np.argmin(triple, axis=1)
+    rows = np.arange(triple.shape[0])
+    c0 = triple[rows, pick]
+    c1 = triple[rows, (pick + 1) % 3]
+    c2 = triple[rows, (pick + 2) % 3]
+    out: I64 = np.lexsort((c2, c1, c0, roots))
+    return out
+
+
+# --------------------------------------------------------------------------
 # assembly
 # --------------------------------------------------------------------------
+
+
+def used_vertices(n: int, tris: I64) -> npt.NDArray[np.bool_]:
+    """Boolean source-membership mask for a triangle array.
+
+    Shared by the in-memory and streamed ledgers so `dropped_island` and the
+    retained-but-unmeshed contribution to `dropped_other` are derived from one
+    definition rather than two that could drift.
+    """
+    import numpy as np
+
+    out = np.zeros(n, dtype=bool)
+    array = np.asarray(tris)
+    if array.size:
+        out[array.ravel()] = True
+    return out
 
 
 def build_mesh(

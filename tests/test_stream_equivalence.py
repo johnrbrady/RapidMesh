@@ -3,14 +3,18 @@
 Comparison contract: PHASE1-DETERMINISM-SPEC.md §7.
 Halo witness design: PHASE1-HALO-CALCULUS.md §9.
 
-This package delivers the harness and the streamed entry-point stub.
-Band-local geometry (PLAN.md §5 items 6–8) is deliberately absent, so the
-matrix integration tests are required-red: they must fail with
-StreamedMeshingNotImplemented, not ImportError, not xfail, not skip.
+Until PLAN.md §5 items 6–8 existed, the matrix integration tests here were
+**required-red**: they had to fail with StreamedMeshingNotImplemented, never
+with ImportError, xfail or skip. Items 6, 7 and 8 are now implemented, so the
+same tests are required-**green** and assert exact equivalence instead. Two
+kept their names and inverted their meaning; one was renamed, because a test
+called ``..._required_red`` that asserts a match reads as the opposite of what
+it does. The mapping is recorded in the WP-1.4 report.
 """
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import replace
 
 import numpy as np
@@ -361,9 +365,11 @@ def test_streamed_equals_in_memory_matrix(
 ) -> None:
     """Call mesh_station vs mesh_station_streamed for each matrix cell.
 
-    Required-red until PLAN.md §5 items 6–8 exist: the streamed entry must
-    raise StreamedMeshingNotImplemented (named failure), not ImportError,
-    and this test must not xfail or skip. The configuration is named in the
+    The number of bands actually produced is asserted, not assumed: a matrix
+    that silently ran one band per cell would pass while exercising no band
+    boundary at all, which is the trap `PHASE1-HALO-CALCULUS.md` §1 records and
+    `PHASE1-ISLANDS-FINALISATION.md` §7 closes with "any run must report the
+    number of bands actually produced". The configuration is named in the
     assertion message so a red run identifies the cell.
     """
     n_bands = (HARNESS_ROWS + band_rows - 1) // band_rows
@@ -385,53 +391,118 @@ def test_streamed_equals_in_memory_matrix(
         band_rows=band_rows,
         chunk_points=chunk_points,
         halo=3,
+        measure=True,
+        measure_samples=2_000,
     )
-    # Unreachable until items 6–8 land; compare would run here.
     report = compare_mesh_results(ref, streamed, source_sha256="d" * 64)
     assert report.ok, config
+    assert streamed.diagnostics is not None, config
+    assert streamed.diagnostics.band_count == n_bands, config
+    assert streamed.mesh.triangle_count > 0, config
 
 
 def test_streamed_entry_does_not_call_mesh_station(
     monkeypatch: pytest.MonkeyPatch,
     harness_scan: synthetic.SyntheticScan,
 ) -> None:
-    """Forbidden streamed implementation: reassemble + mesh_station.
+    """The forbidden implementation, made impossible to hide.
 
-    Green characterisation of the stub: it raises its dedicated exception
-    without calling mesh_station.
+    Inverted from its stub form: `mesh_station` is replaced with a function
+    that raises, and the streamed entry point must now run to completion
+    anyway. Reassembling the scan and delegating — the shortcut that would make
+    every equivalence test above pass while proving nothing — cannot survive
+    this, and neither can a partial delegation for one stage.
+
+    `StreamedMeshingNotImplemented` stays imported and asserted-against because
+    it remains the harness's named-failure channel; what changed is that the
+    implemented path no longer uses it.
     """
 
     def _boom(*_a: object, **_k: object) -> None:
-        raise AssertionError("mesh_station must not be called by streamed stub")
+        raise AssertionError("mesh_station must not be called by the streamed path")
 
     monkeypatch.setattr("rapidmesh.pipeline.mesh_station", _boom)
-    with pytest.raises(StreamedMeshingNotImplemented) as exc:
-        mesh_station_streamed(
-            harness_scan.scan,
-            band_rows=3,
-            chunk_points=100,
-            halo=3,
-        )
-    msg = str(exc.value)
-    assert "PLAN.md" in msg
-    assert "6" in msg and "7" in msg and "8" in msg
+    streamed = mesh_station_streamed(
+        harness_scan.scan,
+        band_rows=3,
+        chunk_points=100,
+        halo=3,
+        measure=True,
+        measure_samples=2_000,
+    )
+    assert streamed.mesh.triangle_count > 0
+    assert streamed.deviation is not None
+    assert streamed.diagnostics is not None
+    assert streamed.diagnostics.band_count == 4
+    assert issubclass(StreamedMeshingNotImplemented, NotImplementedError)
 
 
-def test_halo_witness_streamed_matrix_required_red() -> None:
-    """HALO §9 witness matrix stays required-red until item 6.
+def test_halo_witness_streamed_matches_in_memory_with_neighbours() -> None:
+    """HALO §9 witness, now with the neighbours it always needed.
 
-    Fixture loads and documents predictions; streamed comparison is not
-    asserted green in this package.
+    Renamed from ``test_halo_witness_streamed_matrix_required_red``: items 6–8
+    exist, so this is required-green.
+
+    The witness ships as a single scan, so carve and restore never ran on it
+    (WP-1.2 report, finding 3) and the decision it is named for was
+    unreachable. Two neighbour scans of the same scene — mover removed, since a
+    neighbour that sees the mover cannot carve it — are generated here and
+    turned into carve grids by the item-7 path, without changing `synthetic.py`.
+
+    Two halos are exercised, and the second is what makes this a falsifier
+    rather than a formality: at the specified composed halo of 3 the streamed
+    result must match exactly, and at halo 0 it must **not**. A run where both
+    matched would prove only that the fixture never crosses a band boundary
+    that matters.
     """
+    from rapidmesh.carvegrid import StationRef
+    from rapidmesh.pipeline import carve_grids_streamed
+
     wit = synthetic.generate_halo_witness()
-    # Exercise halo=2 (predicted to change the named decision) — required-red.
+    rows, cols = wit.scan.lattice.rows, wit.scan.lattice.cols
+
+    def neighbour(station_id: str, scanner: tuple[float, float, float], seed: int):  # type: ignore[no-untyped-def]
+        scene = dataclasses.replace(wit.scene, scanner=scanner, mover=False)
+        return synthetic.generate(
+            scene, rows=rows, cols=cols, dropout=0.0, range_noise=0.0,
+            seed=seed, station_id=station_id,
+        ).scan
+
+    scans = [
+        wit.scan,
+        neighbour("W-B", (-2.6, 1.7, 0.0), 31),
+        neighbour("W-C", (2.7, 1.4, 0.0), 37),
+    ]
+    grids = carve_grids_streamed(
+        [StationRef.from_scan(s) for s in scans],
+        exclude=wit.scan.station_id,
+        nearest=2,
+        chunk_points=50_000,
+    )
+    ref = mesh_station(wit.scan, others=grids, measure=False)
+    assert ref.stats.dropped_mover_carve > 0        # carving is live
+
     streamed = mesh_station_streamed(
         wit.scan,
         band_rows=wit.intended_band_rows,
         chunk_points=80,
-        halo=2,
+        halo=3,
+        others=grids,
+        measure=False,
     )
-    ref = mesh_station(wit.scan, measure=False)
     report = compare_mesh_results(ref, streamed, source_sha256="e" * 64)
     assert report.ok
+    assert streamed.diagnostics is not None
+    assert streamed.diagnostics.band_count == 2
     assert wit.predicted_decision_name == "restore_keep_at_band_boundary_rail"
+
+    starved = mesh_station_streamed(
+        wit.scan,
+        band_rows=wit.intended_band_rows,
+        chunk_points=80,
+        halo=0,
+        others=grids,
+        measure=False,
+    )
+    with pytest.raises(EquivalenceMismatch):
+        compare_mesh_results(ref, starved, source_sha256="e" * 64)

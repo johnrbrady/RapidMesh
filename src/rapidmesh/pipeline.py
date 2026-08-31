@@ -21,9 +21,16 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from .carvegrid import (
+    DEFAULT_CHUNK_POINTS,
+    GridStore,
+    StationRef,
+    build_or_load,
+    select_neighbours,
+)
 from .filters import clean
-from .grid import CoarseRangeGrid, ScanGrid
-from .triangulate import build_mesh, cull_islands, triangulate
+from .grid import CARVE_MAX_CELLS, CoarseRangeGrid, ScanGrid
+from .triangulate import build_mesh, cull_islands, triangulate, used_vertices
 from .types import (
     DeviationReport,
     FilterStats,
@@ -35,8 +42,7 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    import numpy as np
-    import numpy.typing as npt
+    from collections.abc import Sequence
 
 
 @dataclass
@@ -52,6 +58,8 @@ class MeshResult:
     timings: dict[str, float] = field(default_factory=dict)
     settings: dict[str, float | int | bool] = field(default_factory=dict)
     station_id: str = ""
+    diagnostics: StreamedDiagnostics | None = None
+    """Internal streamed-run evidence. Never reaches `evidence_report`."""
 
     def summary(self) -> str:
         lines = [
@@ -106,16 +114,43 @@ class MeshResult:
 
 
 class StreamedMeshingNotImplemented(NotImplementedError):
-    """Raised by ``mesh_station_streamed`` until band-local geometry exists.
+    """Retained for the harness's named-failure contract.
 
-    PLAN.md §5 item 6 (band-local despeckle/carve/restore with composed halos)
-    is done and lives in ``filters.clean_bands`` / ``filters.iter_clean_bands``.
-    Items 7 (streaming carve-grid build) and 8 (band-local triangulation and
-    island finalisation) are the work still missing, and item 7 is why this
-    entry point cannot yet supply ``others`` without materialising every
-    neighbour scan. This stub must not call ``mesh_station`` and must not
-    synthesise geometry by reassembling bands.
+    ``mesh_station_streamed`` raised this while PLAN.md §5 items 6–8 were
+    outstanding. All three now exist, so the streamed entry point runs and this
+    exception is no longer raised on the implemented path. It stays defined —
+    and stays exported — because it is the harness's way of distinguishing "not
+    built yet" from a crash, and a configuration this pipeline genuinely cannot
+    stream must still say so by name rather than by traceback.
     """
+
+
+@dataclass(frozen=True)
+class StreamedDiagnostics:
+    """Internal, non-exported evidence about one streamed run.
+
+    Deliberately not part of ``StationQAReport``: the equivalence harness
+    compares metadata field for field (SPEC §7), so the streamed run's settings
+    must be identical to the in-memory run's. The streaming axes and the
+    `PHASE1-ISLANDS-FINALISATION.md` §7 claim-A instrumentation live here
+    instead, where a test can read them and a report cannot accidentally claim
+    them as product metadata.
+    """
+
+    band_rows: int
+    chunk_points: int
+    halo: int
+    band_count: int
+    max_live_components: int
+    max_frontier_occupied: int
+    component_count: int
+    triangles_before_cull: int
+    triangles_after_cull: int
+    retained_unmeshed: int
+    component_area_version: str
+    max_area_ratio: float
+    area_fallback_components: int
+    segment_bytes: int
 
 
 def mesh_station_streamed(
@@ -131,41 +166,84 @@ def mesh_station_streamed(
     despeckle: bool = True,
     measure: bool = True,
     measure_samples: int = 300_000,
+    work_dir: str | None = None,
 ) -> MeshResult:
-    """Streamed entry point for the equivalence harness (PLAN.md §5 item 5).
+    """Two-pass streamed pipeline for one station (PLAN.md §5 items 6–8).
 
-    Signature accepts the streaming axes ``band_rows``, ``chunk_points`` and
-    ``halo`` so the harness matrix can name configurations before band-local
-    geometry is connected. Raises ``StreamedMeshingNotImplemented`` until
-    PLAN.md §5 items 7 and 8 are implemented. Does not call ``mesh_station``.
+    Pass A sweeps the lattice once — filtering each band with the composed
+    halo, triangulating the quads that band owns, labelling components against
+    a one-row frontier, and writing provisional segments to `work_dir` before
+    moving on. Pass B re-reads those segments, evaluates `component-area-v1`
+    over completed components, culls, finalises the ledger and measures.
 
-    The filtering half is available now: ``filters.iter_clean_bands`` runs
-    despeckle, carve and restore band by band and yields core-owned output,
-    and ``filters.clean_bands`` is the drop-in equivalent of ``filters.clean``.
-    Wiring them in here would still need whole-neighbour carve grids (item 7)
-    and band-local triangulation with two-pass island finalisation (item 8),
-    so this entry point stays a stub rather than becoming a partial pipeline
-    that quietly skips them.
+    It does not call ``mesh_station`` and it does not reassemble the input scan
+    and delegate. What it *does* reconstruct, in Pass B, is the **retained**
+    set, from the `pos` segments Pass A wrote — that is the mesh's own vertex
+    store, which any implementation has to materialise to emit a mesh, and it
+    is what the two-pass structure exists to make affordable. The thing being
+    avoided is the global triangle edge list and whole-station
+    `connected_components` of `cull_islands`, which is over 1 GB of
+    intermediate on the reference station before the mesh is counted.
+
+    ``chunk_points`` is accepted and recorded but is not yet a live axis on
+    this path: it belongs to `e57_reader.iter_row_bands`, and driving Pass A
+    from a raw E57 stream is not part of item 8. It is in the signature and in
+    the diagnostics so the harness matrix can vary it and demonstrate that the
+    output does not move, which is a weaker statement than exercising it and is
+    reported as such.
     """
-    # Signature is the future contract; parameters are reserved until items 7-8.
-    _ = (
-        scan,
-        others,
-        max_incidence_deg,
-        noise_floor,
-        min_component_area,
-        despeckle,
-        measure,
-        measure_samples,
+    import tempfile
+    from pathlib import Path
+
+    from .islands import pass_a_sweep, pass_b_finalise
+
+    t: dict[str, float] = {}
+    owned = work_dir is None
+    root = (
+        Path(tempfile.mkdtemp(prefix="rapidmesh-stream-"))
+        if owned
+        else Path(str(work_dir))
     )
-    raise StreamedMeshingNotImplemented(
-        "mesh_station_streamed is not implemented: PLAN.md §5 item 6 "
-        "(band-local despeckle/carve/restore with composed halos) is done in "
-        "filters.clean_bands, but this path still requires items "
-        "7 (streaming carve-grid build) and 8 (band-local triangulation "
-        "and island finalisation). band_rows="
-        f"{band_rows} chunk_points={chunk_points} halo={halo}"
-    )
+    try:
+        t0 = time.perf_counter()
+        pass_a = pass_a_sweep(
+            scan,
+            work_dir=root,
+            others=others,
+            despeckle=despeckle,
+            band_rows=band_rows,
+            halo=halo,
+            max_incidence_deg=max_incidence_deg,
+            noise_floor=noise_floor,
+        )
+        t["pass_a"] = time.perf_counter() - t0
+
+        t0 = time.perf_counter()
+        result = pass_b_finalise(
+            scan,
+            pass_a,
+            work_dir=root,
+            min_component_area=min_component_area,
+            measure=measure,
+            measure_samples=measure_samples,
+            timings=t,
+            settings={
+                "max_incidence_deg": max_incidence_deg,
+                "noise_floor": noise_floor,
+                "min_component_area": min_component_area,
+                "despeckle": despeckle,
+                "measure": measure,
+                "measure_samples": measure_samples,
+            },
+            streaming=(band_rows, chunk_points, halo),
+        )
+        t["pass_b"] = time.perf_counter() - t0
+        return result
+    finally:
+        if owned:
+            import shutil
+
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def mesh_station(
@@ -217,8 +295,8 @@ def mesh_station(
     mesh = build_mesh(grid.scan, tris)
     t["assemble"] = time.perf_counter() - t0
 
-    used_before_cull = _used_vertices(len(grid.scan), tris_before_cull)
-    used_final = _used_vertices(len(grid.scan), tris)
+    used_before_cull = used_vertices(len(grid.scan), tris_before_cull)
+    used_final = used_vertices(len(grid.scan), tris)
 
     dev = None
     reverse = None
@@ -271,35 +349,71 @@ def mesh_station(
     )
 
 
-def _used_vertices(
-    n: int, tris: npt.NDArray[np.int64]
-) -> npt.NDArray[np.bool_]:
-    """Boolean source-membership mask for a triangle array."""
-    import numpy as np
-
-    out = np.zeros(n, dtype=bool)
-    array = np.asarray(tris)
-    if array.size:
-        out[array.ravel()] = True
-    return out
-
-
-def carve_grids(scans: list[StructuredScan], exclude: str, nearest: int = 2) -> list[CoarseRangeGrid]:
+def carve_grids(
+    scans: list[StructuredScan],
+    exclude: str,
+    nearest: int = 2,
+    *,
+    store: GridStore | None = None,
+    max_cells: int = CARVE_MAX_CELLS,
+    fill_holes: bool = True,
+    chunk_points: int = DEFAULT_CHUNK_POINTS,
+) -> list[CoarseRangeGrid]:
     """Coarse range grids from the `nearest` stations to `exclude`.
 
     Two neighbours is Cairn's choice and a reasonable default: carving recall
     rises quickly with the first two and slowly after, while cost is linear.
     In open areas with widely-spaced setups, three or four is worth trying —
     `qa.score_mover_filter` on a synthetic fixture will show whether it helps.
-    """
-    import numpy as np
 
-    target = next((s for s in scans if s.station_id == exclude), None)
-    if target is None:
-        return []
-    o = target.pose.translation
-    ranked = sorted(
-        (s for s in scans if s.station_id != exclude),
-        key=lambda s: float(np.linalg.norm(s.pose.translation - o)),
+    Taking a `list[StructuredScan]` means every neighbour's points are already
+    resident before this is called, so **this signature cannot bound memory**;
+    `PHASE1-TILE-CONTRACT-V0.md` §6.2 calls it evidence of behaviour rather
+    than a production interface. It is kept because the in-memory callers are
+    real, and it now delegates to `carve_grids_streamed`, which builds one grid
+    at a time through the chunked path. `carve_grids_streamed` is the form to
+    use when the neighbours are not already in memory.
+    """
+    refs = [StationRef.from_scan(scan) for scan in scans]
+    return carve_grids_streamed(
+        refs,
+        exclude,
+        nearest,
+        store=store,
+        max_cells=max_cells,
+        fill_holes=fill_holes,
+        chunk_points=chunk_points,
     )
-    return [CoarseRangeGrid.build(s) for s in ranked[:nearest]]
+
+
+def carve_grids_streamed(
+    refs: Sequence[StationRef],
+    exclude: str,
+    nearest: int = 2,
+    *,
+    store: GridStore | None = None,
+    max_cells: int = CARVE_MAX_CELLS,
+    fill_holes: bool = True,
+    chunk_points: int = DEFAULT_CHUNK_POINTS,
+) -> list[CoarseRangeGrid]:
+    """The memory-safe form: metadata for every station, points for one.
+
+    Neighbour selection reads station origins only, so the caller holds poses,
+    lattices and digests for the whole project without holding anyone's point
+    arrays. Each selected neighbour is then loaded, binned and released before
+    the next is touched, and a cached grid skips the load entirely — the
+    schedule of `PHASE1-TILE-CONTRACT-V0.md` §6.2, steps 1 to 4.
+
+    Peak is therefore one neighbour's points plus the grids built so far, not
+    every neighbour's points at once.
+    """
+    return [
+        build_or_load(
+            ref,
+            store=store,
+            max_cells=max_cells,
+            fill_holes=fill_holes,
+            chunk_points=chunk_points,
+        )
+        for ref in select_neighbours(refs, exclude, nearest)
+    ]
