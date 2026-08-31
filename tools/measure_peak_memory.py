@@ -51,14 +51,30 @@ TOOLS_DIR = str(pathlib.Path(__file__).resolve().parent)
 # ---------------------------------------------------------------------------
 
 
-def prepare_fixture(path: str, rows: int, cols: int, seed: int = 7) -> dict[str, Any]:
-    """Generate a scan once and save its arrays. Not a pipeline figure."""
+def prepare_fixture(
+    path: str, rows: int, cols: int, seed: int = 7, extent_scale: float = 1.0
+) -> dict[str, Any]:
+    """Generate a scan once and save its arrays. Not a pipeline figure.
+
+    `extent_scale` grows the *room* while the lattice stays put — WP-1.G0's
+    extent ladder. It is a uniform scale on the scene, scanner included, so the
+    result is a geometric similarity: the same rays, the same lattice cells, the
+    same sample count, at scaled ranges. That is the whole point. WP-3.2's
+    density ladder varied the other axis and could not separate the tile term
+    from the sample-store floor, because it never moved the tile count.
+
+    `range_noise` stays at 2 mm at every scale. It is an instrument parameter,
+    not a scene one; see `RoomScene.scaled`.
+    """
     import numpy as np
 
     from rapidmesh import synthetic
 
+    scene = synthetic.RoomScene(mover=True)
+    if extent_scale != 1.0:
+        scene = scene.scaled(extent_scale)
     scan = synthetic.generate(
-        synthetic.RoomScene(mover=True), rows=rows, cols=cols,
+        scene, rows=rows, cols=cols,
         dropout=0.01, range_noise=0.002, seed=seed, station_id="mem",
     ).scan
     lattice = scan.lattice
@@ -79,6 +95,7 @@ def prepare_fixture(path: str, rows: int, cols: int, seed: int = 7) -> dict[str,
     )
     return {
         "rows": rows, "cols": cols, "samples": len(scan),
+        "extent_scale": float(extent_scale),
         "bytes_on_disk": pathlib.Path(path).stat().st_size,
     }
 

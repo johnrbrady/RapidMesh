@@ -30,8 +30,8 @@ real smeared artefact exactly, rather than approximating it with random noise.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from dataclasses import dataclass, field, fields
+from typing import TYPE_CHECKING, Any
 
 from .types import LatticeInfo, LatticeSource, ScanPose, StructuredScan
 
@@ -51,6 +51,16 @@ SURF_BEYOND_DOOR = 2
 SURF_COLUMN = 3
 SURF_RAIL = 4
 SURF_MOVER = 5
+
+
+# Fields of `RoomScene` that are **not** lengths. `scaled` multiplies everything
+# else, which puts the burden of correctness on this one list: a metre-valued
+# field added later is scaled automatically, and a non-metric one added later
+# must be declared here or it gets scaled and breaks loudly. The alternative —
+# listing the fields to scale — fails the other way, silently leaving a new
+# length unscaled and quietly ending the similarity the ladder depends on.
+# `tests/test_extent_ladder.py` asserts the two sets cover every field.
+NON_METRIC_SCENE_FIELDS = frozenset({"mover"})
 
 
 @dataclass
@@ -94,6 +104,40 @@ class RoomScene:
     mover_from: tuple[float, float] = (-2.0, -2.2)
     mover_to: tuple[float, float] = (2.2, -1.4)
     mover_z: float = -0.7
+
+    def scaled(self, factor: float) -> RoomScene:
+        """A geometrically similar room, `factor` times the size — WP-1.G0.
+
+        Every length scales, **the scanner position included**. That is the part
+        worth stating: the scanner stands inside the room, so leaving it put
+        while the walls move would change every incidence angle and the scene
+        would stop being a similarity. Scaling it keeps the rays leaving at the
+        same angles and hitting the same surfaces at scaled ranges, which is
+        exactly what makes the extent ladder interpretable — the lattice hit
+        pattern, the dropout draw and the sample count do not move, so extent is
+        the only thing that varies.
+
+        `range_noise` is deliberately not part of this. It is an instrument
+        parameter, it belongs to `generate`, and a bigger room does not make a
+        scanner noisier. The consequence is real and is reported rather than
+        hidden: relative noise falls as the room grows, so the absolute
+        thresholds downstream (`noise_floor`, `min_component_area`) see a
+        different scene at each rung.
+        """
+        if not math.isfinite(factor) or factor <= 0.0:
+            raise ValueError(
+                f"extent scale must be a finite positive factor, got {factor!r}"
+            )
+        values: dict[str, Any] = {}
+        for spec in fields(self):
+            current = getattr(self, spec.name)
+            if spec.name in NON_METRIC_SCENE_FIELDS:
+                values[spec.name] = current
+            elif isinstance(current, tuple):
+                values[spec.name] = tuple(float(c) * factor for c in current)
+            else:
+                values[spec.name] = float(current) * factor
+        return RoomScene(**values)
 
 
 @dataclass
