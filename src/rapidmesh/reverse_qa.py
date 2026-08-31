@@ -56,6 +56,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .reverse_qa_select import cumulative_total, select_and_gather, selection_targets
 from .types import DeviationReport, MeshData
 
 if TYPE_CHECKING:
@@ -126,7 +127,7 @@ class ReverseQAEvidence:
 
 
 def mesh_to_source_report_v2(
-    mesh: MeshData,
+    mesh: MeshData | Any,
     source_points: F32,
     *,
     source_rows: I32,
@@ -157,7 +158,7 @@ def mesh_to_source_report_v2(
 
 
 def run_reverse_qa(
-    mesh: MeshData,
+    mesh: MeshData | Any,
     source_points: F32,
     *,
     source_rows: I32,
@@ -177,24 +178,23 @@ def run_reverse_qa(
     """
     import numpy as np
 
-    from .pass_b_merge import merge_runs
+    from .qa_stream import as_source
 
-    tris = np.asarray(mesh.triangles, dtype=np.int64)
-    ids = mesh.source_sample_id
     if (
         mesh.triangle_count == 0
         or source_points.shape[0] == 0
         or max_samples <= 0
-        or ids is None
+        or (isinstance(mesh, MeshData) and mesh.source_sample_id is None)
     ):
         return np.empty(0, np.float64), _no_evidence(qa_window_rows, max_samples, seed)
+    surface = as_source(mesh)
 
     # ITEM-009. The canonical order comes from the bounded external merge, not
     # a resident sort: `verts[tris]` alone is a (T,3,3) float64 array — 72 bytes
     # per triangle — and it used to be built for the whole station just to draw
     # a bounded sample from it.
     with _run_directory(work_dir) as merge_dir:
-        runs = _build_reverse_runs(mesh, tris, np.asarray(ids, np.int64), merge_dir)
+        runs = _build_reverse_runs(surface, merge_dir)
         if runs.record_count == 0:
             return np.empty(0, np.float64), _no_evidence(
                 qa_window_rows, max_samples, seed
@@ -202,24 +202,13 @@ def run_reverse_qa(
 
         # Areas in canonical order, then one strict left-to-right recurrence —
         # the same values and the same summation the resident path performed,
-        # so the selection cannot shift by a rounding step.
+        # so the selection cannot shift by a rounding step. WP-3.1 moved that
+        # recurrence into the merge itself: neither the areas nor their running
+        # total is an array over the station any more (`reverse_qa_select`).
         count = runs.record_count
-        area = np.empty(count, np.float64)
-        at = 0
-        for block in merge_runs(runs):
-            area[at : at + block.shape[0]] = block["area"]
-            at += block.shape[0]
-        cumulative = np.cumsum(area)
-        del area
-
         n = min(max_samples, max(count, min(10_000, max_samples)))
-        targets = (np.arange(n, dtype=np.float64) + 0.5) * float(cumulative[-1]) / n
-        picked = np.clip(
-            np.searchsorted(cumulative, targets, side="right"), 0, count - 1
-        )
-        del cumulative
-
-        corners, triples, vertex_index = _gather_selected(runs, picked, mesh)
+        targets = selection_targets(cumulative_total(runs), n)
+        corners, triples, vertex_index = select_and_gather(runs, targets)
 
     samples = _interior_points(corners, triples, seed)
     rows = np.asarray(source_rows, dtype=np.int64)
@@ -342,7 +331,7 @@ def _windowed_distances(
 
 
 def calibrate_window(
-    mesh: MeshData,
+    mesh: MeshData | Any,
     source_points: F32,
     *,
     source_rows: I32,
@@ -394,6 +383,7 @@ def calibrate_window(
 REVERSE_RUN_FIELDS = [
     ("s0", "<i8"), ("s1", "<i8"), ("s2", "<i8"),
     ("i0", "<i4"), ("i1", "<i4"), ("i2", "<i4"),
+    ("p", "<f4", (3, 3)),
     ("area", "<f8"),
 ]
 REVERSE_RUN_KEY = ("s0", "s1", "s2")
@@ -420,28 +410,37 @@ def _run_directory(work_dir: Path | None) -> Iterator[Path]:
         shutil.rmtree(made, ignore_errors=True)
 
 
-def _build_reverse_runs(
-    mesh: MeshData, tris: I64, ids: I64, work_dir: Path
-) -> Any:
+def _build_reverse_runs(source: Any, work_dir: Path) -> Any:
     """Sorted runs keyed by canonical `source_sample_id` triple.
 
     This is `PHASE1-TILE-CONTRACT-V0.md` §2's *second* merge view — triple
     alone, no component root — and it is a different key on different files, so
     it cannot be mistaken for the area view.
 
-    The stored vertex indices keep the mesh's **original winding**. Rotating
+    The stored vertex indices keep the surface's **original winding**. Rotating
     them to canonical form would be invisible to the T2 triangle comparison and
     would still move every barycentric interior point, so the canonical form is
     the sort key only and never the payload.
+
+    **WP-3.3: the corner positions travel in the record.** They used to be looked
+    up from `mesh.vertices` at gather time, which is a random access into a
+    station-wide array — the exact thing a tile store does not have. Carrying
+    nine float32 per triangle costs 36 bytes of run file and removes the lookup
+    entirely, and float32 widens to float64 exactly, so the interior points are
+    the same bits either way.
+
+    Blocks arrive from a `GeometrySource`, so this reads a resident mesh and a
+    written tile generation through the same code. The **order** blocks arrive in
+    is irrelevant: the runs are sorted by canonical triple and merged, which is
+    what `reverse-qa-v2` exists to guarantee.
     """
     import numpy as np
 
     from .pass_b_merge import write_runs
 
     def blocks() -> Iterator[Any]:
-        for start in range(0, tris.shape[0], REVERSE_BLOCK_TRIANGLES):
-            piece = tris[start : start + REVERSE_BLOCK_TRIANGLES]
-            corners = mesh.vertices.astype(np.float64)[piece]
+        for chunk in source.identified_triangle_blocks():
+            corners = chunk.corners
             area = 0.5 * np.linalg.norm(
                 np.cross(
                     corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
@@ -450,49 +449,15 @@ def _build_reverse_runs(
             positive = np.nonzero(area > 0.0)[0]
             if positive.size == 0:
                 continue
-            kept = piece[positive]
-            triples = _canonical_triples(ids[kept])
+            kept = chunk.ids[positive]
+            triples = _canonical_triples(chunk.sample_ids[positive])
             record = np.empty(positive.size, dtype=np.dtype(REVERSE_RUN_FIELDS))
             for column, name in enumerate(("s0", "s1", "s2")):
                 record[name] = triples[:, column]
             for column, name in enumerate(("i0", "i1", "i2")):
                 record[name] = kept[:, column]
+            record["p"] = corners[positive].astype(np.float32)
             record["area"] = area[positive]
             yield record
 
     return write_runs(blocks(), work_dir, "reverseqa", REVERSE_RUN_KEY)
-
-
-def _gather_selected(runs: Any, picked: I64, mesh: MeshData) -> tuple[F64, I64, I64]:
-    """Corners, canonical triples and vertex indices for the selected samples.
-
-    `picked` is ascending, so one more merged pass suffices: each block covers a
-    contiguous span of canonical positions and the selections inside it are
-    taken by offset. Only the sampled triangles are ever materialised, which is
-    the whole reduction — `n` is capped by the caller, the station is not.
-    """
-    import numpy as np
-
-    from .pass_b_merge import merge_runs
-
-    verts = mesh.vertices.astype(np.float64)
-    corners = np.empty((picked.size, 3, 3), np.float64)
-    triples = np.empty((picked.size, 3), np.int64)
-    vertex_index = np.empty((picked.size, 3), np.int64)
-
-    at = cursor = 0
-    for block in merge_runs(runs):
-        stop = at + block.shape[0]
-        while cursor < picked.size and picked[cursor] < stop:
-            record = block[int(picked[cursor]) - at]
-            index = np.array([record["i0"], record["i1"], record["i2"]], np.int64)
-            vertex_index[cursor] = index
-            corners[cursor] = verts[index]
-            triples[cursor] = (record["s0"], record["s1"], record["s2"])
-            cursor += 1
-        at = stop
-        if cursor >= picked.size:
-            break
-    if cursor != picked.size:
-        raise ValueError(f"reverse-QA merge left {picked.size - cursor} selections unresolved")
-    return corners, triples, vertex_index

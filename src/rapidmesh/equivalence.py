@@ -388,6 +388,19 @@ def compare_mesh_data(
     return rot_l, rot_r
 
 
+def _mesh_of(result: MeshResult) -> MeshData:
+    """The run's mesh, reassembled from its tiles when it did not keep one."""
+    if result.mesh is not None:
+        return result.mesh
+    if result.tiles is None:
+        raise EquivalenceMismatch(
+            "mesh", detail="the run produced neither a resident mesh nor tiles"
+        )
+    from .tile_equivalence import reconstitute_mesh
+
+    return reconstitute_mesh(result.tiles)
+
+
 def compare_mesh_results(
     left: MeshResult,
     right: MeshResult,
@@ -397,7 +410,7 @@ def compare_mesh_results(
     peak_rss_right: int | None = None,
 ) -> EquivalenceReport:
     """Full SPEC §7 comparison; reverse DeviationReport is recorded as blocked."""
-    rot_l, rot_r = compare_mesh_data(left.mesh, right.mesh)
+    rot_l, rot_r = compare_mesh_data(_mesh_of(left), _mesh_of(right))
     compare_filter_stats_t1(left.stats, right.stats)
     compare_deviation_report_t1("deviation", left.deviation, right.deviation)
     # Reverse QA, at T1 now that `reverse-qa-v2` is the metric on both paths.

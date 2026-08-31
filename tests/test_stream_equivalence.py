@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -372,6 +373,7 @@ def test_streamed_equals_in_memory_matrix(
     harness_scan: synthetic.SyntheticScan,
     band_rows: int,
     chunk_points: int,
+    tmp_path: Path,
 ) -> None:
     """Call mesh_station vs mesh_station_streamed for each matrix cell.
 
@@ -381,6 +383,14 @@ def test_streamed_equals_in_memory_matrix(
     `PHASE1-ISLANDS-FINALISATION.md` §7 closes with "any run must report the
     number of bands actually produced". The configuration is named in the
     assertion message so a red run identifies the cell.
+
+    **WP-3.2 moved this onto the tiled path.** The streamed side now writes an
+    incremental spatial generation and keeps no `MeshData` at all, so the
+    comparison runs through `tile_equivalence.reconstitute_mesh` — the adapter
+    that reassembles the station from its tiles by ownership. That is the shape
+    DEC-012 requires Gate 1 to be demonstrated on, so it is the shape the
+    equivalence matrix has to cover; running the matrix against the resident
+    branch would leave the tiled one compared to nothing.
     """
     n_bands = (HARNESS_ROWS + band_rows - 1) // band_rows
     assert n_bands >= 1
@@ -403,12 +413,17 @@ def test_streamed_equals_in_memory_matrix(
         halo=3,
         measure=True,
         measure_samples=2_000,
+        out_dir=str(tmp_path / "out"),
+        tile_size=2.0,
     )
     report = compare_mesh_results(ref, streamed, source_sha256="d" * 64)
     assert report.ok, config
     assert streamed.diagnostics is not None, config
     assert streamed.diagnostics.band_count == n_bands, config
-    assert streamed.mesh.triangle_count > 0, config
+    assert streamed.mesh is None, config
+    assert streamed.tiles is not None, config
+    assert streamed.tiles.triangle_count > 0, config
+    assert len(streamed.tiles.tile_ids) > 1, config
 
 
 def test_streamed_entry_does_not_call_mesh_station(
@@ -447,7 +462,9 @@ def test_streamed_entry_does_not_call_mesh_station(
     assert issubclass(StreamedMeshingNotImplemented, NotImplementedError)
 
 
-def test_halo_witness_streamed_matches_in_memory_with_neighbours() -> None:
+def test_halo_witness_streamed_matches_in_memory_with_neighbours(
+    tmp_path: Path,
+) -> None:
     """HALO §9 witness, now with the neighbours it always needed.
 
     Renamed from ``test_halo_witness_streamed_matrix_required_red``: items 6–8
@@ -499,6 +516,8 @@ def test_halo_witness_streamed_matches_in_memory_with_neighbours() -> None:
         halo=3,
         others=grids,
         measure=False,
+        out_dir=str(tmp_path / "witness"),
+        tile_size=2.0,
     )
     report = compare_mesh_results(ref, streamed, source_sha256="e" * 64)
     assert report.ok
@@ -513,6 +532,8 @@ def test_halo_witness_streamed_matches_in_memory_with_neighbours() -> None:
         halo=0,
         others=grids,
         measure=False,
+        out_dir=str(tmp_path / "starved"),
+        tile_size=2.0,
     )
     with pytest.raises(EquivalenceMismatch):
         compare_mesh_results(ref, starved, source_sha256="e" * 64)

@@ -333,20 +333,37 @@ def test_minus_one_workers_is_refused_on_both_pipeline_paths(
         )
 
 
-def test_streamed_path_refuses_a_count_it_cannot_honour(
+def test_streamed_path_now_honours_the_count_it_records(
     envelope_scan: synthetic.SyntheticScan,
 ) -> None:
-    """Reported unsupported, naming why — CLAUDE.md §4 rule 6.
+    """WP-3.3 lifted WP-1.9's refusal, and the replacement is stronger.
 
-    The streamed path's QA call sites live in `pass_b.py`, which this package
-    does not change. Running at 1 while recording 2 would put a false
-    reproduction condition in the envelope.
+    WP-1.9 reported `qa_workers=2` unsupported on the streamed path rather than
+    running at 1 and recording 2 — CLAUDE.md §4 rule 6, and the honest call while
+    `pass_b.py` was read-only. WP-3.3 edits `pass_b.py`, so the count reaches the
+    KD-tree query and the refusal has nothing left to protect.
+
+    What replaces it is not "no exception": the recorded value must be the value
+    that ran, and the figures must be the ones one thread produced. Measured on
+    an 88,395-point fixture in WP-1.9, `workers=1` and `workers=-1` return
+    bitwise-identical distances, so a thread count is a reproducibility
+    condition and not a numerical one — which is exactly why it has to be
+    recorded and exactly why the two runs must agree here.
     """
-    with pytest.raises(EvidencePolicyError, match="pass_b"):
-        mesh_station_streamed(
-            envelope_scan.scan, band_rows=4, chunk_points=200, halo=3,
-            measure=True, qa_workers=2,
-        )
+    at_one = mesh_station_streamed(
+        envelope_scan.scan, band_rows=4, chunk_points=200, halo=3,
+        measure=True, qa_workers=1,
+    )
+    at_two = mesh_station_streamed(
+        envelope_scan.scan, band_rows=4, chunk_points=200, halo=3,
+        measure=True, qa_workers=2,
+    )
+    assert at_two.qa_workers == 2
+    metadata = at_two.evidence_report("0f" * 32).metadata
+    assert dict(metadata.settings)["qa_workers"] == "2"
+    assert dict(metadata.threads)["qa_workers_effective"] == "2"
+    assert at_two.deviation == at_one.deviation
+    assert at_two.mesh_to_source == at_one.mesh_to_source
 
 
 def test_thread_environment_is_returned_not_applied() -> None:

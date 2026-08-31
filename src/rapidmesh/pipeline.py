@@ -18,7 +18,6 @@ so failures propagate here and the caller decides.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 from .carvegrid import (
@@ -31,23 +30,26 @@ from .carvegrid import (
 from .evidence import (
     DEFAULT_QA_WORKERS,
     FRAME_PATH_UNRECORDED,
-    EvidencePolicyError,
     resolve_qa_workers,
 )
 from .filters import clean
 from .grid import CARVE_MAX_CELLS, CoarseRangeGrid, ScanGrid
 from .qa import QA_QUERY_BLOCK
+from .qa_neighbours import QA_SEED_VERTICES
+from .qa_stream import (
+    QA_PAIR_BLOCK,
+    QA_TRIANGLE_BLOCK_BYTES,
+    QA_VERTEX_BLOCK_BYTES,
+)
+from .result import MeshResult as MeshResult
 from .reverse_qa import DEFAULT_QA_WINDOW_ROWS as REVERSE_QA_WINDOW_ROWS
 from .reverse_qa import REVERSE_QA_VERSION
 from .streaming import StreamedDiagnostics as StreamedDiagnostics
 from .streaming import StreamedMeshingNotImplemented as StreamedMeshingNotImplemented
+from .tiles import DEFAULT_TILE_SIZE_M
 from .triangulate import build_mesh, cull_islands, triangulate, used_vertices
 from .types import (
-    DeviationReport,
     FilterStats,
-    LatticeInfo,
-    MeshData,
-    StationQAReport,
     StructuredScan,
 )
 
@@ -55,69 +57,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
 
     from .e57_reader import RawChunk
-    from .reverse_qa import ReverseQAEvidence
     from .streaming import (
-    StationMetadata,
-    StreamedDiagnostics,
-)
-
-
-@dataclass
-class MeshResult:
-    """Everything produced for one station, including the parts that are
-    inconvenient. A result with no deviation figure is an incomplete result."""
-
-    mesh: MeshData
-    stats: FilterStats
-    lattice: LatticeInfo
-    deviation: DeviationReport | None = None
-    mesh_to_source: DeviationReport | None = None
-    timings: dict[str, float] = field(default_factory=dict)
-    settings: dict[str, float | int | bool | str] = field(default_factory=dict)
-    station_id: str = ""
-    diagnostics: StreamedDiagnostics | None = None
-    """Internal streamed-run evidence. Never reaches `evidence_report`."""
-    reverse_qa_evidence: ReverseQAEvidence | None = None
-    """How the reverse figure was produced — window, sample counts, version.
-    The window and version also reach `settings`, and therefore the exported
-    metadata; the counts stay here because they are results, not settings."""
-    qa_workers: int = DEFAULT_QA_WORKERS
-    """KD-tree query threads this run used. Recorded, never `-1`."""
-    seeds: dict[str, int] = field(default_factory=dict)
-    """Every RNG seed that could move a figure (SPEC §2)."""
-    frame_path: str = FRAME_PATH_UNRECORDED
-    """Which `_resolve_frame` branch the source took, or `unrecorded`."""
-
-    def summary(self) -> str:
-        lines = [
-            f"station    {self.station_id or '(unnamed)'}",
-            f"lattice    {self.lattice.describe()}",
-            f"filters    {self.stats.summary()}",
-            f"mesh       {self.mesh.vertex_count:,} verts  {self.mesh.triangle_count:,} tris",
-        ]
-        if self.deviation:
-            lines.append(f"retained   {self.deviation.summary()}")
-        if self.mesh_to_source:
-            lines.append(f"reverse    {self.mesh_to_source.summary()}")
-        if self.timings:
-            total = sum(self.timings.values())
-            parts = "  ".join(f"{k}={v:.2f}s" for k, v in self.timings.items())
-            lines.append(f"time       {total:.2f}s  ({parts})")
-        return "\n".join(lines)
-
-    def evidence_report(
-        self, source_sha256: str, peak_rss_bytes: int | None = None
-    ) -> StationQAReport:
-        """Package all QA outputs with the full reproduction context.
-
-        The envelope itself is assembled in `evidence.py`; this is the entry
-        point callers already had. Station identity and coordinates are
-        intentionally absent — the source digest is the join to an authorised
-        evidence register.
-        """
-        from .evidence import build_station_report
-
-        return build_station_report(self, source_sha256, peak_rss_bytes)
+        StationMetadata,
+    )
 
 
 def mesh_station_streamed(
@@ -138,6 +80,8 @@ def mesh_station_streamed(
     qa_seed: int = 0,
     frame_path: str = FRAME_PATH_UNRECORDED,
     work_dir: str | None = None,
+    out_dir: str | None = None,
+    tile_size: float = DEFAULT_TILE_SIZE_M,
 ) -> MeshResult:
     """Two-pass streamed pipeline for one station (PLAN.md §5 items 6–8).
 
@@ -178,7 +122,7 @@ def mesh_station_streamed(
         min_component_area=min_component_area, despeckle=despeckle,
         measure=measure, measure_samples=measure_samples,
         qa_window_rows=qa_window_rows, qa_workers=qa_workers, qa_seed=qa_seed,
-        work_dir=work_dir,
+        work_dir=work_dir, out_dir=out_dir, tile_size=tile_size,
     )
 
 
@@ -200,6 +144,8 @@ def mesh_station_from_chunks(
     qa_workers: int = DEFAULT_QA_WORKERS,
     qa_seed: int = 0,
     work_dir: str | None = None,
+    out_dir: str | None = None,
+    tile_size: float = DEFAULT_TILE_SIZE_M,
     converter: Any | None = None,
 ) -> MeshResult:
     """The streamed pipeline with **no resident input scan** — DEC-009 step 2.
@@ -224,19 +170,14 @@ def mesh_station_from_chunks(
     from .pass_b import pass_b_finalise
     from .streaming import iter_band_filter_results
 
+    # WP-1.9 refused any count but the default here, because `pass_b.py` owned
+    # this path's QA call sites and was read-only in that package: silently
+    # running at 1 while recording the requested value would have put a false
+    # reproduction condition in the envelope, which is the one thing the
+    # envelope exists to prevent. WP-3.3 edits `pass_b.py`, so the count and the
+    # seed are threaded through to the call sites and the refusal is lifted. The
+    # recorded value is now the value that ran.
     workers = resolve_qa_workers(qa_workers)
-    if workers != DEFAULT_QA_WORKERS:
-        # `pass_b.py` owns this path's QA call sites and is read-only in the
-        # package that added `qa_workers` (PLAN.md §5 item 11), so the streamed
-        # path cannot honour a count other than the pinned default. Refusing is
-        # the honest option: silently running at 1 while recording the
-        # requested value would put a false reproduction condition in the
-        # envelope, which is the one thing the envelope exists to prevent.
-        raise EvidencePolicyError(
-            f"qa_workers={workers} is not yet supported on the streamed path; "
-            "its QA call sites live in pass_b.py. Use the default of "
-            f"{DEFAULT_QA_WORKERS}."
-        )
     t: dict[str, float] = {}
     owned = work_dir is None
     root = (
@@ -279,9 +220,17 @@ def mesh_station_from_chunks(
                 "qa_window_rows": qa_window_rows,
                 "qa_workers": workers,
                 "qa_query_block": QA_QUERY_BLOCK,
+                "qa_vertex_block_bytes": QA_VERTEX_BLOCK_BYTES,
+                "qa_triangle_block_bytes": QA_TRIANGLE_BLOCK_BYTES,
+                "qa_pair_block": QA_PAIR_BLOCK,
+                "qa_seed_vertices": QA_SEED_VERTICES,
                 "reverse_qa_version": REVERSE_QA_VERSION,
             },
             streaming=(band_rows, chunk_points, halo),
+            out_dir=None if out_dir is None else Path(out_dir),
+            tile_size=tile_size,
+            qa_workers=workers,
+            qa_seed=qa_seed,
         )
         t["pass_b"] = time.perf_counter() - t0
         # `pass_b_finalise` owns the MeshResult and is read-only in this
@@ -414,6 +363,10 @@ def mesh_station(
             "qa_window_rows": qa_window_rows,
             "qa_workers": workers,
             "qa_query_block": QA_QUERY_BLOCK,
+            "qa_vertex_block_bytes": QA_VERTEX_BLOCK_BYTES,
+            "qa_triangle_block_bytes": QA_TRIANGLE_BLOCK_BYTES,
+            "qa_pair_block": QA_PAIR_BLOCK,
+            "qa_seed_vertices": QA_SEED_VERTICES,
             "reverse_qa_version": REVERSE_QA_VERSION,
         },
         station_id=scan.station_id,

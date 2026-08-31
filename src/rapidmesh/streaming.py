@@ -177,6 +177,12 @@ class StreamedDiagnostics:
     max_area_ratio: float
     area_fallback_components: int
     segment_bytes: int
+    tiles: str | None = None
+    """One line describing the written spatial generation, or `None` when the
+    run assembled a resident mesh instead (WP-3.2)."""
+    tile_bytes: int = 0
+    """Bytes of tile payload written. ADR-006 Decision 1 excludes these from the
+    working-memory budget, which is only defensible if the figure is recorded."""
 
 
 # ---------------------------------------------------------------------------

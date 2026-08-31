@@ -230,6 +230,20 @@ def forward_qa(path: str, block: int, max_samples: int = 300_000) -> dict[str, A
     }
 
 
+def forward_qa_resident(
+    path: str, block: int, max_samples: int = 300_000
+) -> dict[str, Any]:
+    """The pre-WP-1.10 shape: the whole station resident, one query batch."""
+    mesh, points = _load_gate_mesh(path)
+    from rapidmesh.qa_reference import resident_distances
+
+    d = resident_distances(mesh, points, max_samples=max_samples, block=block)
+    return {
+        "queries": int(d.size), "block": int(block),
+        "triangles": int(mesh.triangle_count), "mean": float(d.mean()),
+    }
+
+
 @pytest.fixture(scope="module")
 def gate_mesh(tmp_path_factory: pytest.TempPathFactory) -> str:
     path = str(tmp_path_factory.mktemp("qa-gate") / "mesh.npz")
@@ -266,13 +280,23 @@ def test_the_gate_would_reject_the_unblocked_query(gate_mesh: str) -> None:
     The single-batch path is what WP-1.10 replaced; it must fail the bar the
     blocked path passes, on the same fixture and the same instrument. Without
     this row the gate above could be passing because the fixture is small.
+
+    **Re-pointed by WP-3.1, and the reason matters.** This row used to run
+    `qa.distances` with `block = max_samples`, because `block` was the only
+    thing standing between the ragged gather and the whole query set. It is not
+    any more: `qa_stream` bounds that expansion with its own cap, so
+    `qa.distances` at one query batch now peaks at 233,439,232 B and passes a
+    bar it is supposed to fail. Leaving the row pointed at `block` would have
+    left a sensitivity break that no longer breaks — the exact failure mode this
+    test exists to prevent, one level up. The pre-fix shape now has a name of its
+    own, `qa_reference.resident_distances`, and that is what is measured here.
     """
     here = [str(Path(__file__).resolve().parent)]
     unblocked = measure_in_child(
-        "test_forward_qa_blocked", "forward_qa",
+        "test_forward_qa_blocked", "forward_qa_resident",
         {"path": gate_mesh, "block": GATE_QA_SAMPLES,
          "max_samples": GATE_QA_SAMPLES},
-        label="forward QA, one batch", sys_path=here, timeout=1800.0,
+        label="forward QA, resident + one batch", sys_path=here, timeout=1800.0,
     )
     assert unblocked.peak_rss_bytes > GATE_PEAK_BYTES, unblocked.describe()
 

@@ -252,6 +252,51 @@ def streamed_station(
     }
 
 
+def tiled_station(
+    fixture: str,
+    band_rows: int = 64,
+    tile_size: float = 4.0,
+    measure: bool = False,
+    out: str = "",
+) -> dict[str, Any]:
+    """`mesh_station_streamed` writing an incremental spatial generation.
+
+    The WP-3.2 memory row. ADR-006 Decision 1 excludes bytes already written to
+    disk from the working-memory budget, so `tile_bytes` is returned beside the
+    peak: the exclusion is only defensible if the amount excluded is stated, and
+    a run that quietly kept the output in memory would show a large peak and a
+    tile byte count of zero.
+    """
+    import shutil
+    import tempfile
+
+    from rapidmesh.pipeline import mesh_station_streamed
+
+    scan = load_fixture(fixture)
+    owned = not out
+    root = pathlib.Path(out or tempfile.mkdtemp(prefix="rapidmesh-tiles-"))
+    try:
+        result = mesh_station_streamed(
+            scan, band_rows=band_rows, chunk_points=250_000, halo=3,
+            measure=measure, out_dir=str(root), tile_size=tile_size,
+        )
+        diagnostics = result.diagnostics
+        store = result.tiles
+        return {
+            "samples": len(scan),
+            "vertices": 0 if store is None else store.vertex_count,
+            "triangles": 0 if store is None else store.triangle_count,
+            "tiles": 0 if store is None else len(store.tile_ids),
+            "tile_size": tile_size,
+            "tile_bytes": 0 if diagnostics is None else diagnostics.tile_bytes,
+            "segment_bytes": 0 if diagnostics is None else diagnostics.segment_bytes,
+            "resident_mesh": result.mesh is not None,
+        }
+    finally:
+        if owned:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 def streamed_pass_a(fixture: str, band_rows: int = 64) -> dict[str, Any]:
     """Pass A alone: filter, triangulate, label, retire, write segments.
 
@@ -326,6 +371,235 @@ def merge_only(
         return {"records": seen, "runs": len(runs.paths), "largest_block_bytes": largest}
     finally:
         shutil.rmtree(work, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# QA stage attribution — WP-3.1
+#
+# Forward and reverse QA are measured against a mesh **loaded from disk**, in a
+# child that has built nothing. WP-1.10 learned this the hard way: with the mesh
+# built in the same process the pipeline's own high-water mark sits above the QA
+# transient and hides it, and a floor read that way is not a floor. The marginal
+# reported here is therefore `peak(mesh + QA) - peak(mesh alone)`, both rows in
+# their own fresh interpreter.
+# ---------------------------------------------------------------------------
+
+
+def prepare_mesh(fixture: str, path: str) -> dict[str, Any]:
+    """Mesh the fixture once and save the mesh plus its QA inputs.
+
+    Not a pipeline row. `mesh_station`'s retained offsets are bitwise the mesh's
+    own vertices — both are `rotate_local(xyz[used_final]).astype(f32)` — so the
+    forward-QA query set is stored once and reused rather than re-derived.
+    """
+    import numpy as np
+
+    from rapidmesh.filters import clean
+    from rapidmesh.grid import ScanGrid
+    from rapidmesh.triangulate import build_mesh, cull_islands, triangulate, used_vertices
+
+    scan = load_fixture(fixture)
+    cleaned, _ = clean(scan)
+    grid = ScanGrid.build(cleaned)
+    tris = cull_islands(grid.scan.xyz, triangulate(grid), min_area=0.005)
+    mesh = build_mesh(grid.scan, tris)
+    final = used_vertices(len(grid.scan), tris)
+    np.savez(
+        path,
+        origin=mesh.origin,
+        vertices=mesh.vertices,
+        triangles=mesh.triangles,
+        source_sample_id=mesh.source_sample_id,
+        rows=grid.scan.row[final].astype(np.int32),
+        translation=grid.scan.pose.translation,
+        rotation=grid.scan.pose.rotation,
+    )
+    return {
+        "samples": len(scan),
+        "vertices": mesh.vertex_count,
+        "triangles": mesh.triangle_count,
+        "bytes_on_disk": pathlib.Path(path).stat().st_size,
+    }
+
+
+def load_mesh(path: str) -> Any:
+    """Rebuild the `MeshData` and its QA inputs from `prepare_mesh`'s arrays."""
+    import numpy as np
+
+    from rapidmesh.types import MeshData, ScanPose
+
+    data = np.load(path)
+    pose = ScanPose(translation=data["translation"], rotation=data["rotation"])
+    mesh = MeshData(
+        origin=data["origin"],
+        vertices=data["vertices"],
+        triangles=data["triangles"],
+        source_pose=pose,
+        source_sample_id=data["source_sample_id"],
+    )
+    return mesh, np.asarray(data["rows"])
+
+
+def _warm_scipy() -> None:
+    """Load scipy's KD-tree machinery before the baseline row is taken.
+
+    Charging `scipy.spatial`'s import to forward QA would put tens of megabytes
+    of interpreter state in a figure that is supposed to be the QA working set.
+    The production prefix has it loaded already — `filters.clean` builds trees —
+    so every row here loads it too, and the marginal is the computation.
+    """
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    tree = cKDTree(np.zeros((8, 3), np.float64))
+    tree.query(np.zeros((8, 3), np.float64), k=2, workers=1)
+
+
+def mesh_only(path: str) -> dict[str, Any]:
+    """The mesh prefix: the finished mesh resident, and nothing measured."""
+    _warm_scipy()
+    mesh, rows = load_mesh(path)
+    return {
+        "vertices": mesh.vertex_count,
+        "triangles": mesh.triangle_count,
+        "rows": int(rows.shape[0]),
+    }
+
+
+def mesh_forward_qa(
+    path: str, samples: int = 300_000, block: int = 0
+) -> dict[str, Any]:
+    """The mesh prefix plus one forward `deviation_report`."""
+    from rapidmesh.qa import QA_QUERY_BLOCK, deviation_report
+
+    _warm_scipy()
+    mesh, rows = load_mesh(path)
+    report = deviation_report(
+        mesh, mesh.vertices, max_samples=samples,
+        block=block or QA_QUERY_BLOCK,
+    )
+    return {
+        "vertices": mesh.vertex_count,
+        "triangles": mesh.triangle_count,
+        "rows": int(rows.shape[0]),
+        "sampled": report.sampled_points,
+        "rms": report.rms,
+    }
+
+
+def mesh_forward_qa_caps(
+    path: str,
+    samples: int = 300_000,
+    vertex_bytes: int = 0,
+    triangle_bytes: int = 0,
+    pair_block: int = 0,
+    seed_cap: int = 0,
+    stage: str = "all",
+) -> dict[str, Any]:
+    """Forward QA with each cap set explicitly, so a peak can be attributed.
+
+    `stage` stops after a named stage — `seed`, `knn`, or `all` — because the
+    only way to know which cap sets the high-water mark is to measure the peak
+    with the later stages absent.
+    """
+    import numpy as np
+
+    from rapidmesh.qa import QA_QUERY_BLOCK
+    from rapidmesh.qa_neighbours import QA_SEED_VERTICES, _seed_radius, nearest_vertices
+    from rapidmesh.qa_stream import (
+        QA_PAIR_BLOCK,
+        QA_TRIANGLE_BLOCK_BYTES,
+        QA_VERTEX_BLOCK_BYTES,
+        ResidentMesh,
+        incident_distances,
+    )
+
+    _warm_scipy()
+    mesh, _ = load_mesh(path)
+    source = ResidentMesh(
+        mesh,
+        vertex_block_bytes=vertex_bytes or QA_VERTEX_BLOCK_BYTES,
+        triangle_block_bytes=triangle_bytes or QA_TRIANGLE_BLOCK_BYTES,
+    )
+    queries = mesh.vertices
+    if queries.shape[0] > samples:
+        rs = np.random.default_rng(0)
+        queries = queries[rs.choice(queries.shape[0], samples, replace=False)]
+    q64 = queries.astype(np.float64)
+    cap = seed_cap or QA_SEED_VERTICES
+
+    if stage == "queries":
+        # The floor every later stage stands on: 300,000 float64 query points
+        # and the subsample that chose them. Neither is a geometry structure and
+        # neither can be bounded away, so a marginal is only interpretable
+        # beside this row.
+        return {"queries": int(q64.shape[0]), "bytes": int(q64.nbytes)}
+
+    if stage == "seed":
+        radius = _seed_radius(
+            source, q64, k=2, workers=1, block=QA_QUERY_BLOCK, cap=cap
+        )
+        return {"queries": int(q64.shape[0]), "median_radius": float(np.median(radius))}
+
+    found, ids = nearest_vertices(
+        source, q64, k=2, workers=1, block=QA_QUERY_BLOCK, seed_cap=cap
+    )
+    if stage == "knn":
+        return {"queries": int(q64.shape[0]), "median_d1": float(np.median(found[:, 1]))}
+
+    d = incident_distances(
+        source, q64, ids, found[:, 0], pair_block=pair_block or QA_PAIR_BLOCK
+    )
+    return {
+        "queries": int(d.size),
+        "triangles": mesh.triangle_count,
+        "rms": float((d * d).mean() ** 0.5),
+    }
+
+
+def mesh_forward_qa_resident(
+    path: str, samples: int = 300_000, block: int = 0
+) -> dict[str, Any]:
+    """The same row through `qa_reference.resident_distances`.
+
+    The sensitivity break for the WP-3.1 gate: a bound that the implementation it
+    replaced also satisfies is not a bound, it is the fixture being small.
+    """
+    from rapidmesh.qa import QA_QUERY_BLOCK
+    from rapidmesh.qa_reference import resident_distances
+
+    _warm_scipy()
+    mesh, rows = load_mesh(path)
+    d = resident_distances(
+        mesh, mesh.vertices, max_samples=samples, block=block or QA_QUERY_BLOCK
+    )
+    return {
+        "vertices": mesh.vertex_count,
+        "triangles": mesh.triangle_count,
+        "sampled": int(d.size),
+        "rms": float((d * d).mean() ** 0.5),
+    }
+
+
+def mesh_reverse_qa(
+    path: str, samples: int = 300_000, window: int = 8
+) -> dict[str, Any]:
+    """The mesh prefix plus one `reverse-qa-v2` report."""
+    from rapidmesh.reverse_qa import mesh_to_source_report_v2
+
+    _warm_scipy()
+    mesh, rows = load_mesh(path)
+    report, evidence = mesh_to_source_report_v2(
+        mesh, mesh.vertices, source_rows=rows,
+        qa_window_rows=window, max_samples=samples,
+    )
+    return {
+        "vertices": mesh.vertex_count,
+        "triangles": mesh.triangle_count,
+        "sampled": report.sampled_points,
+        "rms": report.rms,
+        "selected": evidence.samples_selected,
+    }
 
 
 def global_cull_only(fixture: str) -> dict[str, Any]:

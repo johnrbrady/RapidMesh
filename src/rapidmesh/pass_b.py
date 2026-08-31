@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .pass_b_merge import RunSet, merge_runs, write_runs
+from .tiles import DEFAULT_TILE_SIZE_M
 from .types import FilterStats, StructuredScan
 
 if TYPE_CHECKING:
@@ -306,6 +307,8 @@ def pass_b_finalise(
     min_component_area: float, measure: bool, measure_samples: int,
     qa_window_rows: int, timings: dict[str, float], streaming: tuple[int, int, int],
     settings: dict[str, float | int | bool | str],
+    out_dir: Path | None = None, tile_size: float = DEFAULT_TILE_SIZE_M,
+    qa_workers: int = 1, qa_seed: int = 0,
 ) -> MeshResult:
     """Re-read the segments, cull on completed components, mesh and measure.
 
@@ -316,6 +319,17 @@ def pass_b_finalise(
     mis-attribute it (§4.3). Both are written once, here. QA follows, against
     final dispositions only: measuring provisional geometry is the defect
     `FINDING-002` records.
+
+    **Two output shapes, and the difference is the WP-3.2 memory row.** With an
+    `out_dir`, the surviving triangles are filed into an immutable spatial
+    generation one tile at a time and no whole-station `MeshData` is ever
+    constructed (ADR-006 Decision 2). Without one there is nowhere for the
+    generation to live that outlives this call, so the old shape runs instead:
+    `build_mesh` over the station, exactly as before. That path is kept
+    deliberately — it is the reference the tiled one is compared against, the way
+    `qa_reference` is for forward QA — but it is **not** the shape the memory gate
+    is measured on, and a caller that wants the gate has to say where the output
+    goes.
     """
     import numpy as np
 
@@ -327,6 +341,7 @@ def pass_b_finalise(
         retained_scan_from_segments,
         write_finalised_component_table,
     )
+    from .tile_build import build_tiles
     from .triangulate import MIN_COMPONENT_TRIANGLES, build_mesh
 
     retained = retained_scan_from_segments(scan, pass_a.segments)
@@ -362,39 +377,64 @@ def pass_b_finalise(
     keep_root[area.root_ids] = survives
     kept_total = int(area.counts[survives].sum())
 
-    kept_tris, before, final = stream_kept_triangles(
-        runs, cells, keep_root, kept_total, len(retained)
-    )
     triangles_before_cull = runs.record_count
-
     write_finalised_component_table(
         work_dir, pass_a.component_table_path, area,
         min_component_area=min_component_area, min_triangles=MIN_COMPONENT_TRIANGLES,
     )
 
-    # Released before the mesh is assembled: the cell index and the run buffers
-    # have no reader left, and `build_mesh` is the largest single allocation in
-    # this pass. Holding them across it is how the old shape reached its peak.
-    del cells
     t0 = time.perf_counter()
-    mesh = build_mesh(retained, kept_tris)
+    mesh: Any = None
+    tiles = None
+    built: Any = None
+    qa_source: Any = None
+    if out_dir is None:
+        kept_tris, before, final = stream_kept_triangles(
+            runs, cells, keep_root, kept_total, len(retained)
+        )
+        # Released before the mesh is assembled: the cell index and the run
+        # buffers have no reader left, and `build_mesh` is the largest single
+        # allocation in this pass. Holding them across it is how the old shape
+        # reached its peak.
+        del cells
+        mesh = build_mesh(retained, kept_tris)
+        triangles_after_cull = int(kept_tris.shape[0])
+        del kept_tris
+        qa_source = mesh
+    else:
+        built = build_tiles(
+            retained, runs, cells, keep_root,
+            work_dir=out_dir, tile_size=tile_size,
+        )
+        del cells
+        before, final = built.before, built.final
+        triangles_after_cull = built.triangles_written
+        tiles = built.store
+        # WP-3.3: both QA directions read the written generation. `TileStore` is
+        # a `qa_stream.GeometrySource`, so neither direction has to know whether
+        # it was handed a resident mesh or a tile store.
+        qa_source = tiles
     timings["assemble"] = time.perf_counter() - t0
-    triangles_after_cull = int(kept_tris.shape[0])
-    del kept_tris
 
     deviation = None
     reverse = None
     reverse_evidence = None
-    if measure and mesh.triangle_count:
+    triangle_count = (
+        triangles_after_cull if mesh is None else mesh.triangle_count
+    )
+    if measure and triangle_count and qa_source is not None:
         t0 = time.perf_counter()
         offsets = retained.pose.rotate_local(retained.xyz[final]).astype(np.float32)
-        deviation = deviation_report(mesh, offsets, max_samples=measure_samples)
+        deviation = deviation_report(
+            qa_source, offsets, max_samples=measure_samples,
+            seed=qa_seed, workers=qa_workers,
+        )
         # §4.4: both directions run here, after culling and the ledger, against
         # final dispositions only.
         reverse, reverse_evidence = mesh_to_source_report_v2(
-            mesh, offsets, source_rows=retained.row[final],
+            qa_source, offsets, source_rows=retained.row[final],
             qa_window_rows=qa_window_rows, max_samples=measure_samples,
-            work_dir=work_dir,
+            seed=qa_seed, work_dir=work_dir,
         )
         timings["measure"] = time.perf_counter() - t0
 
@@ -433,10 +473,12 @@ def pass_b_finalise(
             for seg in pass_a.segments
             for p in (seg.tri_path, seg.pos_path, seg.disp_path)
         ),
+        tiles=None if built is None else built.describe(),
+        tile_bytes=0 if built is None else built.tile_bytes,
     )
     return MeshResult(
         mesh=mesh, stats=stats, lattice=scan.lattice, deviation=deviation,
         mesh_to_source=reverse, timings=timings, settings=settings,
         station_id=scan.station_id, diagnostics=diagnostics,
-        reverse_qa_evidence=reverse_evidence,
+        reverse_qa_evidence=reverse_evidence, tiles=tiles,
     )

@@ -407,7 +407,8 @@ def _distances_with_triangle(mesh: Any, points: Any) -> tuple[Any, Any]:
     import numpy as np
     from scipy.spatial import cKDTree
 
-    from rapidmesh.qa import _point_triangle_distance, _vertex_triangle_map
+    from rapidmesh.qa import _point_triangle_distance
+    from rapidmesh.qa_reference import _vertex_triangle_map
 
     verts = mesh.vertices.astype(np.float64)
     tris = mesh.triangles.astype(np.int64)
