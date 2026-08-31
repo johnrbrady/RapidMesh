@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .carvegrid import (
     DEFAULT_CHUNK_POINTS,
@@ -44,9 +44,11 @@ from .types import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterable, Sequence
 
+    from .e57_reader import RawChunk
     from .reverse_qa import ReverseQAEvidence
+    from .streaming import StationMetadata
 
 
 @dataclass
@@ -194,18 +196,70 @@ def mesh_station_streamed(
     `connected_components` of `cull_islands`, which is over 1 GB of
     intermediate on the reference station before the mesh is counted.
 
-    ``chunk_points`` is accepted and recorded but is not yet a live axis on
-    this path: it belongs to `e57_reader.iter_row_bands`, and driving Pass A
-    from a raw E57 stream is not part of item 8. It is in the signature and in
-    the diagnostics so the harness matrix can vary it and demonstrate that the
-    output does not move, which is a weaker statement than exercising it and is
-    reported as such.
+    ``chunk_points`` is **live** since DEC-009 step 2: the scan is re-emitted as
+    a chunk stream at that capacity, `iter_row_bands` reassembles row bands from
+    it, and Pass A never sees the whole station. Moving chunk boundaries
+    therefore genuinely moves where reads split, and the harness's demonstration
+    that the output does not move is now a statement about the code rather than
+    about an unused parameter.
+
+    Handing a resident `StructuredScan` in does not itself save memory — the
+    caller already has one, and the equivalence harness needs the same station
+    down both paths. `mesh_station_from_chunks` is the form that never
+    materialises it.
+    """
+    from .streaming import StationMetadata, scan_to_chunks
+
+    return mesh_station_from_chunks(
+        scan_to_chunks(scan, chunk_points),
+        StationMetadata.from_scan(scan),
+        band_rows=band_rows, chunk_points=chunk_points, halo=halo, others=others,
+        max_incidence_deg=max_incidence_deg, noise_floor=noise_floor,
+        min_component_area=min_component_area, despeckle=despeckle,
+        measure=measure, measure_samples=measure_samples,
+        qa_window_rows=qa_window_rows, work_dir=work_dir,
+    )
+
+
+def mesh_station_from_chunks(
+    chunks: Iterable[RawChunk],
+    metadata: StationMetadata,
+    *,
+    band_rows: int,
+    chunk_points: int,
+    halo: int,
+    others: list[CoarseRangeGrid] | None = None,
+    max_incidence_deg: float = 82.0,
+    noise_floor: float = 0.012,
+    min_component_area: float = 0.005,
+    despeckle: bool = True,
+    measure: bool = True,
+    measure_samples: int = 300_000,
+    qa_window_rows: int = REVERSE_QA_WINDOW_ROWS,
+    work_dir: str | None = None,
+    converter: Any | None = None,
+) -> MeshResult:
+    """The streamed pipeline with **no resident input scan** — DEC-009 step 2.
+
+    Points enter as a chunk stream and are never assembled into a whole-station
+    array. What is held across the sweep is `metadata`: a pose, a lattice and
+    four counts, a fixed size whatever the station's.
+
+    Pass B still rebuilds the *retained* set from the segments Pass A wrote —
+    that is the mesh's own vertex store, not the input, and bounding it is
+    Phase 3's incremental-output work rather than this package's.
+
+    `converter` turns one raw band into a band-local scan. The default reads
+    the wire vocabulary `streaming.scan_to_chunks` emits; an E57 producer
+    passes `streaming.e57_band_to_scan` bound to its station-level frame and
+    colour policy, which must be decided once and not per band.
     """
     import tempfile
     from pathlib import Path
 
-    from .islands import pass_a_sweep
+    from .islands import pass_a_sweep_bands
     from .pass_b import pass_b_finalise
+    from .streaming import iter_band_filter_results
 
     t: dict[str, float] = {}
     owned = work_dir is None
@@ -216,13 +270,14 @@ def mesh_station_streamed(
     )
     try:
         t0 = time.perf_counter()
-        pass_a = pass_a_sweep(
-            scan,
+        pass_a = pass_a_sweep_bands(
+            metadata,
+            iter_band_filter_results(
+                chunks, metadata, others=others, despeckle=despeckle,
+                band_rows=band_rows, halo=halo,
+                **({} if converter is None else {"converter": converter}),
+            ),
             work_dir=root,
-            others=others,
-            despeckle=despeckle,
-            band_rows=band_rows,
-            halo=halo,
             max_incidence_deg=max_incidence_deg,
             noise_floor=noise_floor,
         )
@@ -230,7 +285,7 @@ def mesh_station_streamed(
 
         t0 = time.perf_counter()
         result = pass_b_finalise(
-            scan,
+            metadata.handle_scan(),
             pass_a,
             work_dir=root,
             min_component_area=min_component_area,

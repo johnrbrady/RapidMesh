@@ -45,7 +45,7 @@ import math
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-from .filters import columns_wrap, iter_clean_bands
+from .filters import BandFilterResult, columns_wrap
 from .grid import ScanGrid, concat, select
 from .segments_io import (
     BandSegment,
@@ -53,16 +53,19 @@ from .segments_io import (
     write_band_segments,
     write_component_table,
 )
+from .streaming import StationMetadata
 from .triangulate import band_triangle_indices
 from .types import StructuredScan
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from pathlib import Path
 
     import numpy as np
     import numpy.typing as npt
 
     from .grid import CoarseRangeGrid
+
 
     F32 = npt.NDArray[np.float32]
     I64 = npt.NDArray[np.int64]
@@ -197,11 +200,52 @@ def pass_a_sweep(
     despeckle: bool = True,
     band_rows: int = 256,
     halo: int = 3,
+    chunk_points: int = 250_000,
     max_incidence_deg: float = 82.0,
     noise_floor: float = 0.012,
     min_quality: float = 0.015,
 ) -> PassAResult:
-    """One forward sweep: filter, triangulate the core, label, merge, retire.
+    """One forward sweep over a resident scan.
+
+    Kept for callers that already hold a `StructuredScan` — fixtures, and the
+    equivalence harness, which needs the same station down both paths. It is a
+    thin wrapper: the scan is re-emitted as a chunk stream and the sweep itself
+    is `pass_a_sweep_bands`, so there is one implementation and not two.
+
+    Holding the scan is the caller's choice here and costs what it always did.
+    `pipeline.mesh_station_from_chunks` is the form where the input is never
+    resident.
+    """
+    from .streaming import StationMetadata, scan_band_stream
+
+    return pass_a_sweep_bands(
+        StationMetadata.from_scan(scan),
+        scan_band_stream(
+            scan, chunk_points=chunk_points, others=others, despeckle=despeckle,
+            band_rows=band_rows, halo=halo,
+        ),
+        work_dir=work_dir,
+        max_incidence_deg=max_incidence_deg,
+        noise_floor=noise_floor,
+        min_quality=min_quality,
+    )
+
+
+def pass_a_sweep_bands(
+    metadata: StationMetadata,
+    bands: Iterable[BandFilterResult],
+    *,
+    work_dir: Path,
+    max_incidence_deg: float = 82.0,
+    noise_floor: float = 0.012,
+    min_quality: float = 0.015,
+) -> PassAResult:
+    """One forward sweep: triangulate each filtered core, label, merge, retire.
+
+    Takes a **stream** of already-filtered bands and the station's metadata, not
+    a resident scan: DEC-009 step 2. Nothing here is sized by the station — the
+    lattice and pose are fixed, the frontier is one row wide, and a band's
+    points are released when its segment is written.
 
     The one-row lookahead is worth reading twice. A band's core `[b0, b1)` owns
     the quads whose *top* row is in the core (`PHASE1-HALO-CALCULUS.md` §7), and
@@ -214,12 +258,14 @@ def pass_a_sweep(
     """
     import numpy as np
 
-    from .filters import BandFilterResult
-
-    cols = scan.lattice.cols
-    rows = scan.lattice.rows
-    wrap = columns_wrap(scan)
-    step = max(abs(scan.lattice.az_step), abs(scan.lattice.el_step))
+    handle = metadata.handle_scan()
+    cols = metadata.lattice.cols
+    rows = metadata.lattice.rows
+    # Scan-level, from the lattice the metadata carries. Recomputing it from a
+    # band would judge a band of a full sweep as a partial-FOV scan and drop the
+    # wrap seam (`PHASE1-HALO-CALCULUS.md` §3).
+    wrap = columns_wrap(handle)
+    step = max(abs(metadata.lattice.az_step), abs(metadata.lattice.el_step))
     tan_limit = math.tan(math.radians(min(max_incidence_deg, 89.5)))
 
     table = ComponentTable()
@@ -281,9 +327,7 @@ def pass_a_sweep(
         band_count += 1
 
     pending: BandFilterResult | None = None
-    for result in iter_clean_bands(
-        scan, others, despeckle, band_rows=band_rows, halo=halo
-    ):
+    for result in bands:
         counts[0] += result.dropped_despeckle
         counts[1] += result.dropped_mover_carve
         counts[2] += result.restored_from_carve

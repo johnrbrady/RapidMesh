@@ -303,12 +303,26 @@ def iter_row_bands(
             )
 
     def ready(eof: bool) -> bool:
+        """Is every row this band needs *complete* in the buffer?
+
+        Strictly greater, not `>=`. A row is only known to be finished once a
+        sample from a later row has arrived, so `row[-1] >= need_row` fires when
+        the last needed row has merely *started*. For an interior band that
+        emits a partial halo row — survivable at halo 3, because the composed
+        filter chain reaches only two rows and never reads it. For the **final**
+        band `need_row` is its own core row, and emitting early truncated the
+        core: the rest of that row arrived after `core_start` had advanced past
+        it and was silently dropped. Measured on a 16 x 360 fixture at
+        `chunk_points=80`: 250 of 360 samples in the last row lost, and the
+        ledger stopped balancing. The end-of-stream pass below is what releases
+        the final band now.
+        """
         if not buffered or core_start >= row_stop:
             return False
         row = np.asarray(buffered["rowIndex"])
         core_stop = min(core_start + band_rows, row_stop)
         need_row = min(core_stop + halo, row_stop) - 1
-        return eof or (row.size > 0 and int(row[-1]) >= need_row)
+        return eof or (row.size > 0 and int(row[-1]) > need_row)
 
     def take() -> RawRowBand | None:
         nonlocal buffered, core_start

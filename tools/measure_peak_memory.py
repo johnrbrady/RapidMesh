@@ -114,6 +114,105 @@ def load_fixture(fixture: str) -> Any:
 # ---------------------------------------------------------------------------
 
 
+def prepare_e57(path: str, rows: int, cols: int, seed: int = 7) -> dict[str, Any]:
+    """Write the same station as a structured E57. Not a pipeline figure.
+
+    The streamed rows below read from this file, so the input genuinely lives
+    on disk rather than being handed over as an array. No reference-corpus data
+    is touched.
+    """
+    import numpy as np
+    import pye57
+
+    from rapidmesh import synthetic
+
+    scan = synthetic.generate(
+        synthetic.RoomScene(mover=True), rows=rows, cols=cols,
+        dropout=0.01, range_noise=0.002, seed=seed, station_id="mem",
+    ).scan
+    writer = pye57.E57(path, mode="w")
+    writer.write_scan_raw(
+        {
+            "cartesianX": scan.xyz[:, 0].astype(np.float64),
+            "cartesianY": scan.xyz[:, 1].astype(np.float64),
+            "cartesianZ": scan.xyz[:, 2].astype(np.float64),
+            "rowIndex": scan.row.astype(np.int64),
+            "columnIndex": scan.col.astype(np.int64),
+            "cartesianInvalidState": np.zeros(len(scan), np.int64),
+        },
+        name="mem",
+    )
+    del writer
+    return {
+        "rows": rows, "cols": cols, "samples": len(scan),
+        "bytes_on_disk": pathlib.Path(path).stat().st_size,
+    }
+
+
+def e57_metadata_only(e57: str, chunk_points: int = 250_000) -> dict[str, Any]:
+    """The bounded metadata passes alone: lattice, pose, frame and colour."""
+    from rapidmesh.streaming_e57 import e57_station_metadata
+
+    metadata, policy = e57_station_metadata(e57, chunk_points=chunk_points)
+    return {
+        "rows": metadata.lattice.rows, "cols": metadata.lattice.cols,
+        "rewrite_to_local": policy.rewrite_to_local,
+    }
+
+
+def e57_pass_a(
+    e57: str, band_rows: int = 64, chunk_points: int = 250_000
+) -> dict[str, Any]:
+    """Pass A driven from the file — the input is never a whole-station array."""
+    import shutil
+    import tempfile
+
+    from rapidmesh.islands import pass_a_sweep_bands
+    from rapidmesh.streaming_e57 import e57_band_filter_results, e57_station_metadata
+
+    metadata, policy = e57_station_metadata(e57, chunk_points=chunk_points)
+    work = pathlib.Path(tempfile.mkdtemp(prefix="rapidmesh-e57a-"))
+    try:
+        result = pass_a_sweep_bands(
+            metadata,
+            e57_band_filter_results(
+                e57, metadata, policy, chunk_points=chunk_points,
+                band_rows=band_rows, halo=3,
+            ),
+            work_dir=work,
+        )
+        return {
+            "bands": result.band_count,
+            "max_live_components": result.max_live_components,
+            "segment_bytes": sum(
+                p.stat().st_size for p in work.rglob("*") if p.is_file()
+            ),
+        }
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def e57_streamed_station(
+    e57: str, band_rows: int = 64, chunk_points: int = 250_000,
+    measure: bool = False,
+) -> dict[str, Any]:
+    """The whole streamed pipeline, input never resident."""
+    from rapidmesh.pipeline import mesh_station_from_chunks
+    from rapidmesh.streaming_e57 import e57_band_to_scan, e57_chunks, e57_station_metadata
+
+    metadata, policy = e57_station_metadata(e57, chunk_points=chunk_points)
+    result = mesh_station_from_chunks(
+        e57_chunks(e57, chunk_points=chunk_points), metadata,
+        band_rows=band_rows, chunk_points=chunk_points, halo=3, measure=measure,
+        converter=lambda band, meta: e57_band_to_scan(band, meta, policy),
+    )
+    return {
+        "vertices": result.mesh.vertex_count,
+        "triangles": result.mesh.triangle_count,
+        "bands": 0 if result.diagnostics is None else result.diagnostics.band_count,
+    }
+
+
 def load_only(fixture: str) -> dict[str, Any]:
     """The input scan alone. The floor every measured run starts from."""
     scan = load_fixture(fixture)
