@@ -28,17 +28,24 @@ from .carvegrid import (
     build_or_load,
     select_neighbours,
 )
+from .evidence import (
+    DEFAULT_QA_WORKERS,
+    FRAME_PATH_UNRECORDED,
+    EvidencePolicyError,
+    resolve_qa_workers,
+)
 from .filters import clean
 from .grid import CARVE_MAX_CELLS, CoarseRangeGrid, ScanGrid
 from .reverse_qa import DEFAULT_QA_WINDOW_ROWS as REVERSE_QA_WINDOW_ROWS
 from .reverse_qa import REVERSE_QA_VERSION
+from .streaming import StreamedDiagnostics as StreamedDiagnostics
+from .streaming import StreamedMeshingNotImplemented as StreamedMeshingNotImplemented
 from .triangulate import build_mesh, cull_islands, triangulate, used_vertices
 from .types import (
     DeviationReport,
     FilterStats,
     LatticeInfo,
     MeshData,
-    QAReportMetadata,
     StationQAReport,
     StructuredScan,
 )
@@ -48,7 +55,10 @@ if TYPE_CHECKING:
 
     from .e57_reader import RawChunk
     from .reverse_qa import ReverseQAEvidence
-    from .streaming import StationMetadata
+    from .streaming import (
+    StationMetadata,
+    StreamedDiagnostics,
+)
 
 
 @dataclass
@@ -70,6 +80,12 @@ class MeshResult:
     """How the reverse figure was produced — window, sample counts, version.
     The window and version also reach `settings`, and therefore the exported
     metadata; the counts stay here because they are results, not settings."""
+    qa_workers: int = DEFAULT_QA_WORKERS
+    """KD-tree query threads this run used. Recorded, never `-1`."""
+    seeds: dict[str, int] = field(default_factory=dict)
+    """Every RNG seed that could move a figure (SPEC §2)."""
+    frame_path: str = FRAME_PATH_UNRECORDED
+    """Which `_resolve_frame` branch the source took, or `unrecorded`."""
 
     def summary(self) -> str:
         lines = [
@@ -91,76 +107,16 @@ class MeshResult:
     def evidence_report(
         self, source_sha256: str, peak_rss_bytes: int | None = None
     ) -> StationQAReport:
-        """Package all QA outputs with reproducibility metadata.
+        """Package all QA outputs with the full reproduction context.
 
-        Station identity and coordinates are intentionally absent. The source
-        digest is the join to an authorised evidence register.
+        The envelope itself is assembled in `evidence.py`; this is the entry
+        point callers already had. Station identity and coordinates are
+        intentionally absent — the source digest is the join to an authorised
+        evidence register.
         """
-        from . import __version__
+        from .evidence import build_station_report
 
-        metadata = QAReportMetadata(
-            source_sha256=source_sha256,
-            rapidmesh_version=__version__,
-            settings=tuple(
-                (key, str(value)) for key, value in sorted(self.settings.items())
-            ),
-            exclusions=(
-                "no-return",
-                "despeckled",
-                "carved",
-                "island-culled",
-                "otherwise-excluded",
-            ),
-            processing_seconds=sum(self.timings.values()),
-            peak_rss_bytes=peak_rss_bytes,
-        )
-        return StationQAReport(
-            retained_surface=self.deviation,
-            filtering_ledger=self.stats,
-            mesh_to_source=self.mesh_to_source,
-            metadata=metadata,
-            lattice_source=self.lattice.source.value,
-        )
-
-
-class StreamedMeshingNotImplemented(NotImplementedError):
-    """Retained for the harness's named-failure contract.
-
-    ``mesh_station_streamed`` raised this while PLAN.md §5 items 6–8 were
-    outstanding. All three now exist, so the streamed entry point runs and this
-    exception is no longer raised on the implemented path. It stays defined —
-    and stays exported — because it is the harness's way of distinguishing "not
-    built yet" from a crash, and a configuration this pipeline genuinely cannot
-    stream must still say so by name rather than by traceback.
-    """
-
-
-@dataclass(frozen=True)
-class StreamedDiagnostics:
-    """Internal, non-exported evidence about one streamed run.
-
-    Deliberately not part of ``StationQAReport``: the equivalence harness
-    compares metadata field for field (SPEC §7), so the streamed run's settings
-    must be identical to the in-memory run's. The streaming axes and the
-    `PHASE1-ISLANDS-FINALISATION.md` §7 claim-A instrumentation live here
-    instead, where a test can read them and a report cannot accidentally claim
-    them as product metadata.
-    """
-
-    band_rows: int
-    chunk_points: int
-    halo: int
-    band_count: int
-    max_live_components: int
-    max_frontier_occupied: int
-    component_count: int
-    triangles_before_cull: int
-    triangles_after_cull: int
-    retained_unmeshed: int
-    component_area_version: str
-    max_area_ratio: float
-    area_fallback_components: int
-    segment_bytes: int
+        return build_station_report(self, source_sha256, peak_rss_bytes)
 
 
 def mesh_station_streamed(
@@ -177,6 +133,9 @@ def mesh_station_streamed(
     measure: bool = True,
     measure_samples: int = 300_000,
     qa_window_rows: int = REVERSE_QA_WINDOW_ROWS,
+    qa_workers: int = DEFAULT_QA_WORKERS,
+    qa_seed: int = 0,
+    frame_path: str = FRAME_PATH_UNRECORDED,
     work_dir: str | None = None,
 ) -> MeshResult:
     """Two-pass streamed pipeline for one station (PLAN.md §5 items 6–8).
@@ -212,12 +171,13 @@ def mesh_station_streamed(
 
     return mesh_station_from_chunks(
         scan_to_chunks(scan, chunk_points),
-        StationMetadata.from_scan(scan),
+        StationMetadata.from_scan(scan, frame_path=frame_path),
         band_rows=band_rows, chunk_points=chunk_points, halo=halo, others=others,
         max_incidence_deg=max_incidence_deg, noise_floor=noise_floor,
         min_component_area=min_component_area, despeckle=despeckle,
         measure=measure, measure_samples=measure_samples,
-        qa_window_rows=qa_window_rows, work_dir=work_dir,
+        qa_window_rows=qa_window_rows, qa_workers=qa_workers, qa_seed=qa_seed,
+        work_dir=work_dir,
     )
 
 
@@ -236,6 +196,8 @@ def mesh_station_from_chunks(
     measure: bool = True,
     measure_samples: int = 300_000,
     qa_window_rows: int = REVERSE_QA_WINDOW_ROWS,
+    qa_workers: int = DEFAULT_QA_WORKERS,
+    qa_seed: int = 0,
     work_dir: str | None = None,
     converter: Any | None = None,
 ) -> MeshResult:
@@ -261,6 +223,19 @@ def mesh_station_from_chunks(
     from .pass_b import pass_b_finalise
     from .streaming import iter_band_filter_results
 
+    workers = resolve_qa_workers(qa_workers)
+    if workers != DEFAULT_QA_WORKERS:
+        # `pass_b.py` owns this path's QA call sites and is read-only in the
+        # package that added `qa_workers` (PLAN.md §5 item 11), so the streamed
+        # path cannot honour a count other than the pinned default. Refusing is
+        # the honest option: silently running at 1 while recording the
+        # requested value would put a false reproduction condition in the
+        # envelope, which is the one thing the envelope exists to prevent.
+        raise EvidencePolicyError(
+            f"qa_workers={workers} is not yet supported on the streamed path; "
+            "its QA call sites live in pass_b.py. Use the default of "
+            f"{DEFAULT_QA_WORKERS}."
+        )
     t: dict[str, float] = {}
     owned = work_dir is None
     root = (
@@ -301,11 +276,18 @@ def mesh_station_from_chunks(
                 "measure": measure,
                 "measure_samples": measure_samples,
                 "qa_window_rows": qa_window_rows,
+                "qa_workers": workers,
                 "reverse_qa_version": REVERSE_QA_VERSION,
             },
             streaming=(band_rows, chunk_points, halo),
         )
         t["pass_b"] = time.perf_counter() - t0
+        # `pass_b_finalise` owns the MeshResult and is read-only in this
+        # package, so the envelope's three run-identity fields are attached
+        # here, where the values are known, rather than threaded through it.
+        result.qa_workers = workers
+        result.seeds = {"qa_seed": qa_seed}
+        result.frame_path = metadata.frame_path
         return result
     finally:
         if owned:
@@ -324,6 +306,9 @@ def mesh_station(
     measure: bool = True,
     measure_samples: int = 300_000,
     qa_window_rows: int = REVERSE_QA_WINDOW_ROWS,
+    qa_workers: int = DEFAULT_QA_WORKERS,
+    qa_seed: int = 0,
+    frame_path: str = FRAME_PATH_UNRECORDED,
 ) -> MeshResult:
     """Full pipeline for one station.
 
@@ -339,6 +324,7 @@ def mesh_station(
     from .qa import deviation_report
     from .reverse_qa import mesh_to_source_report_v2
 
+    workers = resolve_qa_workers(qa_workers)
     t: dict[str, float] = {}
 
     t0 = time.perf_counter()
@@ -378,13 +364,17 @@ def mesh_station(
         retained_offsets = grid.scan.pose.rotate_local(
             grid.scan.xyz[used_final]
         ).astype(np.float32)
-        dev = deviation_report(mesh, retained_offsets, max_samples=measure_samples)
+        dev = deviation_report(
+            mesh, retained_offsets, max_samples=measure_samples, seed=qa_seed,
+            workers=workers,
+        )
         # Reverse QA runs against final dispositions only, on the same retained
         # set the forward direction uses (`PHASE1-ISLANDS-FINALISATION.md` §4.4).
         reverse, reverse_evidence = mesh_to_source_report_v2(
             mesh, retained_offsets,
             source_rows=grid.scan.row[used_final],
             qa_window_rows=qa_window_rows, max_samples=measure_samples,
+            seed=qa_seed,
         )
         t["measure"] = time.perf_counter() - t0
 
@@ -420,10 +410,14 @@ def mesh_station(
             "measure": measure,
             "measure_samples": measure_samples,
             "qa_window_rows": qa_window_rows,
+            "qa_workers": workers,
             "reverse_qa_version": REVERSE_QA_VERSION,
         },
         station_id=scan.station_id,
         reverse_qa_evidence=reverse_evidence,
+        qa_workers=workers,
+        seeds={"qa_seed": qa_seed},
+        frame_path=frame_path,
     )
 
 

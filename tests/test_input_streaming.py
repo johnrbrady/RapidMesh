@@ -279,16 +279,25 @@ def test_streamed_e57_meshes_identically_to_the_resident_path(
 ) -> None:
     """End to end: the same station, from disk and from memory, compared with
     `compare_mesh_results` — exact SPEC §7, never `allclose`."""
+    from rapidmesh.e57_reader import read_scan_with_frame_path
     from rapidmesh.equivalence import compare_mesh_results
+    from rapidmesh.evidence import FRAME_PATH_UNRECORDED
     from rapidmesh.pipeline import mesh_station_from_chunks, mesh_station_streamed
 
     path, _scan = e57_file
     metadata, policy = e57_station_metadata(path)
-    whole = read_scan(path)
+    whole, frame_path = read_scan_with_frame_path(path)
+    # Both runs read the same file, so both took the same frame branch. The
+    # resident path has to be *told* it, because `StructuredScan` cannot carry
+    # it; the streamed path decided it in `e57_station_metadata`. That the two
+    # agree is part of what this test proves.
+    assert frame_path == metadata.frame_path
+    # And it is a real branch name, not the "we never looked" placeholder.
+    assert frame_path != FRAME_PATH_UNRECORDED
 
     resident = mesh_station_streamed(
         whole, band_rows=6, chunk_points=997, halo=3, measure=True,
-        measure_samples=2_000,
+        measure_samples=2_000, frame_path=frame_path,
     )
     from_disk = mesh_station_from_chunks(
         e57_chunks(path, chunk_points=997),

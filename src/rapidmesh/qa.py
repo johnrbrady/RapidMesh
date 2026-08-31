@@ -68,6 +68,7 @@ def deviation_report(
     max_samples: int = 500_000,
     k: int = 2,
     seed: int = 0,
+    workers: int = 1,
 ) -> DeviationReport:
     """Point-to-mesh distance statistics, in metres.
 
@@ -81,7 +82,7 @@ def deviation_report(
     millimetre. Sampling is uniform random rather than a lattice stride, so a
     periodic artefact cannot hide between the samples.
     """
-    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed)
+    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers)
     return _summarise(
         d,
         metric="retained-source-to-mesh",
@@ -96,6 +97,7 @@ def mesh_to_source_report(
     source_points: F32,
     max_samples: int = 500_000,
     seed: int = 0,
+    workers: int = 1,
 ) -> DeviationReport:
     """Sample finished triangle interiors and measure to source observations.
 
@@ -155,7 +157,7 @@ def mesh_to_source_report(
         + (u * v)[:, None] * tv[:, 2]
     )
     tree = cKDTree(source_points.astype(np.float64))
-    d, _ = tree.query(samples, k=1, workers=-1)
+    d, _ = tree.query(samples, k=1, workers=workers)
     return _summarise(
         np.asarray(d, np.float64),
         metric="mesh-to-retained-source",
@@ -215,6 +217,7 @@ def truth_report(
     max_samples: int = 500_000,
     k: int = 2,
     seed: int = 0,
+    workers: int = 1,
 ) -> DeviationReport:
     """Deviation against noise-free analytic surface points.
 
@@ -225,7 +228,7 @@ def truth_report(
     import numpy as np
 
     points = truth_points.astype(np.float32)
-    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed)
+    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers)
     return _summarise(
         d,
         metric="analytic-truth-to-mesh",
@@ -241,9 +244,18 @@ def distances(
     max_samples: int | None = None,
     k: int = 2,
     seed: int = 0,
+    workers: int = 1,
 ) -> F64:
     """Per-point distance to the nearest mesh surface. Unaggregated, so a
-    caller can map the error back onto the lattice and *see* where it is."""
+    caller can map the error back onto the lattice and *see* where it is.
+
+    `workers` is the KD-tree query thread count and defaults to **1**, not to
+    SciPy's `-1`. `PHASE1-DETERMINISM-SPEC.md` §3 requires every thread pool in
+    an evidence run to be an explicit, recordable count, and "all processors on
+    whatever machine this is" is not one. Measured on an 88,395-point fixture:
+    `workers=1` and `workers=-1` return bitwise-identical distances and
+    indices, so this is a reproducibility change and not a numerical one.
+    """
     import numpy as np
     from scipy.spatial import cKDTree
 
@@ -260,7 +272,7 @@ def distances(
     tris = mesh.triangles.astype(np.int64)
 
     tree = cKDTree(verts)
-    _, nearest = tree.query(q64, k=k, workers=-1)
+    _, nearest = tree.query(q64, k=k, workers=workers)
     nearest = np.atleast_2d(nearest.T).T if k > 1 else nearest.reshape(-1, 1)
 
     start, incident = _vertex_triangle_map(tris, verts.shape[0])
@@ -286,7 +298,7 @@ def distances(
     # silently reporting inf and poisoning the RMS.
     missing = ~np.isfinite(best)
     if np.any(missing):
-        dv, _ = tree.query(q64[missing], k=1, workers=-1)
+        dv, _ = tree.query(q64[missing], k=1, workers=workers)
         best[missing] = dv
     return best
 

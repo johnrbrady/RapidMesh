@@ -42,13 +42,27 @@ ORIENTATION_AMBIGUITY_REL = 1e-12
 # passes §5(h)", and this is that lift.
 REVERSE_QA_STATUS = "compared_reverse-qa-v2"
 
-# QAReportMetadata fields compared at T1; timing and peak RSS are excluded
-# per SPEC §5(i) / §7.
+# QAReportMetadata fields compared at T1. Everything the evidence envelope
+# records is here except the three in `EXCLUDED_FROM_COMPARISON`: timing and
+# peak RSS measure the machine rather than the mesh (SPEC §5(i)), and the
+# streaming axes are the configuration the two compared runs deliberately
+# differ in — requiring those to match would be requiring the harness to
+# compare a run with itself.
 _QA_METADATA_COMPARED = (
     "source_sha256",
     "rapidmesh_version",
     "settings",
     "exclusions",
+    "envelope_version",
+    "commit_sha",
+    "working_tree",
+    "platform",
+    "libraries",
+    "seeds",
+    "threads",
+    "frame_path",
+    "versions",
+    "reverse_qa",
 )
 _QA_METADATA_EXCLUDED = ("processing_seconds", "peak_rss_bytes")
 
@@ -333,9 +347,19 @@ def compare_qa_metadata_t1(
                 f"metadata.{name}",
                 detail=f"{lv!r} != {rv!r}",
             )
-    # Explicitly acknowledge exclusions so a future edit that drops them
-    # is visible in review.
+    # Every metadata field is either compared or named as excluded. A field
+    # added to the envelope and to neither list is a silent gap in the
+    # comparison, so this fails rather than ignoring it.
+    from .evidence import EXCLUDED_FROM_COMPARISON
+
     assert _QA_METADATA_EXCLUDED == ("processing_seconds", "peak_rss_bytes")
+    covered = set(_QA_METADATA_COMPARED) | set(EXCLUDED_FROM_COMPARISON)
+    missing = {f.name for f in fields(left)} - covered
+    if missing:
+        raise EquivalenceMismatch(
+            "metadata",
+            detail=f"envelope fields neither compared nor excluded: {sorted(missing)}",
+        )
 
 
 def compare_mesh_data(

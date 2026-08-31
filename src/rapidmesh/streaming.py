@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .e57_reader import RawChunk, iter_row_bands
+from .evidence import FRAME_PATH_UNRECORDED
 from .filters import BandPlan, iter_clean_bands
 from .types import LatticeInfo, ScanPose, StructuredScan
 
@@ -80,10 +81,27 @@ class StationMetadata:
     dropped_other: int = 0
     has_rgb: bool = False
     has_sample_id: bool = True
+    frame_path: str = FRAME_PATH_UNRECORDED
+    """Which `_resolve_frame` branch this station took, for the evidence
+    envelope. Decided once, at open time, because the test reads azimuth spread
+    *within lattice columns* and a band holds a fraction of each column.
+    `unrecorded` for a scan that never went through that decision — a synthetic
+    fixture, for instance — rather than a fabricated branch name."""
 
     @classmethod
-    def from_scan(cls, scan: StructuredScan) -> StationMetadata:
+    def from_scan(
+        cls, scan: StructuredScan, *, frame_path: str = FRAME_PATH_UNRECORDED
+    ) -> StationMetadata:
+        """Station facts from a resident scan.
+
+        `frame_path` is passed in rather than read off the scan: the branch is
+        taken by the reader and `StructuredScan` cannot carry it (see
+        `e57_reader.read_scan_with_frame_path`). A caller that does not have
+        it leaves it `unrecorded`, which is the honest answer for a synthetic
+        fixture that never resolved a frame at all.
+        """
         return cls(
+            frame_path=frame_path,
             pose=scan.pose,
             lattice=scan.lattice,
             station_id=scan.station_id,
@@ -118,6 +136,47 @@ class StationMetadata:
             dropped_no_return=self.dropped_no_return,
             dropped_other=self.dropped_other,
         )
+
+
+class StreamedMeshingNotImplemented(NotImplementedError):
+    """Retained for the harness's named-failure contract.
+
+    ``mesh_station_streamed`` raised this while PLAN.md §5 items 6–8 were
+    outstanding. All three now exist, so the streamed entry point runs and this
+    exception is no longer raised on the implemented path. It stays defined —
+    and stays exported — because it is the harness's way of distinguishing "not
+    built yet" from a crash, and a configuration this pipeline genuinely cannot
+    stream must still say so by name rather than by traceback.
+    """
+
+
+@dataclass(frozen=True)
+class StreamedDiagnostics:
+    """Evidence about one streamed run: the axes and the §7 instrumentation.
+
+    Kept out of ``settings``, which the equivalence harness compares field for
+    field (SPEC §7): a streamed run and an in-memory run of the same station
+    must agree there, and these values are exactly what the two configure
+    differently. PLAN.md §5 item 11 exports them all the same — a run whose
+    band and chunk sizes are unrecorded cannot be set up again — in the
+    envelope's `streaming` slot, which `evidence.EXCLUDED_FROM_COMPARISON`
+    names as not compared across paths.
+    """
+
+    band_rows: int
+    chunk_points: int
+    halo: int
+    band_count: int
+    max_live_components: int
+    max_frontier_occupied: int
+    component_count: int
+    triangles_before_cull: int
+    triangles_after_cull: int
+    retained_unmeshed: int
+    component_area_version: str
+    max_area_ratio: float
+    area_fallback_components: int
+    segment_bytes: int
 
 
 # ---------------------------------------------------------------------------

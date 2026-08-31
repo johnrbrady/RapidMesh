@@ -35,7 +35,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from .e57_reader import RawChunk
+from .e57_reader import (
+    FRAME_IDENTITY_POSE,
+    FRAME_LEFT_AS_LOCAL,
+    FRAME_REWRITTEN_TO_LOCAL,
+    FRAME_TOO_FEW_SAMPLES,
+    RawChunk,
+)
 from .streaming import StationMetadata, iter_band_filter_results
 from .types import LatticeInfo, LatticeSource, StructuredScan
 
@@ -151,6 +157,7 @@ def e57_station_metadata(
     )
     lattice = LatticeInfo(rows, cols, az_step, el_step, az0, el0, LatticeSource.ROW_COL)
 
+    frame_path = FRAME_TOO_FEW_SAMPLES
     rewrite = False
     if frame_sub["xyz"].shape[0] >= 64:
         translation = np.asarray(pose.translation, np.float64)
@@ -164,6 +171,11 @@ def e57_station_metadata(
             )
             as_local = _column_azimuth_spread(frame_sub["xyz"], frame_sub["col"])
             rewrite = as_world < as_local * 0.2
+            frame_path = (
+                FRAME_REWRITTEN_TO_LOCAL if rewrite else FRAME_LEFT_AS_LOCAL
+            )
+        else:
+            frame_path = FRAME_IDENTITY_POSE
 
     name = str(getattr(header, "name", "") or "")
     del source_file
@@ -180,6 +192,7 @@ def e57_station_metadata(
         dropped_other=0,
         has_rgb=has_rgb,
         has_sample_id=True,
+        frame_path=frame_path,
     )
     return metadata, FramePolicy(
         rewrite_to_local=rewrite, shift_colour=colour_max > 255

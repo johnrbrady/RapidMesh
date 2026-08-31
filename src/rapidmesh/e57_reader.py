@@ -191,6 +191,37 @@ def read_scan(
     raw: dict[str, Any] = e57.read_scan_raw(index)
     pose = _pose_from_header(header)
     sid = station_id or str(getattr(header, "name", "") or f"scan{index:03d}")
+    scan, _frame_path = _build(raw, pose, sid, max_points)
+    return scan
+
+
+def read_scan_with_frame_path(
+    path: str | Path,
+    index: int = 0,
+    max_points: int | None = None,
+    station_id: str = "",
+) -> tuple[StructuredScan, str]:
+    """`read_scan`, plus which `_resolve_frame` branch it took.
+
+    The branch is a reproduction condition — it decides whether the pipeline
+    saw the exporter's coordinates or the recovered local ones — so PLAN.md §5
+    item 11 requires it in the evidence envelope. It cannot ride on
+    `StructuredScan`: `grid.sort_row_major`, `select` and `concat` rebuild that
+    dataclass field by field, so a field added there is dropped by the first
+    derived scan without anything raising. Returned beside the scan instead,
+    where losing it takes an edit rather than an omission.
+
+    `read_scan` stays exactly as it was for the callers that do not need it.
+    """
+    import pye57
+
+    e57 = pye57.E57(str(path))
+    if not 0 <= index < e57.scan_count:
+        raise IndexError(f"scan {index} out of range (file has {e57.scan_count})")
+    header = e57.get_header(index)
+    raw: dict[str, Any] = e57.read_scan_raw(index)
+    pose = _pose_from_header(header)
+    sid = station_id or str(getattr(header, "name", "") or f"scan{index:03d}")
     return _build(raw, pose, sid, max_points)
 
 
@@ -366,7 +397,7 @@ def _build(
     pose: ScanPose,
     station_id: str,
     max_points: int | None,
-) -> StructuredScan:
+) -> tuple[StructuredScan, str]:
     """Turn one scan's raw field dict into a `StructuredScan`.
 
     Split out from `read_scan` with no pye57 in its signature so the synthetic
@@ -378,6 +409,7 @@ def _build(
 
     xyz_local, rng = _positions(raw)
     valid = _validity(raw, rng)
+    frame_path = frame_decision(raw, pose, valid)
     xyz_local, rng = _resolve_frame(xyz_local, rng, raw, pose, valid)
     row, col, lattice = _lattice(raw, xyz_local, rng, valid)
 
@@ -415,7 +447,7 @@ def _build(
             dropped_no_return=dropped_no_return,
             dropped_other=dropped_other,
         )
-    )
+    ), frame_path
 
 
 # --------------------------------------------------------------------------
@@ -478,36 +510,62 @@ def _resolve_frame(xyz: Any, rng: Any, raw: dict[str, Any], pose: ScanPose, vali
     """
     import numpy as np
 
+    if frame_decision(raw, pose, valid) is not FRAME_REWRITTEN_TO_LOCAL:
+        return xyz, rng
+    out = pose.world_to_local(xyz).astype(np.float64)
+    return out, np.linalg.norm(out, axis=1)
+
+
+# The branch names `_resolve_frame` can take. Recorded in the evidence envelope
+# because `SPATIAL-CONTRACT.md` §3 rule 7 turns on which one happened, and
+# PLAN.md §5 item 11 closes that conflict by writing it down.
+FRAME_SPHERICAL_IS_LOCAL = "spherical-is-local-by-definition"
+FRAME_NO_ROW_COLUMN = "no-row-column-lattice"
+FRAME_IDENTITY_POSE = "identity-pose-nothing-to-detect"
+FRAME_TOO_FEW_SAMPLES = "too-few-valid-samples-to-discriminate"
+FRAME_LEFT_AS_LOCAL = "left-as-local"
+FRAME_REWRITTEN_TO_LOCAL = "rewritten-to-local"
+
+
+def frame_decision(raw: dict[str, Any], pose: ScanPose, valid: Any) -> str:
+    """Which branch `_resolve_frame` takes, as a recordable name.
+
+    Split out of the correction itself so the decision can be recorded without
+    re-deriving it, and so the streamed path can take it **once** for the
+    station instead of once per band — a band holds a fraction of each lattice
+    column, and this test reads azimuth spread *within* columns.
+    """
+    import numpy as np
+
     if all(f in raw for f in _SPHERICAL):
-        return xyz, rng
+        return FRAME_SPHERICAL_IS_LOCAL
     if not all(f in raw for f in _ROWCOL):
-        return xyz, rng
+        return FRAME_NO_ROW_COLUMN
     t = np.asarray(pose.translation, np.float64)
     rotation = np.asarray(pose.rotation, np.float64)
     if float(np.linalg.norm(t)) < 0.01 and np.allclose(
         rotation, np.eye(3), rtol=1e-12, atol=1e-12
     ):
-        return xyz, rng
+        return FRAME_IDENTITY_POSE
 
     col = np.asarray(raw["columnIndex"], np.int64)
     idx = np.nonzero(valid)[0]
     if idx.size > 100_000:
         idx = idx[:: idx.size // 100_000]
     if idx.size < 64:
-        return xyz, rng
+        return FRAME_TOO_FEW_SAMPLES
 
-    project_encoded_as_local = pose.world_to_local(xyz)
+    xyz, _rng = _positions(raw)
     as_local = _column_azimuth_spread(xyz[idx], col[idx])
-    as_world = _column_azimuth_spread(project_encoded_as_local[idx], col[idx])
+    as_world = _column_azimuth_spread(pose.world_to_local(xyz)[idx], col[idx])
 
     # Require a decisive margin. A borderline result means the test did not
     # discriminate — a partial-FOV scan, or a station whose pose translation is
     # small relative to the scene — and silently rewriting coordinates on weak
     # evidence would be worse than the problem.
     if as_world < as_local * 0.2:
-        out = project_encoded_as_local.astype(np.float64)
-        return out, np.linalg.norm(out, axis=1)
-    return xyz, rng
+        return FRAME_REWRITTEN_TO_LOCAL
+    return FRAME_LEFT_AS_LOCAL
 
 
 def _column_azimuth_spread(xyz: Any, col: Any) -> float:

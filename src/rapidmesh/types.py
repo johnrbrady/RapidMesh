@@ -26,6 +26,8 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from typing import TYPE_CHECKING
 
+from .evidence import EVIDENCE_ENVELOPE_VERSION, FRAME_PATH_UNRECORDED
+
 if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
@@ -302,7 +304,19 @@ class FilterStats:
 
 @dataclass(frozen=True)
 class QAReportMetadata:
-    """Reproduction context required around every exported QA report."""
+    """Reproduction context required around every exported QA report.
+
+    The field list is `PHASE1-DETERMINISM-SPEC.md` §2's table of conditions that
+    must be equal for two runs to be compared bit for bit. Everything after
+    `peak_rss_bytes` was added by PLAN.md §5 item 11 and defaults to an empty or
+    explicitly-unknown value, so a report built without a collector says so
+    rather than looking complete.
+
+    `settings` carries what both pipeline paths share; the band, chunk and halo
+    axes live in `streaming`, because the two paths are deliberately different
+    configurations and requiring those to match would be requiring the
+    equivalence harness to compare a run with itself.
+    """
 
     source_sha256: str
     rapidmesh_version: str
@@ -310,6 +324,20 @@ class QAReportMetadata:
     exclusions: tuple[str, ...]
     processing_seconds: float
     peak_rss_bytes: int | None
+    envelope_version: str = EVIDENCE_ENVELOPE_VERSION
+    commit_sha: str = "unknown"
+    working_tree: str = "unknown"
+    """`clean`, `modified` or `unknown`. A commit hash read from a tree with
+    uncommitted edits names code that is not the code that ran, so the two
+    fields are only meaningful together."""
+    platform: tuple[tuple[str, str], ...] = ()
+    libraries: tuple[tuple[str, str], ...] = ()
+    seeds: tuple[tuple[str, str], ...] = ()
+    threads: tuple[tuple[str, str], ...] = ()
+    frame_path: str = FRAME_PATH_UNRECORDED
+    versions: tuple[tuple[str, str], ...] = ()
+    streaming: tuple[tuple[str, str], ...] = ()
+    reverse_qa: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         digest = self.source_sha256.lower()
@@ -328,7 +356,17 @@ class StationQAReport:
     lattice_source: str
 
     def to_dict(self) -> dict[str, object]:
-        """Return a JSON-ready structure without station names or coordinates."""
+        """Return a JSON-ready structure without station names or coordinates.
+
+        Pair tuples become objects so the result survives `json.dumps` and comes
+        back as the same mapping; `exclusions` stays a list because it is a set
+        of category names, not name/value pairs.
+        """
         out = asdict(self)
-        out["metadata"]["settings"] = dict(self.metadata.settings)
+        metadata = out["metadata"]
+        for name in (
+            "settings", "platform", "libraries", "seeds", "threads", "versions",
+            "streaming", "reverse_qa",
+        ):
+            metadata[name] = dict(getattr(self.metadata, name))
         return out
