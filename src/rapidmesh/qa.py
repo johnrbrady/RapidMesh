@@ -36,7 +36,7 @@ second-nearest vertex, which happens on elongated triangles near edges.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .types import DeviationReport, MeshData
 
@@ -47,6 +47,20 @@ if TYPE_CHECKING:
     F32 = npt.NDArray[np.float32]
     F64 = npt.NDArray[np.float64]
     I64 = npt.NDArray[np.int64]
+
+# Queries per batch in `distances`. Chosen by measurement, and the measurement
+# corrected a first guess: WP-3.0 read the floor as 50,000, but that reading was
+# taken with the mesh built in the same process, so the pipeline's own
+# high-water mark sat above the query transient and hid it. Measured against a
+# mesh merely loaded from disk, the peak is 432 MB at 50,000 and 386 MB at both
+# 25,000 and 10,000 — so **25,000 is the largest batch that reaches the floor**,
+# and 50,000 leaves 46 MB of transient that WP-3.1 would expose the moment it
+# lowers everything around it. Iteration cost between the two is nil (5.45 s vs
+# 5.49 s on that fixture).
+#
+# A setting under `PHASE1-DETERMINISM-SPEC.md` §2, recorded in the evidence
+# envelope, because a reader must be able to see it did not move the output.
+QA_QUERY_BLOCK = 25_000
 
 
 def sha256_file(path: str, chunk_bytes: int = 4 * 1024 * 1024) -> str:
@@ -69,6 +83,7 @@ def deviation_report(
     k: int = 2,
     seed: int = 0,
     workers: int = 1,
+    block: int = QA_QUERY_BLOCK,
 ) -> DeviationReport:
     """Point-to-mesh distance statistics, in metres.
 
@@ -82,7 +97,10 @@ def deviation_report(
     millimetre. Sampling is uniform random rather than a lattice stride, so a
     periodic artefact cannot hide between the samples.
     """
-    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers)
+    d = distances(
+        mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers,
+        block=block,
+    )
     return _summarise(
         d,
         metric="retained-source-to-mesh",
@@ -218,6 +236,7 @@ def truth_report(
     k: int = 2,
     seed: int = 0,
     workers: int = 1,
+    block: int = QA_QUERY_BLOCK,
 ) -> DeviationReport:
     """Deviation against noise-free analytic surface points.
 
@@ -228,7 +247,10 @@ def truth_report(
     import numpy as np
 
     points = truth_points.astype(np.float32)
-    d = distances(mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers)
+    d = distances(
+        mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers,
+        block=block,
+    )
     return _summarise(
         d,
         metric="analytic-truth-to-mesh",
@@ -245,6 +267,7 @@ def distances(
     k: int = 2,
     seed: int = 0,
     workers: int = 1,
+    block: int = QA_QUERY_BLOCK,
 ) -> F64:
     """Per-point distance to the nearest mesh surface. Unaggregated, so a
     caller can map the error back onto the lattice and *see* where it is.
@@ -255,10 +278,18 @@ def distances(
     whatever machine this is" is not one. Measured on an 88,395-point fixture:
     `workers=1` and `workers=-1` return bitwise-identical distances and
     indices, so this is a reproducibility change and not a numerical one.
+
+    `block` is the query batch size. The three structures that scale with the
+    *station* — the float64 vertex copy, the int64 triangle copy and the
+    vertex-to-triangle map — are built once, outside the loop, exactly as
+    before; only the per-query work is split. Bounding those is `WP-3.1`, and
+    is deliberately not attempted here.
     """
     import numpy as np
     from scipy.spatial import cKDTree
 
+    if block < 1:
+        raise ValueError(f"block must be a positive query count, got {block}")
     if mesh.triangle_count == 0 or points.shape[0] == 0:
         return np.empty(0, np.float64)
 
@@ -272,10 +303,42 @@ def distances(
     tris = mesh.triangles.astype(np.int64)
 
     tree = cKDTree(verts)
+    start, incident = _vertex_triangle_map(tris, verts.shape[0])
+
+    # `full(inf)` rather than `empty`: if a future edit ever left a query
+    # unwritten, uninitialised memory can hold a plausible-looking finite
+    # distance and be believed. An infinity cannot.
+    best = np.full(q64.shape[0], np.inf, np.float64)
+    for lo in range(0, q64.shape[0], block):
+        best[lo : lo + block] = _block_distances(
+            q64[lo : lo + block], tree, verts, tris, start, incident, k, workers
+        )
+    return best
+
+
+def _block_distances(
+    q64: F64, tree: Any, verts: F64, tris: I64, start: I64, incident: I64,
+    k: int, workers: int,
+) -> F64:
+    """One batch of queries against the whole mesh.
+
+    Split out of `distances` for one measured reason: the ragged gather below
+    costs about **2,955 bytes per query** — the arrays it builds are sized by
+    queries times incident triangles, not by the mesh — so evaluating every
+    query at once put ~886 MB on the peak at the default 300,000 samples,
+    whatever the station's size (`REPORTS/2026-08-31-WP-3.0-report.md` §1.5).
+
+    Splitting cannot move the answer, and the claim is not left as an argument:
+    each query's candidate triangle set is the same triangles either way,
+    `_point_triangle_distance` is elementwise, and the reduction is a minimum,
+    which does not depend on how the queries were grouped. `tests/
+    test_forward_qa_blocked.py` asserts bitwise equality against the
+    single-batch result at four block sizes.
+    """
+    import numpy as np
+
     _, nearest = tree.query(q64, k=k, workers=workers)
     nearest = np.atleast_2d(nearest.T).T if k > 1 else nearest.reshape(-1, 1)
-
-    start, incident = _vertex_triangle_map(tris, verts.shape[0])
 
     best = np.full(q64.shape[0], np.inf)
     for col in range(nearest.shape[1]):

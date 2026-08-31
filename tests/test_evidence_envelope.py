@@ -53,6 +53,7 @@ from rapidmesh.evidence import (
     working_tree_state,
 )
 from rapidmesh.pipeline import mesh_station, mesh_station_streamed
+from rapidmesh.qa import QA_QUERY_BLOCK
 from rapidmesh.types import QAReportMetadata, ScanPose
 
 # A synthetic station is not client data and has no file to digest, so the
@@ -138,8 +139,12 @@ def test_settings_carry_the_streaming_and_qa_axes(
     assert settings.keys() >= {
         "max_incidence_deg", "noise_floor", "min_component_area", "despeckle",
         "measure", "measure_samples", "qa_window_rows", "qa_workers",
+        "qa_query_block",
     }
     assert settings["qa_workers"] == str(DEFAULT_QA_WORKERS)
+    # WP-1.10. Recorded on the streamed path too, from the same constant, so
+    # the two paths cannot disagree about a condition of the run.
+    assert settings["qa_query_block"] == str(QA_QUERY_BLOCK)
 
     streaming = dict(_streamed(envelope_scan).streaming)
     assert streaming.keys() >= {"band_rows", "chunk_points", "halo"}

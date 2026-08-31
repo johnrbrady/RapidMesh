@@ -36,6 +36,7 @@ from .evidence import (
 )
 from .filters import clean
 from .grid import CARVE_MAX_CELLS, CoarseRangeGrid, ScanGrid
+from .qa import QA_QUERY_BLOCK
 from .reverse_qa import DEFAULT_QA_WINDOW_ROWS as REVERSE_QA_WINDOW_ROWS
 from .reverse_qa import REVERSE_QA_VERSION
 from .streaming import StreamedDiagnostics as StreamedDiagnostics
@@ -277,6 +278,7 @@ def mesh_station_from_chunks(
                 "measure_samples": measure_samples,
                 "qa_window_rows": qa_window_rows,
                 "qa_workers": workers,
+                "qa_query_block": QA_QUERY_BLOCK,
                 "reverse_qa_version": REVERSE_QA_VERSION,
             },
             streaming=(band_rows, chunk_points, halo),
@@ -411,6 +413,7 @@ def mesh_station(
             "measure_samples": measure_samples,
             "qa_window_rows": qa_window_rows,
             "qa_workers": workers,
+            "qa_query_block": QA_QUERY_BLOCK,
             "reverse_qa_version": REVERSE_QA_VERSION,
         },
         station_id=scan.station_id,
