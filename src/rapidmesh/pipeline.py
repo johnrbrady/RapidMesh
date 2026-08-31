@@ -147,6 +147,7 @@ def mesh_station_from_chunks(
     out_dir: str | None = None,
     tile_size: float = DEFAULT_TILE_SIZE_M,
     converter: Any | None = None,
+    chunk_factory: Any | None = None,
 ) -> MeshResult:
     """The streamed pipeline with **no resident input scan** — DEC-009 step 2.
 
@@ -193,6 +194,7 @@ def mesh_station_from_chunks(
                 chunks, metadata, others=others, despeckle=despeckle,
                 band_rows=band_rows, halo=halo,
                 **({} if converter is None else {"converter": converter}),
+                **({} if chunk_factory is None else {"chunk_factory": chunk_factory}),
             ),
             work_dir=root,
             max_incidence_deg=max_incidence_deg,

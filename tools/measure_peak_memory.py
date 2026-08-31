@@ -222,6 +222,7 @@ def e57_streamed_station(
         e57_chunks(e57, chunk_points=chunk_points), metadata,
         band_rows=band_rows, chunk_points=chunk_points, halo=3, measure=measure,
         converter=lambda band, meta: e57_band_to_scan(band, meta, policy),
+        chunk_factory=lambda: e57_chunks(e57, chunk_points=chunk_points),
     )
     return {
         "vertices": result.mesh.vertex_count,
@@ -265,6 +266,7 @@ def e57_tiled_station(
             band_rows=band_rows, chunk_points=chunk_points, halo=3,
             measure=measure, out_dir=str(root), tile_size=tile_size,
             converter=lambda band, meta: e57_band_to_scan(band, meta, policy),
+            chunk_factory=lambda: e57_chunks(e57, chunk_points=chunk_points),
         )
         diagnostics = result.diagnostics
         store = result.tiles

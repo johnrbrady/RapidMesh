@@ -332,4 +332,5 @@ def e57_band_filter_results(
         metadata,
         others=others, despeckle=despeckle, band_rows=band_rows, halo=halo,
         converter=lambda band, meta: e57_band_to_scan(band, meta, policy),
+        chunk_factory=lambda: e57_chunks(path, index, chunk_points=chunk_points),
     )

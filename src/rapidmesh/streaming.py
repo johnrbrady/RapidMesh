@@ -47,6 +47,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .column_bands import (
+    detect_stream_order,
+    iter_row_bands_column_major,
+)
 from .e57_reader import RawChunk, iter_row_bands
 from .evidence import FRAME_PATH_UNRECORDED
 from .filters import BandPlan, iter_clean_bands
@@ -235,6 +239,38 @@ def scan_to_chunks(
         yield RawChunk(offset=start, count=stop - start, data=data)
 
 
+def scan_to_chunks_column_major(
+    scan: StructuredScan, chunk_points: int = 250_000
+) -> Iterator[RawChunk]:
+    """Re-emit a resident scan as column-major chunks, like real E57 exports."""
+    import numpy as np
+
+    if chunk_points <= 0:
+        raise ValueError("chunk_points must be positive")
+    order = np.lexsort((scan.row, scan.col))
+    ids = (
+        np.arange(len(scan), dtype=np.int64) if scan.sample_id is None else scan.sample_id
+    )
+    offset = 0
+    for start in range(0, order.size, chunk_points):
+        stop = min(start + chunk_points, order.size)
+        pick = order[start:stop]
+        data: dict[str, Any] = {
+            "rowIndex": scan.row[pick].astype(np.int64),
+            "columnIndex": scan.col[pick].astype(np.int64),
+            "x": scan.xyz[pick, 0].copy(),
+            "y": scan.xyz[pick, 1].copy(),
+            "z": scan.xyz[pick, 2].copy(),
+            "range": scan.rng[pick].copy(),
+            "sampleId": np.asarray(ids[pick], np.int64),
+        }
+        if scan.rgb is not None:
+            for channel, name in enumerate(COLOUR_FIELDS):
+                data[name] = scan.rgb[pick, channel].copy()
+        yield RawChunk(offset=offset, count=stop - start, data=data)
+        offset += stop - start
+
+
 def band_to_scan(band: Any, metadata: StationMetadata) -> StructuredScan:
     """One `RawRowBand` in the wire vocabulary, as a band-local scan.
 
@@ -287,6 +323,7 @@ def iter_band_filter_results(
     band_rows: int = 256,
     halo: int = 3,
     converter: Callable[[Any, StationMetadata], StructuredScan] = band_to_scan,
+    chunk_factory: Callable[[], Iterable[RawChunk]] | None = None,
 ) -> Iterator[BandFilterResult]:
     """Filtered, core-owned band output, from a chunk stream.
 
@@ -300,10 +337,33 @@ def iter_band_filter_results(
     and dropped before the next band's chunks are read.
     """
     rows = metadata.lattice.rows
+    chunk_iter = iter(chunks)
+    first = next(chunk_iter, None)
+    if first is None:
+        return
+    order = detect_stream_order(first)
+    from itertools import chain
+
+    if order == "column-major":
+        factory = chunk_factory or (lambda: iter(chunks))
+        band_source = iter_row_bands_column_major(
+            lambda: iter(factory()),
+            row_min=0,
+            row_stop=rows,
+            col_count=metadata.lattice.cols,
+            band_rows=band_rows,
+            halo=halo,
+        )
+    else:
+        band_source = iter_row_bands(
+            chain([first], chunk_iter),
+            row_min=0,
+            row_stop=rows,
+            band_rows=band_rows,
+            halo=halo,
+        )
     band_scan: StructuredScan | None = None
-    for band in iter_row_bands(
-        iter(chunks), row_min=0, row_stop=rows, band_rows=band_rows, halo=halo
-    ):
+    for band in band_source:
         band_scan = converter(band, metadata)
         if len(band_scan) == 0:
             band_scan = None
