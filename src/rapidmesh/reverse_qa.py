@@ -2,25 +2,19 @@
 Bounded reverse QA — `reverse-qa-v2`, PLAN.md §5 item 9, specified in
 `PHASE1-DETERMINISM-SPEC.md` §5(h).
 
-What was wrong with v1
-----------------------
-`qa.mesh_to_source_report` selects triangles with
+**What was wrong with v1.** `qa.mesh_to_source_report` selects triangles with
 `rs.choice(tri_ids, p=weights/weights.sum())` over a probability vector in
 *triangle array order*. Inverse-CDF sampling over a reordered vector picks
 different triangles, so the metric moved when nothing about the data moved.
 SPEC §5(h) measured 1.371 mm of p99.9 spread from `triangulate`'s internal band
 size alone, and on this repository's own 12 x 48 harness fixture the in-memory
-and streamed paths disagree by about 5% of RMS at every band size while forward
-QA is bitwise identical. That is why reverse figures were excluded from the
-equivalence comparison: they were not a property of the mesh.
+and streamed paths disagreed by about 5% of RMS at every band size while
+forward QA was bitwise identical. No tolerance was offered for that, and none
+is offered here: one wide enough to absorb it would be comparable to the
+quantity being tested.
 
-No tolerance was offered for that, and none is offered here. A tolerance wide
-enough to absorb it would be comparable to the quantity being tested, which is
-not a gate — it is an acceptance number widened by the back door.
-
-What v2 does instead
---------------------
-Every step is a function of the mesh's own content, never of array order:
+**What v2 does instead.** Every step is a function of the mesh's own content,
+never of array order:
 
 1. **Identity** — each positive-area triangle becomes its canonical oriented
    `source_sample_id` triple (SPEC §4). Reversed winding is a different
@@ -47,22 +41,27 @@ window changes the answer on a fixture small enough to compute both.
 
 **Not in scope.** The reservoir strategy is the Pipeline B fallback
 (PLAN.md §5 item 9) and is **not implemented**; a caller needing it must treat
-it as unsupported. The bounded k-way merge over persisted segments (SPEC §5(h)
-step 2, a B13 consumer) is also not implemented: the canonical sort here is
-resident, which is correct for Phase 1 fixtures and is the piece that must be
-externalised before a station-scale run.
+it as unsupported.
+
+SPEC §5(h) step 2's bounded k-way merge over persisted runs **is** implemented
+now (ITEM-009): the canonical order comes from `pass_b_merge`, so neither the
+sort nor the `(T,3,3)` corner array is resident for the station.
 """
 
 from __future__ import annotations
 
 import hashlib
 import struct
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .types import DeviationReport, MeshData
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+    from pathlib import Path
+
     import numpy as np
     import numpy.typing as npt
 
@@ -134,6 +133,7 @@ def mesh_to_source_report_v2(
     qa_window_rows: int | None = DEFAULT_QA_WINDOW_ROWS,
     max_samples: int = 500_000,
     seed: int = 0,
+    work_dir: Path | None = None,
 ) -> tuple[DeviationReport, ReverseQAEvidence]:
     """Sample triangle interiors and measure to retained observations, bounded.
 
@@ -147,6 +147,7 @@ def mesh_to_source_report_v2(
     distances, evidence = run_reverse_qa(
         mesh, source_points, source_rows=source_rows,
         qa_window_rows=qa_window_rows, max_samples=max_samples, seed=seed,
+        work_dir=work_dir,
     )
     report = _summarise(
         distances, metric=REVERSE_QA_METRIC, population=mesh.triangle_count,
@@ -163,13 +164,20 @@ def run_reverse_qa(
     qa_window_rows: int | None = DEFAULT_QA_WINDOW_ROWS,
     max_samples: int = 500_000,
     seed: int = 0,
+    work_dir: Path | None = None,
 ) -> tuple[F64, ReverseQAEvidence]:
     """The per-sample distances and the evidence behind one reverse-QA figure.
 
     One implementation, used by the report and by the calibration, so the two
     cannot drift into measuring different things.
+
+    `work_dir` holds the bounded merge runs. When absent a temporary directory
+    is used and removed; Pass B passes its own so the runs sit beside the
+    segments they were derived from.
     """
     import numpy as np
+
+    from .pass_b_merge import merge_runs
 
     tris = np.asarray(mesh.triangles, dtype=np.int64)
     ids = mesh.source_sample_id
@@ -181,30 +189,41 @@ def run_reverse_qa(
     ):
         return np.empty(0, np.float64), _no_evidence(qa_window_rows, max_samples, seed)
 
-    verts = mesh.vertices.astype(np.float64)
-    corners = verts[tris]
-    area = 0.5 * np.linalg.norm(
-        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
-    )
-    positive = np.nonzero(area > 0.0)[0]
-    if positive.size == 0:
-        return np.empty(0, np.float64), _no_evidence(qa_window_rows, max_samples, seed)
+    # ITEM-009. The canonical order comes from the bounded external merge, not
+    # a resident sort: `verts[tris]` alone is a (T,3,3) float64 array — 72 bytes
+    # per triangle — and it used to be built for the whole station just to draw
+    # a bounded sample from it.
+    with _run_directory(work_dir) as merge_dir:
+        runs = _build_reverse_runs(mesh, tris, np.asarray(ids, np.int64), merge_dir)
+        if runs.record_count == 0:
+            return np.empty(0, np.float64), _no_evidence(
+                qa_window_rows, max_samples, seed
+            )
 
-    triples = _canonical_triples(np.asarray(ids, dtype=np.int64)[tris[positive]])
-    order = np.lexsort((triples[:, 2], triples[:, 1], triples[:, 0]))
-    chosen, triples = positive[order], triples[order]
+        # Areas in canonical order, then one strict left-to-right recurrence —
+        # the same values and the same summation the resident path performed,
+        # so the selection cannot shift by a rounding step.
+        count = runs.record_count
+        area = np.empty(count, np.float64)
+        at = 0
+        for block in merge_runs(runs):
+            area[at : at + block.shape[0]] = block["area"]
+            at += block.shape[0]
+        cumulative = np.cumsum(area)
+        del area
 
-    # One strict left-to-right float64 recurrence, reused for the bounds: the
-    # selection must not rest on a different summation than the total did.
-    cumulative = np.cumsum(area[chosen])
-    count = int(chosen.size)
-    n = min(max_samples, max(count, min(10_000, max_samples)))
-    targets = (np.arange(n, dtype=np.float64) + 0.5) * float(cumulative[-1]) / n
-    picked = np.clip(np.searchsorted(cumulative, targets, side="right"), 0, count - 1)
+        n = min(max_samples, max(count, min(10_000, max_samples)))
+        targets = (np.arange(n, dtype=np.float64) + 0.5) * float(cumulative[-1]) / n
+        picked = np.clip(
+            np.searchsorted(cumulative, targets, side="right"), 0, count - 1
+        )
+        del cumulative
 
-    samples = _interior_points(corners[chosen[picked]], triples[picked], seed)
+        corners, triples, vertex_index = _gather_selected(runs, picked, mesh)
+
+    samples = _interior_points(corners, triples, seed)
     rows = np.asarray(source_rows, dtype=np.int64)
-    tri_rows = rows[tris[chosen[picked]]]
+    tri_rows = rows[vertex_index]
     distances, unmatched, windows, largest = _windowed_distances(
         samples, np.asarray(source_points, np.float64), rows,
         tri_rows.min(axis=1), tri_rows.max(axis=1), qa_window_rows,
@@ -366,3 +385,114 @@ def calibrate_window(
         "largest_candidate_set": float(evidence.largest_window_candidates),
         "unbounded_candidate_set": float(unbounded.largest_window_candidates),
     }
+
+
+# ---------------------------------------------------------------------------
+# bounded canonical order — the shared merge layer, second view
+# ---------------------------------------------------------------------------
+
+REVERSE_RUN_FIELDS = [
+    ("s0", "<i8"), ("s1", "<i8"), ("s2", "<i8"),
+    ("i0", "<i4"), ("i1", "<i4"), ("i2", "<i4"),
+    ("area", "<f8"),
+]
+REVERSE_RUN_KEY = ("s0", "s1", "s2")
+
+# Triangles per run-creation block. Bounded so the (block, 3, 3) float64 corner
+# array is a fixed cost rather than a multiple of the station.
+REVERSE_BLOCK_TRIANGLES = 65_536
+
+
+@contextmanager
+def _run_directory(work_dir: Path | None) -> Iterator[Path]:
+    """Where the merge runs live. A caller's directory, or a temporary one."""
+    import shutil
+    import tempfile
+    from pathlib import Path as _Path
+
+    if work_dir is not None:
+        yield work_dir
+        return
+    made = tempfile.mkdtemp(prefix="rapidmesh-reverseqa-")
+    try:
+        yield _Path(made)
+    finally:
+        shutil.rmtree(made, ignore_errors=True)
+
+
+def _build_reverse_runs(
+    mesh: MeshData, tris: I64, ids: I64, work_dir: Path
+) -> Any:
+    """Sorted runs keyed by canonical `source_sample_id` triple.
+
+    This is `PHASE1-TILE-CONTRACT-V0.md` §2's *second* merge view — triple
+    alone, no component root — and it is a different key on different files, so
+    it cannot be mistaken for the area view.
+
+    The stored vertex indices keep the mesh's **original winding**. Rotating
+    them to canonical form would be invisible to the T2 triangle comparison and
+    would still move every barycentric interior point, so the canonical form is
+    the sort key only and never the payload.
+    """
+    import numpy as np
+
+    from .pass_b_merge import write_runs
+
+    def blocks() -> Iterator[Any]:
+        for start in range(0, tris.shape[0], REVERSE_BLOCK_TRIANGLES):
+            piece = tris[start : start + REVERSE_BLOCK_TRIANGLES]
+            corners = mesh.vertices.astype(np.float64)[piece]
+            area = 0.5 * np.linalg.norm(
+                np.cross(
+                    corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]
+                ), axis=1,
+            )
+            positive = np.nonzero(area > 0.0)[0]
+            if positive.size == 0:
+                continue
+            kept = piece[positive]
+            triples = _canonical_triples(ids[kept])
+            record = np.empty(positive.size, dtype=np.dtype(REVERSE_RUN_FIELDS))
+            for column, name in enumerate(("s0", "s1", "s2")):
+                record[name] = triples[:, column]
+            for column, name in enumerate(("i0", "i1", "i2")):
+                record[name] = kept[:, column]
+            record["area"] = area[positive]
+            yield record
+
+    return write_runs(blocks(), work_dir, "reverseqa", REVERSE_RUN_KEY)
+
+
+def _gather_selected(runs: Any, picked: I64, mesh: MeshData) -> tuple[F64, I64, I64]:
+    """Corners, canonical triples and vertex indices for the selected samples.
+
+    `picked` is ascending, so one more merged pass suffices: each block covers a
+    contiguous span of canonical positions and the selections inside it are
+    taken by offset. Only the sampled triangles are ever materialised, which is
+    the whole reduction — `n` is capped by the caller, the station is not.
+    """
+    import numpy as np
+
+    from .pass_b_merge import merge_runs
+
+    verts = mesh.vertices.astype(np.float64)
+    corners = np.empty((picked.size, 3, 3), np.float64)
+    triples = np.empty((picked.size, 3), np.int64)
+    vertex_index = np.empty((picked.size, 3), np.int64)
+
+    at = cursor = 0
+    for block in merge_runs(runs):
+        stop = at + block.shape[0]
+        while cursor < picked.size and picked[cursor] < stop:
+            record = block[int(picked[cursor]) - at]
+            index = np.array([record["i0"], record["i1"], record["i2"]], np.int64)
+            vertex_index[cursor] = index
+            corners[cursor] = verts[index]
+            triples[cursor] = (record["s0"], record["s1"], record["s2"])
+            cursor += 1
+        at = stop
+        if cursor >= picked.size:
+            break
+    if cursor != picked.size:
+        raise ValueError(f"reverse-QA merge left {picked.size - cursor} selections unresolved")
+    return corners, triples, vertex_index

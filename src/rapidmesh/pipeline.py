@@ -204,7 +204,8 @@ def mesh_station_streamed(
     import tempfile
     from pathlib import Path
 
-    from .islands import pass_a_sweep, pass_b_finalise
+    from .islands import pass_a_sweep
+    from .pass_b import pass_b_finalise
 
     t: dict[str, float] = {}
     owned = work_dir is None

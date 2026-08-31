@@ -15,7 +15,8 @@ no band can decide it. The answer is not a bigger halo; it is to separate
     Pass A   per band: label locally, merge across a one-row frontier,
              write provisional segments, retire what can no longer grow
     Pass B   re-read the segments, evaluate component-area-v1 over completed
-             components, cull, finalise the ledger, mesh and measure
+             components, cull, finalise the ledger, mesh and measure —
+             `pass_b.py`, bounded by `pass_b_merge.py` since ITEM-009
 
 Three properties this has to get right, each of which fails silently:
 
@@ -41,7 +42,6 @@ areas once, in Pass B, over completed components.
 from __future__ import annotations
 
 import math
-import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -53,8 +53,8 @@ from .segments_io import (
     write_band_segments,
     write_component_table,
 )
-from .triangulate import band_triangle_indices, used_vertices
-from .types import FilterStats, StructuredScan
+from .triangulate import band_triangle_indices
+from .types import StructuredScan
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -63,7 +63,6 @@ if TYPE_CHECKING:
     import numpy.typing as npt
 
     from .grid import CoarseRangeGrid
-    from .pipeline import MeshResult
 
     F32 = npt.NDArray[np.float32]
     I64 = npt.NDArray[np.int64]
@@ -370,130 +369,3 @@ def _label_band(
                 dtype=np.int64,
             )
     return comp_of_triangle, new_frontier
-
-
-def pass_b_finalise(
-    scan: StructuredScan, pass_a: PassAResult, *, work_dir: Path,
-    min_component_area: float, measure: bool, measure_samples: int,
-    qa_window_rows: int, timings: dict[str, float], streaming: tuple[int, int, int],
-    settings: dict[str, float | int | bool | str],
-) -> MeshResult:
-    """Re-read the segments, cull on completed components, mesh and measure.
-
-    The ordering is not incidental. `dropped_island` needs the completed
-    component table, and retained-but-unmeshed needs certainty that *no* band
-    produced a triangle containing the sample — one in band *k*'s halo may be a
-    vertex of a triangle band *k+1* owns, so deciding either at band *k* would
-    mis-attribute it (§4.3). Both are written once, here. QA follows, against
-    final dispositions only: measuring provisional geometry is the defect
-    `FINDING-002` records.
-    """
-    import numpy as np
-
-    from .pipeline import MeshResult, StreamedDiagnostics
-    from .qa import deviation_report
-    from .reverse_qa import mesh_to_source_report_v2
-    from .segments_io import (
-        read_triangles_and_final_roots,
-        retained_scan_from_segments,
-        write_finalised_component_table,
-    )
-    from .triangulate import MIN_COMPONENT_TRIANGLES, build_mesh, component_area_v1
-
-    retained = retained_scan_from_segments(scan, pass_a.segments)
-    cells = retained.row.astype(np.int64) * scan.lattice.cols + retained.col
-    if cells.size and not bool(np.all(np.diff(cells) > 0)):
-        raise ValueError("pos segments are not in strictly increasing cell order")
-
-    tri_cells, roots = read_triangles_and_final_roots(
-        pass_a.segments, pass_a.component_table_path
-    )
-
-    # Stable ids back to array positions. `searchsorted` is exact because the
-    # concatenated `pos` cell ids are strictly increasing, asserted above.
-    tris = (
-        np.searchsorted(cells, tri_cells).astype(np.int64)
-        if tri_cells.size
-        else np.empty((0, 3), np.int64)
-    )
-    del tri_cells                       # released before the area working set
-
-    area = component_area_v1(retained.xyz, tris, roots, cells)
-    if min_component_area > 0 and tris.shape[0]:
-        at = np.searchsorted(area.root_ids, roots)
-        keep = (area.areas[at] >= min_component_area) & (
-            area.counts[at] >= MIN_COMPONENT_TRIANGLES
-        )
-        kept_tris = tris[keep]
-    else:
-        kept_tris = tris
-
-    write_finalised_component_table(
-        work_dir, pass_a.component_table_path, area,
-        min_component_area=min_component_area, min_triangles=MIN_COMPONENT_TRIANGLES,
-    )
-
-    t0 = time.perf_counter()
-    mesh = build_mesh(retained, kept_tris)
-    timings["assemble"] = time.perf_counter() - t0
-
-    before = used_vertices(len(retained), tris)
-    final = used_vertices(len(retained), kept_tris)
-
-    deviation = None
-    reverse = None
-    reverse_evidence = None
-    if measure and mesh.triangle_count:
-        t0 = time.perf_counter()
-        offsets = retained.pose.rotate_local(retained.xyz[final]).astype(np.float32)
-        deviation = deviation_report(mesh, offsets, max_samples=measure_samples)
-        # §4.4: both directions run here, after culling and the ledger, against
-        # final dispositions only.
-        reverse, reverse_evidence = mesh_to_source_report_v2(
-            mesh, offsets, source_rows=retained.row[final],
-            qa_window_rows=qa_window_rows, max_samples=measure_samples,
-        )
-        timings["measure"] = time.perf_counter() - t0
-
-    source_count = scan.source_sample_count
-    stats = FilterStats(
-        input_points=(
-            source_count
-            if source_count is not None
-            else len(scan) + scan.dropped_no_return + scan.dropped_other
-        ),
-        retained=int(final.sum()),
-        dropped_no_return=scan.dropped_no_return,
-        dropped_despeckle=pass_a.dropped_despeckle,
-        dropped_mover_carve=pass_a.dropped_mover_carve,
-        dropped_island=int((before & ~final).sum()),
-        dropped_other=scan.dropped_other + int((~before).sum()),
-        restored_from_carve=pass_a.restored_from_carve,
-    )
-    stats.require_balanced()
-
-    band_rows, chunk_points, halo = streaming
-    diagnostics = StreamedDiagnostics(
-        band_rows=band_rows, chunk_points=chunk_points, halo=halo,
-        band_count=pass_a.band_count,
-        max_live_components=pass_a.max_live_components,
-        max_frontier_occupied=pass_a.max_frontier_occupied,
-        component_count=int(area.root_ids.size),
-        triangles_before_cull=int(tris.shape[0]),
-        triangles_after_cull=int(kept_tris.shape[0]),
-        retained_unmeshed=int((~before).sum()),
-        component_area_version=area.version,
-        max_area_ratio=area.max_ratio,
-        area_fallback_components=area.fallback_components,
-        segment_bytes=sum(
-            p.stat().st_size
-            for seg in pass_a.segments
-            for p in (seg.tri_path, seg.pos_path, seg.disp_path)
-        ),
-    )
-    return MeshResult(
-        mesh=mesh, stats=stats, lattice=scan.lattice, deviation=deviation,
-        mesh_to_source=reverse, timings=timings, settings=settings,
-        station_id=scan.station_id, diagnostics=diagnostics,
-        reverse_qa_evidence=reverse_evidence,
-    )

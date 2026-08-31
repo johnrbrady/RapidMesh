@@ -182,6 +182,53 @@ def streamed_pass_a(fixture: str, band_rows: int = 64) -> dict[str, Any]:
         shutil.rmtree(work, ignore_errors=True)
 
 
+def merge_only(
+    records: int,
+    block_records: int = 200_000,
+    merge_bytes: int = 4_000_000,
+    output_bytes: int = 1_000_000,
+) -> dict[str, Any]:
+    """The external merge alone, over synthetic records.
+
+    Blocks are generated lazily at a fixed size, so nothing about the *input*
+    scales with `records` — only the number of runs does. The peak this reports
+    is therefore the merge layer's own, and it is what ITEM-009 claims is
+    bounded by its caps rather than by the station.
+
+    The caps are arguments so a caller can put both sizes in the *same* regime.
+    Comparing a run small enough to fit under the cap against one that reaches
+    it measures the cap being approached, not the bound holding.
+    """
+    import shutil
+    import tempfile
+
+    import numpy as np
+
+    from rapidmesh.pass_b_merge import merge_runs, write_runs
+
+    dtype = np.dtype([("a", "<i8"), ("b", "<i8")])
+
+    def blocks() -> Any:
+        rng = np.random.default_rng(0)
+        for start in range(0, records, block_records):
+            count = min(block_records, records - start)
+            out = np.empty(count, dtype)
+            out["a"] = rng.integers(0, 1_000_000, count)
+            out["b"] = rng.integers(0, 1_000_000, count)
+            yield out
+
+    work = pathlib.Path(tempfile.mkdtemp(prefix="rapidmesh-merge-"))
+    try:
+        runs = write_runs(blocks(), work, "bench", ("a", "b"))
+        seen, largest = 0, 0
+        for block in merge_runs(runs, merge_bytes=merge_bytes, output_bytes=output_bytes):
+            seen += int(block.shape[0])
+            largest = max(largest, int(block.nbytes))
+        return {"records": seen, "runs": len(runs.paths), "largest_block_bytes": largest}
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def global_cull_only(fixture: str) -> dict[str, Any]:
     """`cull_islands` alone — the whole-station intermediate item 8 removed."""
     from rapidmesh.filters import clean
