@@ -34,8 +34,13 @@ NORMAL_ANGLE_TOL_RAD = 1e-6
 NORMAL_UNIT_TOL = 1e-6
 ORIENTATION_AMBIGUITY_REL = 1e-12
 
-# Reverse QA comparison is blocked until PLAN.md §5 item 9 (reverse-qa-v2).
-REVERSE_QA_STATUS = "blocked_until_reverse-qa-v2"
+# Reverse QA was excluded from the comparison until PLAN.md §5 item 9 existed,
+# because v1's triangle selection followed array order and the figure moved
+# when nothing about the data moved (SPEC §5(h)). `reverse-qa-v2` makes the
+# selection a function of the mesh's own content, so the reverse report is now
+# compared at T1 like the forward one — SPEC §7 says "T1 after reverse-qa-v2
+# passes §5(h)", and this is that lift.
+REVERSE_QA_STATUS = "compared_reverse-qa-v2"
 
 # QAReportMetadata fields compared at T1; timing and peak RSS are excluded
 # per SPEC §5(i) / §7.
@@ -371,7 +376,12 @@ def compare_mesh_results(
     rot_l, rot_r = compare_mesh_data(left.mesh, right.mesh)
     compare_filter_stats_t1(left.stats, right.stats)
     compare_deviation_report_t1("deviation", left.deviation, right.deviation)
-    # Reverse QA: do not compare until reverse-qa-v2 (SPEC §5(h) / §7).
+    # Reverse QA, at T1 now that `reverse-qa-v2` is the metric on both paths.
+    # A run that produced no reverse figure on either side is not a mismatch;
+    # one that produced it on exactly one side is.
+    compare_deviation_report_t1(
+        "mesh_to_source", left.mesh_to_source, right.mesh_to_source
+    )
     left_rep = left.evidence_report(source_sha256, peak_rss_bytes=peak_rss_left)
     right_rep = right.evidence_report(source_sha256, peak_rss_bytes=peak_rss_right)
     compare_qa_metadata_t1(left_rep.metadata, right_rep.metadata)

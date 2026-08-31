@@ -204,14 +204,14 @@ def pass_a_sweep(
 ) -> PassAResult:
     """One forward sweep: filter, triangulate the core, label, merge, retire.
 
-    The one-row lookahead is the part worth reading twice. A band's core
-    `[b0, b1)` owns the quads whose *top* row is in the core
-    (`PHASE1-HALO-CALCULUS.md` §7), and those quads reach down to row `b1`,
-    which the **next** band's core owns. So each band is triangulated only once
-    its successor has been filtered, and borrows exactly that one row of
-    retained samples. Borrowing is not owning: the row's own sample records are
-    written by the band whose core contains it, so no sample and no triangle is
-    written twice and no de-duplication step exists to hide an ownership bug.
+    The one-row lookahead is worth reading twice. A band's core `[b0, b1)` owns
+    the quads whose *top* row is in the core (`PHASE1-HALO-CALCULUS.md` §7), and
+    those quads reach down to row `b1`, which the **next** band's core owns. So
+    each band is triangulated only once its successor has been filtered, and
+    borrows exactly that one row of retained samples. Borrowing is not owning:
+    the row's own sample records are written by the band whose core contains it,
+    so nothing is written twice and no de-duplication step exists to hide an
+    ownership bug.
     """
     import numpy as np
 
@@ -373,16 +373,10 @@ def _label_band(
 
 
 def pass_b_finalise(
-    scan: StructuredScan,
-    pass_a: PassAResult,
-    *,
-    work_dir: Path,
-    min_component_area: float,
-    measure: bool,
-    measure_samples: int,
-    timings: dict[str, float],
-    settings: dict[str, float | int | bool],
-    streaming: tuple[int, int, int],
+    scan: StructuredScan, pass_a: PassAResult, *, work_dir: Path,
+    min_component_area: float, measure: bool, measure_samples: int,
+    qa_window_rows: int, timings: dict[str, float], streaming: tuple[int, int, int],
+    settings: dict[str, float | int | bool | str],
 ) -> MeshResult:
     """Re-read the segments, cull on completed components, mesh and measure.
 
@@ -397,7 +391,8 @@ def pass_b_finalise(
     import numpy as np
 
     from .pipeline import MeshResult, StreamedDiagnostics
-    from .qa import deviation_report, mesh_to_source_report
+    from .qa import deviation_report
+    from .reverse_qa import mesh_to_source_report_v2
     from .segments_io import (
         read_triangles_and_final_roots,
         retained_scan_from_segments,
@@ -447,11 +442,17 @@ def pass_b_finalise(
 
     deviation = None
     reverse = None
+    reverse_evidence = None
     if measure and mesh.triangle_count:
         t0 = time.perf_counter()
         offsets = retained.pose.rotate_local(retained.xyz[final]).astype(np.float32)
         deviation = deviation_report(mesh, offsets, max_samples=measure_samples)
-        reverse = mesh_to_source_report(mesh, offsets, max_samples=measure_samples)
+        # §4.4: both directions run here, after culling and the ledger, against
+        # final dispositions only.
+        reverse, reverse_evidence = mesh_to_source_report_v2(
+            mesh, offsets, source_rows=retained.row[final],
+            qa_window_rows=qa_window_rows, max_samples=measure_samples,
+        )
         timings["measure"] = time.perf_counter() - t0
 
     source_count = scan.source_sample_count
@@ -494,4 +495,5 @@ def pass_b_finalise(
         mesh=mesh, stats=stats, lattice=scan.lattice, deviation=deviation,
         mesh_to_source=reverse, timings=timings, settings=settings,
         station_id=scan.station_id, diagnostics=diagnostics,
+        reverse_qa_evidence=reverse_evidence,
     )

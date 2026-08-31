@@ -264,13 +264,14 @@ def test_t1_origin_and_rgb_and_source_sample_id() -> None:
     assert exc.value.index == 1
 
 
-def test_forward_deviation_t1_and_reverse_blocked() -> None:
+def test_forward_and_reverse_deviation_are_both_compared_at_t1() -> None:
     a = _tiny_deviation(rms=0.0)
     b = _tiny_deviation(rms=0.0)
     compare_deviation_report_t1("deviation", a, b)
     with pytest.raises(EquivalenceMismatch):
         compare_deviation_report_t1("deviation", a, _tiny_deviation(rms=1e-12))
-    assert REVERSE_QA_STATUS == "blocked_until_reverse-qa-v2"
+    # Reverse QA is compared at T1 too now — PLAN.md §5 item 9 lifted the block.
+    assert REVERSE_QA_STATUS == "compared_reverse-qa-v2"
 
 
 def test_qa_metadata_excludes_timing_and_rss() -> None:
@@ -309,12 +310,20 @@ def test_compare_mesh_results_reports_first_mismatch_field() -> None:
     assert "source_sample_id" in exc.value.field
 
 
-def test_compare_identical_mesh_results_pass_with_reverse_blocked() -> None:
+def test_compare_mesh_results_now_compares_the_reverse_report() -> None:
+    """Inverted by PLAN.md §5 item 9.
+
+    While reverse QA followed triangle array order it could not be compared,
+    and this test asserted that a mutated reverse figure was *ignored*. Under
+    `reverse-qa-v2` the figure is a property of the mesh, so SPEC §7's "T1
+    after reverse-qa-v2 passes §5(h)" applies and a mutated reverse figure must
+    now be caught.
+    """
     left = _tiny_result(mesh_to_source=_tiny_deviation(metric="mesh-to-source"))
     right = _tiny_result(mesh_to_source=_tiny_deviation(metric="mesh-to-source"))
-    # Mutate reverse figures so a naïve comparator would fail; harness must
-    # record reverse as blocked and ignore the difference.
-    right = MeshResult(
+    assert compare_mesh_results(left, right, source_sha256="c" * 64).ok
+
+    mutated = MeshResult(
         mesh=right.mesh,
         stats=right.stats,
         lattice=right.lattice,
@@ -324,9 +333,10 @@ def test_compare_identical_mesh_results_pass_with_reverse_blocked() -> None:
         settings=right.settings,
         station_id=right.station_id,
     )
-    report = compare_mesh_results(left, right, source_sha256="c" * 64)
-    assert report.ok
-    assert report.reverse_qa_status == REVERSE_QA_STATUS
+    with pytest.raises(EquivalenceMismatch) as exc:
+        compare_mesh_results(left, mutated, source_sha256="c" * 64)
+    assert exc.value.field == "mesh_to_source.rms"
+    assert REVERSE_QA_STATUS == "compared_reverse-qa-v2"
 
 
 # --------------------------------------------------------------------------

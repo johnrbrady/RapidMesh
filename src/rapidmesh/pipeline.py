@@ -30,6 +30,8 @@ from .carvegrid import (
 )
 from .filters import clean
 from .grid import CARVE_MAX_CELLS, CoarseRangeGrid, ScanGrid
+from .reverse_qa import DEFAULT_QA_WINDOW_ROWS as REVERSE_QA_WINDOW_ROWS
+from .reverse_qa import REVERSE_QA_VERSION
 from .triangulate import build_mesh, cull_islands, triangulate, used_vertices
 from .types import (
     DeviationReport,
@@ -44,6 +46,8 @@ from .types import (
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
+    from .reverse_qa import ReverseQAEvidence
+
 
 @dataclass
 class MeshResult:
@@ -56,10 +60,14 @@ class MeshResult:
     deviation: DeviationReport | None = None
     mesh_to_source: DeviationReport | None = None
     timings: dict[str, float] = field(default_factory=dict)
-    settings: dict[str, float | int | bool] = field(default_factory=dict)
+    settings: dict[str, float | int | bool | str] = field(default_factory=dict)
     station_id: str = ""
     diagnostics: StreamedDiagnostics | None = None
     """Internal streamed-run evidence. Never reaches `evidence_report`."""
+    reverse_qa_evidence: ReverseQAEvidence | None = None
+    """How the reverse figure was produced — window, sample counts, version.
+    The window and version also reach `settings`, and therefore the exported
+    metadata; the counts stay here because they are results, not settings."""
 
     def summary(self) -> str:
         lines = [
@@ -166,6 +174,7 @@ def mesh_station_streamed(
     despeckle: bool = True,
     measure: bool = True,
     measure_samples: int = 300_000,
+    qa_window_rows: int = REVERSE_QA_WINDOW_ROWS,
     work_dir: str | None = None,
 ) -> MeshResult:
     """Two-pass streamed pipeline for one station (PLAN.md §5 items 6–8).
@@ -226,6 +235,7 @@ def mesh_station_streamed(
             min_component_area=min_component_area,
             measure=measure,
             measure_samples=measure_samples,
+            qa_window_rows=qa_window_rows,
             timings=t,
             settings={
                 "max_incidence_deg": max_incidence_deg,
@@ -234,6 +244,8 @@ def mesh_station_streamed(
                 "despeckle": despeckle,
                 "measure": measure,
                 "measure_samples": measure_samples,
+                "qa_window_rows": qa_window_rows,
+                "reverse_qa_version": REVERSE_QA_VERSION,
             },
             streaming=(band_rows, chunk_points, halo),
         )
@@ -255,6 +267,7 @@ def mesh_station(
     despeckle: bool = True,
     measure: bool = True,
     measure_samples: int = 300_000,
+    qa_window_rows: int = REVERSE_QA_WINDOW_ROWS,
 ) -> MeshResult:
     """Full pipeline for one station.
 
@@ -267,7 +280,8 @@ def mesh_station(
     range sigma. 12 mm suits a 2 mm-sigma scanner. Too low perforates flat
     surfaces at close range; too high starts bridging genuine thin gaps.
     """
-    from .qa import deviation_report, mesh_to_source_report
+    from .qa import deviation_report
+    from .reverse_qa import mesh_to_source_report_v2
 
     t: dict[str, float] = {}
 
@@ -300,6 +314,7 @@ def mesh_station(
 
     dev = None
     reverse = None
+    reverse_evidence = None
     if measure and mesh.triangle_count:
         import numpy as np
 
@@ -308,8 +323,12 @@ def mesh_station(
             grid.scan.xyz[used_final]
         ).astype(np.float32)
         dev = deviation_report(mesh, retained_offsets, max_samples=measure_samples)
-        reverse = mesh_to_source_report(
-            mesh, retained_offsets, max_samples=measure_samples
+        # Reverse QA runs against final dispositions only, on the same retained
+        # set the forward direction uses (`PHASE1-ISLANDS-FINALISATION.md` §4.4).
+        reverse, reverse_evidence = mesh_to_source_report_v2(
+            mesh, retained_offsets,
+            source_rows=grid.scan.row[used_final],
+            qa_window_rows=qa_window_rows, max_samples=measure_samples,
         )
         t["measure"] = time.perf_counter() - t0
 
@@ -344,8 +363,11 @@ def mesh_station(
             "despeckle": despeckle,
             "measure": measure,
             "measure_samples": measure_samples,
+            "qa_window_rows": qa_window_rows,
+            "reverse_qa_version": REVERSE_QA_VERSION,
         },
         station_id=scan.station_id,
+        reverse_qa_evidence=reverse_evidence,
     )
 
 

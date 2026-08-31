@@ -32,6 +32,7 @@ def check_runs() -> list[str]:
         ([sys.executable, str(ROOT / "tools" / "bench_synthetic.py"), "--help"], "bench_synthetic"),
         ([sys.executable, str(ROOT / "tools" / "e57_inventory.py")], "e57_inventory"),
         ([sys.executable, str(ROOT / "tools" / "check_laz_precision.py")], "check_laz_precision"),
+        ([sys.executable, str(ROOT / "tools" / "measure_peak_memory.py"), "--help"], "measure_peak_memory"),
     ]
     for cmd, name in checks:
         r = subprocess.run(cmd, capture_output=True, cwd=ROOT, text=True)
@@ -58,7 +59,7 @@ def main() -> int:
             print(f"        {f}")
         ok = False
     else:
-        print("ok    CLI, bench, inventory and LAZ tools all import and run")
+        print("ok    CLI, bench, inventory, LAZ and peak-memory tools all import and run")
 
     return 0 if ok else 1
 
