@@ -183,6 +183,12 @@ class StreamedDiagnostics:
     tile_bytes: int = 0
     """Bytes of tile payload written. ADR-006 Decision 1 excludes these from the
     working-memory budget, which is only defensible if the figure is recorded."""
+    observation_bytes: int = 0
+    """Bytes of observation store written beside the generation (WP-1.G1b B2).
+    Zero when no store was written. Recorded for the same reason as
+    `tile_bytes`: a by-product nobody sizes is one nobody notices growing."""
+    observation_count: int = 0
+    """Retained observations persisted. Must equal the ledger's `retained`."""
 
 
 # ---------------------------------------------------------------------------

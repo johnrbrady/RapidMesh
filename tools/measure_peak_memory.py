@@ -230,6 +230,64 @@ def e57_streamed_station(
     }
 
 
+def e57_tiled_station(
+    e57: str,
+    band_rows: int = 64,
+    chunk_points: int = 250_000,
+    tile_size: float = 4.0,
+    measure: bool = False,
+    out: str = "",
+) -> dict[str, Any]:
+    """The whole tiled pipeline driven from an E57, input never resident.
+
+    The Round 4 reference row. `e57_streamed_station` runs the same sweep but
+    without an output directory, so it takes Pass B's *resident* branch and
+    assembles a whole-station `MeshData` — exactly what ADR-006 Decision 2
+    forbids at reference scale. This one passes `out_dir`, so Pass B files
+    triangles into per-tile spools and never holds the station's mesh.
+
+    Returns counts only. No path, no station name, no coordinate reaches the
+    caller: the measurement is authorised read-only and nothing identifying may
+    leave it.
+    """
+    import shutil
+    import tempfile
+
+    from rapidmesh.pipeline import mesh_station_from_chunks
+    from rapidmesh.streaming_e57 import e57_band_to_scan, e57_chunks, e57_station_metadata
+
+    owned = not out
+    root = pathlib.Path(out or tempfile.mkdtemp(prefix="rapidmesh-e57tiles-"))
+    try:
+        metadata, policy = e57_station_metadata(e57, chunk_points=chunk_points)
+        result = mesh_station_from_chunks(
+            e57_chunks(e57, chunk_points=chunk_points), metadata,
+            band_rows=band_rows, chunk_points=chunk_points, halo=3,
+            measure=measure, out_dir=str(root), tile_size=tile_size,
+            converter=lambda band, meta: e57_band_to_scan(band, meta, policy),
+        )
+        diagnostics = result.diagnostics
+        store = result.tiles
+        return {
+            "rows": metadata.lattice.rows,
+            "cols": metadata.lattice.cols,
+            "vertices": 0 if store is None else store.vertex_count,
+            "triangles": 0 if store is None else store.triangle_count,
+            "tiles": 0 if store is None else len(store.tile_ids),
+            "tile_size": tile_size,
+            "tile_bytes": 0 if diagnostics is None else diagnostics.tile_bytes,
+            "segment_bytes": 0 if diagnostics is None else diagnostics.segment_bytes,
+            "bands": 0 if diagnostics is None else diagnostics.band_count,
+            "resident_mesh": result.mesh is not None,
+            "retained": result.stats.retained,
+            "input_points": result.stats.input_points,
+            "balanced": result.stats.balanced,
+        }
+    finally:
+        if owned:
+            shutil.rmtree(root, ignore_errors=True)
+
+
 def load_only(fixture: str) -> dict[str, Any]:
     """The input scan alone. The floor every measured run starts from."""
     scan = load_fixture(fixture)

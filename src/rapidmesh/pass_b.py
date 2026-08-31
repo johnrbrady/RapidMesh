@@ -333,6 +333,7 @@ def pass_b_finalise(
     """
     import numpy as np
 
+    from .obs_store import write_store
     from .pipeline import MeshResult, StreamedDiagnostics
     from .qa import deviation_report
     from .reverse_qa import mesh_to_source_report_v2
@@ -388,6 +389,8 @@ def pass_b_finalise(
     tiles = None
     built: Any = None
     qa_source: Any = None
+    observation_bytes = 0
+    observation_count = 0
     if out_dir is None:
         kept_tris, before, final = stream_kept_triangles(
             runs, cells, keep_root, kept_total, len(retained)
@@ -410,6 +413,15 @@ def pass_b_finalise(
         before, final = built.before, built.final
         triangles_after_cull = built.triangles_written
         tiles = built.store
+        # WP-1.G1b B2. Written here because this is the one moment the pipeline
+        # holds the retained set and knows which of it survived the cull, and
+        # because the generation directory is already open. Costs one sequential
+        # write and no second read of the source.
+        observation_bytes = write_store(
+            out_dir / "generations" / "00000000" / "obs" / "observations.rmobs",
+            retained, final, retained.pose,
+        )
+        observation_count = int(final.sum())
         # WP-3.3: both QA directions read the written generation. `TileStore` is
         # a `qa_stream.GeometrySource`, so neither direction has to know whether
         # it was handed a resident mesh or a tile store.
@@ -475,6 +487,8 @@ def pass_b_finalise(
         ),
         tiles=None if built is None else built.describe(),
         tile_bytes=0 if built is None else built.tile_bytes,
+        observation_bytes=observation_bytes,
+        observation_count=observation_count,
     )
     return MeshResult(
         mesh=mesh, stats=stats, lattice=scan.lattice, deviation=deviation,
