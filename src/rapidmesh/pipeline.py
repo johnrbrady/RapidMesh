@@ -155,9 +155,9 @@ def mesh_station_from_chunks(
     array. What is held across the sweep is `metadata`: a pose, a lattice and
     four counts, a fixed size whatever the station's.
 
-    Pass B still rebuilds the *retained* set from the segments Pass A wrote —
-    that is the mesh's own vertex store, not the input, and bounding it is
-    Phase 3's incremental-output work rather than this package's.
+    Pass B rebuilds a *mesh vertex store* from the `pos` segments — only the
+    lattice cells named by a triangle (Round 4c), not every filter-retained
+    sample Pass A wrote. Retained-but-unmeshed stays a ledger count.
 
     `converter` turns one raw band into a band-local scan. The default reads
     the wire vocabulary `streaming.scan_to_chunks` emits; an E57 producer
@@ -167,7 +167,7 @@ def mesh_station_from_chunks(
     import tempfile
     from pathlib import Path
 
-    from .islands import pass_a_sweep_bands
+    from .islands import ComponentTable, pass_a_sweep_bands
     from .pass_b import pass_b_finalise
     from .streaming import iter_band_filter_results
 
@@ -201,6 +201,17 @@ def mesh_station_from_chunks(
             noise_floor=noise_floor,
         )
         t["pass_a"] = time.perf_counter() - t0
+
+        # Round 4e (ITEM-014). Pass A's working `ComponentTable` — the union-
+        # find parent list, one int object per component id, the triangle-count
+        # dict and the retired set — is dead the moment Pass A writes the
+        # completed table to disk, but it is reachable from `pass_a` and so
+        # stayed resident through the whole of Pass B. Measured at 30.8 MB on a
+        # 175,274-component station, and live at the exact moment Pass B set
+        # its high-water mark. Released here, at the handoff that owns both
+        # passes, rather than inside `pass_b_finalise`, which does not own its
+        # argument. `pass_a_sweep` callers that read `.table` never run Pass B.
+        pass_a.table = ComponentTable()
 
         t0 = time.perf_counter()
         result = pass_b_finalise(

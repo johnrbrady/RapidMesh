@@ -70,7 +70,7 @@ def _alias(pass_a) -> np.ndarray:  # type: ignore[no-untyped-def]
 
 
 def _retained(station: synthetic.SyntheticScan, pass_a):  # type: ignore[no-untyped-def]
-    from rapidmesh.segments_io import retained_scan_from_segments
+    from rapidmesh.retained_io import retained_scan_from_segments
 
     retained = retained_scan_from_segments(station.scan, pass_a.segments)
     cells = (
@@ -164,7 +164,7 @@ def test_streamed_component_areas_match_the_reference(station, tmp_path) -> None
     pass_a = _pass_a(station, tmp_path)
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
-    runs = build_triangle_runs(pass_a.segments, alias, tmp_path)
+    runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
     streamed = stream_component_areas(runs, cells, retained.xyz).as_area_result(set())
 
     from rapidmesh.segments_io import read_triangles_and_final_roots
@@ -192,7 +192,7 @@ def test_the_streamed_cull_selects_the_same_triangles(station, tmp_path) -> None
     pass_a = _pass_a(station, tmp_path)
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
-    runs = build_triangle_runs(pass_a.segments, alias, tmp_path)
+    runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
     area = stream_component_areas(runs, cells, retained.xyz).as_area_result(set())
 
     # A threshold chosen to be *discriminating on this fixture*: at the 0.005
@@ -239,7 +239,7 @@ def test_the_original_winding_survives_the_canonical_merge(station, tmp_path) ->
     pass_a = _pass_a(station, tmp_path)
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
-    runs = build_triangle_runs(pass_a.segments, alias, tmp_path)
+    runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
     keep_root = np.ones(alias.size, dtype=bool)
     total = sum(read_tri_segment(s.tri_path)[0].shape[0] for s in pass_a.segments)
     kept, _before, _final = stream_kept_triangles(
@@ -317,7 +317,7 @@ def test_the_exact_pass_reads_only_the_flagged_components(station, tmp_path) -> 
     pass_a = _pass_a(station, tmp_path)
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
-    runs = build_triangle_runs(pass_a.segments, alias, tmp_path)
+    runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
     accumulator = stream_component_areas(runs, cells, retained.xyz)
 
     assert accumulator.needs_exact() == set()          # nothing flagged naturally

@@ -8,17 +8,10 @@ meshes and measures. WP-1.5 then measured what Pass B actually cost — 45% of
 the streamed pipeline's peak at 158k samples, rising to 76% at 990k — because
 it held the whole station's triangles several times over at once.
 
-**The insight that makes streaming safe.** Component area is a *reduction*, and
-§4.1's exactness condition is exactly a licence to reassociate it. While
-
-    component total area / smallest positive triangle area  <  2**29
-
-every float64 addition of a float32 area is exact, so a streamed block-wise
-accumulation, `np.bincount` over the whole station, and `math.fsum` all yield
-the **identical** float64 value. That is why the resident sort can go without a
-tolerance: under the condition there is nothing to lose, and the condition is
-checked rather than assumed. Above it, `math.fsum` over the component's own
-bounded run is authoritative for both paths, exactly as §4.1 requires.
+The area reduction that makes the streaming safe — §4.1's exactness condition,
+and why it licenses a block-wise accumulation — now lives in `pass_b_area.py`,
+which this module re-exports from. That split is DEC-010 only; nothing about the
+computation changed.
 
 Two merged passes replace it. The first reduces area per component; the second
 emits the survivors into an array preallocated from the first pass's counts, so
@@ -29,12 +22,35 @@ entry per *component*, not one per triangle.
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .pass_b_area import (
+    BOUNDARY_SAFETY,
+    EXACTNESS_RATIO_LIMIT,
+    StreamedAreaAccumulator,
+    _block_indices,
+    exact_component_areas,
+    stream_component_areas,
+)
 from .pass_b_merge import RunSet, merge_runs, write_runs
 from .tiles import DEFAULT_TILE_SIZE_M
 from .types import FilterStats, StructuredScan
+
+# Re-exported for callers that predate the DEC-010 split: `tile_build` imports
+# `_block_indices` from here, and `test_pass_b_bound` the area names. The split
+# is a file boundary, not an interface change.
+__all__ = [
+    "BOUNDARY_SAFETY",
+    "EXACTNESS_RATIO_LIMIT",
+    "StreamedAreaAccumulator",
+    "TRIANGLE_RUN_FIELDS",
+    "TRIANGLE_RUN_KEY",
+    "build_triangle_runs",
+    "exact_component_areas",
+    "pass_b_finalise",
+    "stream_component_areas",
+    "stream_kept_triangles",
+]
 
 if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
@@ -49,97 +65,6 @@ if TYPE_CHECKING:
     F64 = npt.NDArray[np.float64]
     I64 = npt.NDArray[np.int64]
 
-# `PHASE1-ISLANDS-FINALISATION.md` §4.1.
-EXACTNESS_RATIO_LIMIT = 2**29
-
-# Components whose ratio lands within this factor of the limit are escalated to
-# the exact accumulator even though the streamed total says they are safe. The
-# streamed total is itself rounded above the limit, so a component sitting on
-# the boundary could otherwise be classified by a number that is already wrong.
-BOUNDARY_SAFETY = 0.99
-
-
-@dataclass
-class StreamedAreaAccumulator:
-    """Per-component area, count and smallest positive area, from a stream.
-
-    Holds one entry per component, never one per triangle. §4.1's exactness
-    condition is what licenses the block-wise accumulation: while it holds,
-    this and `np.bincount` over the whole station are the same float64 value,
-    not merely close.
-    """
-
-    totals: dict[int, float]
-    counts: dict[int, int]
-    smallest: dict[int, float]
-
-    @classmethod
-    def empty(cls) -> StreamedAreaAccumulator:
-        return cls(totals={}, counts={}, smallest={})
-
-    def add_block(self, roots: I64, areas: F64) -> None:
-        """One merged block. `roots` is sorted, so components are contiguous.
-
-        `areas` must already be float64 holding the float32 area values — the
-        summands the reference uses, accumulated in the width the reference
-        accumulates them in. Summing a float32 array would round in float32 and
-        is not the same computation.
-        """
-        import numpy as np
-
-        if roots.size == 0:
-            return
-        edges = np.flatnonzero(np.diff(roots)) + 1
-        starts = np.concatenate(([0], edges))
-        stops = np.concatenate((edges, [roots.size]))
-        for start, stop in zip(starts, stops, strict=True):
-            root = int(roots[start])
-            chunk = areas[start:stop]
-            self.totals[root] = self.totals.get(root, 0.0) + float(chunk.sum())
-            self.counts[root] = self.counts.get(root, 0) + int(chunk.size)
-            positive = chunk[chunk > 0.0]
-            if positive.size:
-                low = float(positive.min())
-                previous = self.smallest.get(root)
-                self.smallest[root] = low if previous is None else min(previous, low)
-
-    def ratios(self) -> dict[int, float]:
-        return {
-            root: (total / self.smallest[root] if self.smallest.get(root) else 0.0)
-            for root, total in self.totals.items()
-        }
-
-    def as_area_result(self, fallback_roots: set[int]) -> Any:
-        """The same shape `component_area_v1` returns, so Pass B's downstream —
-        the finalised component table and the diagnostics — is unchanged."""
-        import numpy as np
-
-        from .triangulate import AreaResult
-
-        roots = np.fromiter(sorted(self.totals), np.int64, len(self.totals))
-        ratios = self.ratios()
-        return AreaResult(
-            root_ids=roots,
-            areas=np.array([self.totals[int(r)] for r in roots], np.float64),
-            counts=np.array([self.counts[int(r)] for r in roots], np.int64),
-            smallest_positive=np.array(
-                [self.smallest.get(int(r), 0.0) for r in roots], np.float64
-            ),
-            fallback=np.array([int(r) in fallback_roots for r in roots], bool),
-            max_ratio=max(ratios.values()) if ratios else 0.0,
-            fallback_components=len(fallback_roots),
-        )
-
-    def needs_exact(self) -> set[int]:
-        """Components whose streamed total cannot be trusted to be exact.
-
-        The trigger is deliberately conservative: a component whose ratio is
-        merely *near* the limit is escalated too, because above the limit the
-        streamed total is itself rounded and would be classifying itself.
-        """
-        limit = EXACTNESS_RATIO_LIMIT * BOUNDARY_SAFETY
-        return {root for root, ratio in self.ratios().items() if ratio >= limit}
-
 
 TRIANGLE_RUN_FIELDS = [
     ("root", "<i8"), ("c0", "<i8"), ("c1", "<i8"), ("c2", "<i8"), ("rot", "i1"),
@@ -147,7 +72,9 @@ TRIANGLE_RUN_FIELDS = [
 TRIANGLE_RUN_KEY = ("root", "c0", "c1", "c2")
 
 
-def build_triangle_runs(segments: Sequence[Any], alias: I64, work_dir: Path) -> RunSet:
+def build_triangle_runs(
+    segments: Sequence[Any], alias: I64, work_dir: Path
+) -> tuple[RunSet, I64]:
     """One sorted run per band segment, keyed `(root, canonical cell triple)`.
 
     The key is the stable lattice cell id, never a band-local array index —
@@ -162,16 +89,23 @@ def build_triangle_runs(segments: Sequence[Any], alias: I64, work_dir: Path) -> 
     barycentric interior point from the stored corner order, so emitting a
     rotated triple would silently move every reverse-QA sample. Measured, not
     reasoned about — see the WP-1.7 report.
+
+    Also returns the sorted unique lattice cells named by any triangle. Pass B
+    loads only those samples from `pos` (Round 4c): the rest of `pos` is
+    retained-but-unmeshed and is counted, not materialised.
     """
     import numpy as np
 
     from .segments_io import read_tri_segment
+
+    unique_chunks: list[Any] = []
 
     def blocks() -> Iterator[Any]:
         for segment in segments:
             cells, provisional = read_tri_segment(segment.tri_path)
             if cells.shape[0] == 0:
                 continue
+            unique_chunks.append(np.unique(cells))
             pick = np.argmin(cells, axis=1)
             rows = np.arange(cells.shape[0])
             record = np.empty(cells.shape[0], dtype=np.dtype(TRIANGLE_RUN_FIELDS))
@@ -181,90 +115,27 @@ def build_triangle_runs(segments: Sequence[Any], alias: I64, work_dir: Path) -> 
                 record[name] = cells[rows, (pick + offset) % 3]
             yield record
 
-    return write_runs(blocks(), work_dir, "tri", TRIANGLE_RUN_KEY)
-
-
-def _block_indices(block: Any, cells: I64) -> I64:
-    """Canonical cell triples back to positions in the retained scan.
-
-    `searchsorted` is exact because the concatenated `pos` cell ids are
-    strictly increasing — Pass B asserts that before calling this.
-
-    The stored rotation is always undone, so the returned triple carries the
-    winding `_band_triangles` produced rather than the canonical one the merge
-    sorted by. Area *looks* rotation-invariant — it is, in real arithmetic —
-    but `cross(B-A, C-A)` and `cross(C-B, A-B)` are different float32
-    expressions and round differently. Measured: rotating the triple moved one
-    component's area by one ULP against the reference. So the canonical form is
-    the sort key, and never the geometry.
-    """
-    import numpy as np
-
-    triple = np.stack([block["c0"], block["c1"], block["c2"]], axis=1)
-    indices = np.searchsorted(cells, triple).astype(np.int64)
-    rot = block["rot"].astype(np.int64)
-    rows = np.arange(indices.shape[0])
-    out: I64 = np.stack(
-        [indices[rows, (j - rot) % 3] for j in range(3)], axis=1
-    )
-    return out
-
-
-def _block_areas(indices: I64, xyz: Any) -> F64:
-    """`cull_islands`' own float32 expression, widened for accumulation only."""
-    import numpy as np
-
-    corners = xyz[indices]
-    area = 0.5 * np.linalg.norm(
-        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
-    )
-    widened: F64 = area.astype(np.float64)
-    return widened
-
-
-def stream_component_areas(
-    runs: RunSet, cells: I64, xyz: Any
-) -> StreamedAreaAccumulator:
-    """Phase one: accumulate per-component area without holding the station.
-
-    One block of triangles is resident at a time. What survives the pass is one
-    entry per component, not one per triangle — the reduction the whole
-    external merge exists to make affordable.
-    """
-    accumulator = StreamedAreaAccumulator.empty()
-    for block in merge_runs(runs):
-        indices = _block_indices(block, cells)
-        accumulator.add_block(block["root"], _block_areas(indices, xyz))
-    return accumulator
-
-
-def exact_component_areas(
-    runs: RunSet, cells: I64, xyz: Any, roots: set[int]
-) -> dict[int, float]:
-    """`math.fsum` for components the streamed total cannot vouch for.
-
-    Runs only for components flagged by `needs_exact`, and buffers only those
-    components' areas — so the cost is paid by the geometry that earns it
-    rather than by every station. Zero components have been flagged on any
-    fixture measured so far.
-    """
-    import math
-
-    import numpy as np
-
-    if not roots:
-        return {}
-    collected: dict[int, list[float]] = {root: [] for root in roots}
-    wanted = np.fromiter(sorted(roots), dtype=np.int64, count=len(roots))
-    for block in merge_runs(runs):
-        hit = np.isin(block["root"], wanted)
-        if not bool(hit.any()):
-            continue
-        chosen = block[hit]
-        areas = _block_areas(_block_indices(chosen, cells), xyz)
-        for root, value in zip(chosen["root"], areas, strict=True):
-            collected[int(root)].append(float(value))
-    return {root: math.fsum(values) for root, values in collected.items()}
+    runs = write_runs(blocks(), work_dir, "tri", TRIANGLE_RUN_KEY)
+    if not unique_chunks:
+        return runs, np.empty(0, np.int64)
+    # Round 4e. `np.unique(np.concatenate(chunks))` held three copies at once —
+    # the per-band chunks, their concatenation, and the sorted copy `np.unique`
+    # makes internally — and that transient, not any resident structure, set
+    # Pass B's high-water mark. On the most fragmented station measured
+    # (175,274 components) this was the *only* call in the pass that raised the
+    # process peak at all, by 110,825,472 B, while every later call reported no
+    # rise. The chunks are released before the sort, the sort is in place, and
+    # an adjacent-difference mask replaces the second copy, so one copy of the
+    # concatenation survives where three did.
+    needed = np.concatenate(unique_chunks)
+    unique_chunks.clear()
+    needed.sort()
+    if needed.size > 1:
+        keep = np.empty(needed.size, dtype=bool)
+        keep[0] = True
+        np.not_equal(needed[1:], needed[:-1], out=keep[1:])
+        needed = needed[keep]
+    return runs, needed.astype(np.int64, copy=False)
 
 
 def stream_kept_triangles(
@@ -320,6 +191,14 @@ def pass_b_finalise(
     final dispositions only: measuring provisional geometry is the defect
     `FINDING-002` records.
 
+    **Round 4c — the mesh vertex store, not the whole `pos` set.** Pass A writes
+    every filter-retained sample to `pos`. Only samples named by a triangle are
+    ever indexed for area, cull, mesh or tiles. Loading the rest was the Class F
+    Gate 1 binding term (~1.1 GB of `pos` for ~0.4% final retention). This path
+    therefore builds triangle runs first, takes the unique cells they name, and
+    loads only those samples. Retained-but-unmeshed is counted from the segment
+    totals minus that set, never materialised.
+
     **Two output shapes, and the difference is the WP-3.2 memory row.** With an
     `out_dir`, the surviving triangles are filed into an immutable spatial
     generation one tile at a time and no whole-station `MeshData` is ever
@@ -336,29 +215,36 @@ def pass_b_finalise(
     from .obs_store import write_store
     from .pipeline import MeshResult, StreamedDiagnostics
     from .qa import deviation_report
+    from .retained_io import retained_scan_for_cells
     from .reverse_qa import mesh_to_source_report_v2
-    from .segments_io import (
-        read_component_table,
-        retained_scan_from_segments,
-        write_finalised_component_table,
-    )
+    from .segments_io import read_component_alias, write_finalised_component_table
     from .tile_build import build_tiles
     from .triangulate import MIN_COMPONENT_TRIANGLES, build_mesh
-
-    retained = retained_scan_from_segments(scan, pass_a.segments)
-    cells = retained.row.astype(np.int64) * scan.lattice.cols + retained.col
-    if cells.size and not bool(np.all(np.diff(cells) > 0)):
-        raise ValueError("pos segments are not in strictly increasing cell order")
 
     # ITEM-009. The station's triangles are never resident: they are sorted
     # per band into bounded runs, then merged twice — once to reduce area per
     # component, once to emit the survivors. What lives between the passes is
     # one entry per *component*, not one per triangle.
-    records = read_component_table(pass_a.component_table_path)
-    alias = np.full(len(records) + 1, -1, np.int64)
-    for record in records:
-        alias[record.component_id] = record.root
-    runs = build_triangle_runs(pass_a.segments, alias, work_dir)
+    #
+    # Round 4e (ITEM-014). Nothing in this pass reads `pass_a.table`: Pass A
+    # wrote the completed table to disk before returning, and the file is what
+    # is read here. `mesh_station_from_chunks` releases that in-memory table at
+    # the handoff, because it is 30.8 MB on a 175,274-component station and is
+    # otherwise still live at the moment this pass sets its peak.
+    alias = read_component_alias(pass_a.component_table_path)
+    runs, mesh_cells = build_triangle_runs(pass_a.segments, alias, work_dir)
+
+    # Round 4c: load only triangle-named pos samples (the mesh vertex store).
+    pos_samples_total = sum(seg.sample_count for seg in pass_a.segments)
+    retained = retained_scan_for_cells(scan, pass_a.segments, mesh_cells)
+    retained_unmeshed = pos_samples_total - len(retained)
+    cells = retained.row.astype(np.int64) * scan.lattice.cols + retained.col
+    if cells.size and not bool(np.all(np.diff(cells) > 0)):
+        raise ValueError("pos segments are not in strictly increasing cell order")
+    if cells.size != mesh_cells.size or (
+        cells.size and not bool(np.array_equal(cells, mesh_cells))
+    ):
+        raise ValueError("mesh vertex store does not match the triangle cell set")
 
     accumulator = stream_component_areas(runs, cells, retained.xyz)
     flagged = accumulator.needs_exact()
@@ -462,7 +348,7 @@ def pass_b_finalise(
         dropped_despeckle=pass_a.dropped_despeckle,
         dropped_mover_carve=pass_a.dropped_mover_carve,
         dropped_island=int((before & ~final).sum()),
-        dropped_other=scan.dropped_other + int((~before).sum()),
+        dropped_other=scan.dropped_other + retained_unmeshed,
         restored_from_carve=pass_a.restored_from_carve,
     )
     stats.require_balanced()
@@ -476,7 +362,7 @@ def pass_b_finalise(
         component_count=int(area.root_ids.size),
         triangles_before_cull=triangles_before_cull,
         triangles_after_cull=triangles_after_cull,
-        retained_unmeshed=int((~before).sum()),
+        retained_unmeshed=retained_unmeshed,
         component_area_version=area.version,
         max_area_ratio=area.max_ratio,
         area_fallback_components=area.fallback_components,

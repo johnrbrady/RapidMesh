@@ -17,13 +17,13 @@ resident at once. Neither exists now. The triangles are filed to per-tile spools
 as they stream past, and each tile is assembled, written, digested and released
 before the next is touched.
 
-What this does **not** remove, stated plainly
-----------------------------------------------
-The retained sample store — `segments_io.retained_scan_from_segments` — is still
-resident, as it was before. It is the mesh's own vertex store rather than a
-processing intermediate, and bounding it means moving positions through per-tile
-spools as well, which is a change to Pass B's shape rather than to its output.
-Section §B of the WP-3.2 report carries its measured share of the peak.
+What Round 4c removed on top
+----------------------------
+Pass B no longer rebuilds the whole `pos` set. It loads only the lattice cells
+named by a triangle (`retained_scan_for_cells`). On real structured stations
+that is the difference between ~O(input) resident samples and ~O(mesh vertices).
+Per-tile position spools remain a separate, later bound if the mesh vertex
+store itself grows to the budget.
 
 The lifecycle, since the gate asks for it in writing
 -----------------------------------------------------
@@ -115,7 +115,7 @@ def build_tiles(
     """Stream the surviving triangles into an immutable spatial generation."""
     import numpy as np
 
-    from .pass_b import _block_indices
+    from .pass_b_area import _block_indices
     from .pass_b_merge import merge_runs
     from .tile_spool import TileSpoolSet
 
@@ -200,7 +200,7 @@ def _membership(
     """
     import numpy as np
 
-    from .pass_b import _block_indices
+    from .pass_b_area import _block_indices
     from .pass_b_merge import merge_runs
 
     before = np.zeros(vertices, dtype=bool)

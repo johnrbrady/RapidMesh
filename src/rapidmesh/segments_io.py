@@ -329,6 +329,14 @@ def write_component_table(
 
 
 def read_component_table(path: Path) -> list[ComponentRecord]:
+    """Every row as a `ComponentRecord`. Diagnostics and tests, not Pass B.
+
+    One dataclass per component id ever allocated: measured at 409-422 bytes a
+    row across a tenfold range of station fragmentation, so 71.7 MB on a
+    175,274-component station. Pass B needs only the alias column and reads it
+    through `read_component_alias`; the finalise step rewrites the table
+    column-wise. Both avoid this shape deliberately (Round 4e Phase 1).
+    """
     records, _ = _read_records(path, KIND_COMPONENT)
     return [
         ComponentRecord(
@@ -345,75 +353,29 @@ def read_component_table(path: Path) -> list[ComponentRecord]:
     ]
 
 
-def retained_scan_from_segments(
-    scan: StructuredScan, segments: Sequence[BandSegment]
-) -> StructuredScan:
-    """Rebuild the retained set from the `pos` segments, in band order.
+def read_component_alias(path: Path) -> I64:
+    """`component_id -> root`, indexed by id, without materialising the rows.
 
-    Band order **is** row-major order, because cores tile the lattice in
-    increasing row order and each core's records are already row-major. That is
-    not a convenience: it is the order `build_mesh`'s vertex compaction walks
-    (`triangulate.py:260`), so it is what makes a streamed vertex array
-    identical to the in-memory one rather than a permutation of it
-    (`PHASE1-DETERMINISM-SPEC.md` §5(a), §5(c)).
+    This is the whole of what Pass B took from the Pass A table, and taking it
+    through `read_component_table` left the dataclass list resident for the
+    entire pass with no reader after the alias was built — 71.7 MB of a
+    175,274-component station, live at the exact moment Pass B set its peak.
+    The structured records already carry both columns; this indexes one by the
+    other and keeps neither.
 
-    Scan-level attributes come from `scan` because they are properties of the
-    station, not of any band. `intensity` is not carried by the `pos` record and
-    is therefore dropped; nothing downstream of meshing reads it, and inventing
-    a value would be worse than its absence.
+    Sized `rows + 1` and filled with -1 exactly as the loop it replaces was, so
+    an id the table does not carry still reads back as -1 rather than aliasing
+    to something plausible.
     """
     import numpy as np
 
-    from .types import StructuredScan as _Scan
-
-    cols = scan.lattice.cols
-    total = sum(seg.sample_count for seg in segments)
-    if not total:
-        empty = np.empty(0, np.int32)
-        return _Scan(
-            row=empty, col=empty.copy(), xyz=np.empty((0, 3), np.float32),
-            rng=np.empty(0, np.float32), pose=scan.pose, lattice=scan.lattice,
-            rgb=None if scan.rgb is None else np.empty((0, 3), np.uint8),
-            intensity=None, station_id=scan.station_id,
-            sample_id=None if scan.sample_id is None else np.empty(0, np.int64),
-            source_sample_count=scan.source_sample_count,
-            dropped_no_return=scan.dropped_no_return,
-            dropped_other=scan.dropped_other,
-        )
-
-    # Preallocate and fill band by band, for the same reason as
-    # `read_triangles_and_final_roots`: never hold the parts and the join.
-    cells = np.empty(total, np.int64)
-    xyz = np.empty((total, 3), np.float32)
-    rng = np.empty(total, np.float32)
-    sample_id = None if scan.sample_id is None else np.empty(total, np.int64)
-    rgb = None if scan.rgb is None else np.empty((total, 3), np.uint8)
-    at = 0
-    for seg in segments:
-        block = read_pos_segment(seg.pos_path)
-        n = int(block["cell"].size)
-        if not n:
-            continue
-        cells[at : at + n] = block["cell"]
-        xyz[at : at + n] = block["xyz"]
-        rng[at : at + n] = block["rng"]
-        if sample_id is not None:
-            sample_id[at : at + n] = block["sample_id"]
-        if rgb is not None:
-            if block["rgb"] is None:
-                raise SegmentError("pos segment has no colour but the scan does")
-            rgb[at : at + n] = block["rgb"]
-        at += n
-    if at != total:
-        raise SegmentError("pos segments do not carry the sample counts they declare")
-
-    return _Scan(
-        row=(cells // cols).astype(np.int32), col=(cells % cols).astype(np.int32),
-        xyz=xyz, rng=rng, pose=scan.pose, lattice=scan.lattice, rgb=rgb,
-        intensity=None, station_id=scan.station_id, sample_id=sample_id,
-        source_sample_count=scan.source_sample_count,
-        dropped_no_return=scan.dropped_no_return, dropped_other=scan.dropped_other,
-    )
+    records, _ = _read_records(path, KIND_COMPONENT)
+    alias = np.full(int(records.shape[0]) + 1, -1, np.int64)
+    if records.shape[0]:
+        alias[records["component_id"].astype(np.int64, copy=False)] = records[
+            "root"
+        ].astype(np.int64, copy=False)
+    return alias
 
 
 def write_finalised_component_table(
@@ -430,32 +392,58 @@ def write_finalised_component_table(
     place. A published generation is immutable (`PHASE1-TILE-CONTRACT-V0.md`
     §3), and an in-place update is the one edit that could leave a reader
     holding a table that is half Pass A and half Pass B.
+
+    **Column-wise, since Round 4e.** The row-wise form read the provisional
+    table into `ComponentRecord`s, built a root lookup dict and accumulated a
+    second list of finalised rows, so three per-component Python structures
+    were live at once for the length of the call — 88.6 MB on a 175,274-
+    component station, the largest single resident term Phase 1 named. The
+    columns do the same work: rows the area pass did not name are copied
+    through untouched, and the named ones have their five finalised columns
+    overwritten. Same values, same dtypes, same rounding — `smallest_positive_
+    area` still narrows to float32 on store, because the field is `<f4` in
+    both forms.
     """
-    lookup = {int(root): i for i, root in enumerate(area.root_ids)}
-    finalised: list[ComponentRecord] = []
-    for rec in read_component_table(provisional_table):
-        i = lookup.get(rec.root)
-        if i is None:
-            finalised.append(rec)
-            continue
-        total = float(area.areas[i])
-        kept = min_component_area <= 0 or (
-            total >= min_component_area and int(area.counts[i]) >= min_triangles
-        )
-        finalised.append(
-            ComponentRecord(
-                component_id=rec.component_id,
-                root=rec.root,
-                triangle_count=int(area.counts[i]) if rec.component_id == rec.root else 0,
-                retired=rec.retired,
-                area=total,
-                smallest_positive_area=float(area.smallest_positive[i]),
-                verdict=1 if kept else 2,
-                area_fallback=bool(area.fallback[i]),
-            )
-        )
-    return write_component_table(
-        work_dir, finalised, name="component.rmcomp", finalised=True
+    import numpy as np
+
+    # `searchsorted` replaces the dict, so the ordering the dict did not need
+    # is now load-bearing. `as_area_result` builds `root_ids` from `sorted(...)`
+    # and every caller goes through it, but an unsorted input would silently
+    # mis-assign areas to components rather than fail, so it is checked.
+    if area.root_ids.size > 1 and not bool(np.all(np.diff(area.root_ids) > 0)):
+        raise SegmentError("area root ids must be strictly increasing")
+
+    records, _ = _read_records(provisional_table, KIND_COMPONENT)
+    table = np.zeros(records.shape[0], dtype=np.dtype(_COMPONENT_FIELDS))
+    for name, _dtype in _COMPONENT_FIELDS:
+        if name != "pad":
+            table[name] = records[name]
+
+    roots = records["root"].astype(np.int64, copy=False)
+    where = np.searchsorted(area.root_ids, roots)
+    inside = where < area.root_ids.size
+    hit = np.zeros(roots.size, dtype=bool)
+    hit[inside] = area.root_ids[where[inside]] == roots[inside]
+    at = where[hit]
+
+    total = area.areas[at]
+    counts = area.counts[at]
+    kept = (
+        np.ones(at.size, dtype=bool)
+        if min_component_area <= 0
+        else (total >= min_component_area) & (counts >= min_triangles)
+    )
+    table["area"][hit] = total
+    table["smallest_positive_area"][hit] = area.smallest_positive[at]
+    table["verdict"][hit] = np.where(kept, 1, 2)
+    table["area_fallback"][hit] = area.fallback[at]
+    # Only a component's own root row carries the count; alias rows carry zero,
+    # exactly as the row-wise form's `if rec.component_id == rec.root` did.
+    table["triangle_count"][hit] = np.where(
+        records["component_id"][hit] == records["root"][hit], counts, 0
+    )
+    return _write_records(
+        work_dir / "component.rmcomp", KIND_COMPONENT, table, flags=FLAG_FINALISED
     )
 
 

@@ -436,7 +436,7 @@ def _streamed_triangles(
     band_rows: int,
 ) -> tuple[Any, Any, Any, Any]:
     """Run Pass A and return `(verts, tris, roots, cells)` as Pass B sees them."""
-    from rapidmesh.segments_io import retained_scan_from_segments
+    from rapidmesh.retained_io import retained_scan_from_segments
 
     work = tmp_path / f"pa{band_rows}"
     pass_a = pass_a_sweep(

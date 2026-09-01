@@ -45,6 +45,14 @@ from rapidmesh.memory import (  # noqa: E402
 
 TOOLS_DIR = str(pathlib.Path(__file__).resolve().parent)
 
+# Round 4 close. The band_rows sweep measured Class F across 48/56/64/72/80 and
+# found 64 — the previous default here — sitting one grid step below a cliff at
+# +1.20% margin, with 72 and 80 both FAIL. 56 holds +10.25% for about 15% more
+# time, and reproduced the band_rows=64 geometry exactly on all six counts.
+# Measurement default only: `mesh_station_from_chunks` and `mesh_station_streamed`
+# take band_rows as a required keyword and have no default to change.
+DEFAULT_BAND_ROWS = 56
+
 
 # ---------------------------------------------------------------------------
 # fixture, prepared once and loaded by every measured run
@@ -178,7 +186,7 @@ def e57_metadata_only(e57: str, chunk_points: int = 250_000) -> dict[str, Any]:
 
 
 def e57_pass_a(
-    e57: str, band_rows: int = 64, chunk_points: int = 250_000
+    e57: str, band_rows: int = DEFAULT_BAND_ROWS, chunk_points: int = 250_000
 ) -> dict[str, Any]:
     """Pass A driven from the file — the input is never a whole-station array."""
     import shutil
@@ -210,7 +218,7 @@ def e57_pass_a(
 
 
 def e57_streamed_station(
-    e57: str, band_rows: int = 64, chunk_points: int = 250_000,
+    e57: str, band_rows: int = DEFAULT_BAND_ROWS, chunk_points: int = 250_000,
     measure: bool = False,
 ) -> dict[str, Any]:
     """The whole streamed pipeline, input never resident."""
@@ -233,7 +241,7 @@ def e57_streamed_station(
 
 def e57_tiled_station(
     e57: str,
-    band_rows: int = 64,
+    band_rows: int = DEFAULT_BAND_ROWS,
     chunk_points: int = 250_000,
     tile_size: float = 4.0,
     measure: bool = False,
@@ -310,7 +318,7 @@ def in_memory_station(fixture: str, measure: bool = False) -> dict[str, Any]:
 
 
 def streamed_station(
-    fixture: str, band_rows: int = 64, measure: bool = False
+    fixture: str, band_rows: int = DEFAULT_BAND_ROWS, measure: bool = False
 ) -> dict[str, Any]:
     """`mesh_station_streamed` — Pass A then Pass B, segments via a temp dir."""
     from rapidmesh.pipeline import mesh_station_streamed
@@ -331,7 +339,7 @@ def streamed_station(
 
 def tiled_station(
     fixture: str,
-    band_rows: int = 64,
+    band_rows: int = DEFAULT_BAND_ROWS,
     tile_size: float = 4.0,
     measure: bool = False,
     out: str = "",
@@ -374,7 +382,7 @@ def tiled_station(
             shutil.rmtree(root, ignore_errors=True)
 
 
-def streamed_pass_a(fixture: str, band_rows: int = 64) -> dict[str, Any]:
+def streamed_pass_a(fixture: str, band_rows: int = DEFAULT_BAND_ROWS) -> dict[str, Any]:
     """Pass A alone: filter, triangulate, label, retire, write segments.
 
     Measured on its own so Pass B's share can be derived exactly. A peak only
