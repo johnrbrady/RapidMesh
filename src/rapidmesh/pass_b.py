@@ -245,6 +245,11 @@ def pass_b_finalise(
         cells.size and not bool(np.array_equal(cells, mesh_cells))
     ):
         raise ValueError("mesh vertex store does not match the triangle cell set")
+    # Round 6b'. The check above is the last reader: from here `cells` *is* the
+    # mesh vertex store and `mesh_cells` is a second, byte-identical copy of it.
+    # 16,449,288 B on ord 1, and it stayed live to function exit — including
+    # through `build_tiles`, which is where this pass now peaks.
+    del mesh_cells
 
     accumulator = stream_component_areas(runs, cells, retained.xyz)
     flagged = accumulator.needs_exact()
@@ -253,6 +258,16 @@ def pass_b_finalise(
             exact_component_areas(runs, cells, retained.xyz, flagged)
         )
     area = accumulator.as_area_result(flagged)
+    # Round 6b' (ITEM-016). `area` holds its own numpy copies, so the three
+    # per-component dicts have no reader past this line — but as a local the
+    # accumulator stayed alive through the mesh and tile build. 35,292,720 B on
+    # ord 1, resident at the exact call that sets the peak.
+    #
+    # Round 4e declined this on the grounds that `stream_component_areas` showed
+    # no peak rise. That was the right reading of *where* the peak occurs and the
+    # wrong inference about *what is resident when it occurs*: being allocated
+    # before the peak is not being freed before it. Measured, not reasoned about.
+    del accumulator, flagged
 
     survives = (
         np.ones(area.root_ids.size, dtype=bool)
