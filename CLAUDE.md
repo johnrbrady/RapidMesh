@@ -6,7 +6,8 @@ Short on purpose. The detail lives in the documents listed in §7. Keep this
 file current: if you complete a phase or resolve a blocker, update §5 and §9 in
 the same change.
 
-Last updated: 15 August 2026.
+Last updated: 2 September 2026 — Round 7 Gate 1 close. Formal report:
+`E:\Claude Projects\Lead AI SW Eng\RapidMesh\REPORTS\2026-09-02-WP-1.G7-gate1-close-report.md`.
 
 ---
 
@@ -75,8 +76,8 @@ project-lead execution plan (`PLAN.md`, project-lead records, adopted 15 August
 |---|---|---|
 | 0a | **Endpoint safety.** Disable/gate `build_meshes` + `build_vantage_meshes` at the server. Frontend removal is not protection | **DONE** 2 Aug 2026 — Cairn `e201e98` (gating) and `aac4c9c` (authorisation, found during 0b live testing; see the 0b row). Both 404 unless `CAIRN_ENABLE_MESH_ROUTES=1`; gate test proven to fail against the pre-fix code first. Merged to Cairn `master` 6 Aug 2026 in `14680f5` |
 | 0b | Job isolation: child process, per-workload rlimit, ceiling, no retry loop, remove redundant f64 copy | **DONE** 2–3 Aug 2026 — Cairn `b744953` (out of process), `2ae99a4` (redundant copy), `31b245a` (failure reporting), `aac4c9c` (authorisation), `5e12425` (heavy-job admission, 3 Aug). Merged to Cairn `master` 6 Aug 2026 in `14680f5`. Closed against the real 1.77 GB Ampol file in a 3 GB-capped Docker container (see §9's former item 13, now resolved): `/api/health` 200 throughout (88/88 authenticated polls, zero anomalies), container/uvicorn never restarted, worker PID differs from uvicorn's, `RLIMIT_AS` and the RSS watchdog each independently demonstrated firing on the same file under different limit configs, source scan stayed `ready` and immediately retryable, no partial mesh output accepted, no zombie process, cancellation and timeout both proven. **Live testing found and fixed a real bug**: per-task worker failures (e.g. the `MemoryError` this exact file produces) were silently dropped by both routes — neither `meshError` nor any manifest change resulted. Fixed in `31b245a`, proven to fail against the pre-fix code first. A second finding, `aac4c9c`: the routes-enabled flag is a rollout control, not an authorisation control: both routes now also require a signed-in project admin (accounts mode only; token and open mode refused). A third, `5e12425`: only one heavy job is admitted globally |
-| 0c | Spatial contract and transform foundation | **DONE** 15 Aug 2026 — `SPATIAL-CONTRACT.md`; full pose applied once to project-axis offsets and normals; inverse E57 recovery fixed; 13 spatial-contract tests, 35 total tests **at 0c close** (the suite has since grown to 43 — see below), Ruff, strict mypy and smoke pass. Header-only validation covered 312 authorised E57 files / 313 scans, including 310 non-identity poses, with zero pose-validation failures. **The 312 file / 313 scan counts are re-verified** (16 Aug 2026, `tools/e57_inventory.py` over every E57 under the authorised sample root: 312 files, 313 scans); they do not conflict with §10, which lists only the 31 files profiled in `docs/DATA-INVENTORY.md`, not the whole authorised corpus. The 310 non-identity-pose figure is carried from the 0c run and was **not** re-verified here. Cairn unchanged |
-| 1 | QA rework (3 reports) + streamed/chunked processing + isolation matrix + smoke gate. Design-first items precede the code: halo calculus, two-pass island finalisation, versioned intermediate tile contract v0, determinism spec | **PARTIAL — ACTIVE.** Three metric/accounting cores implemented: retained observations only, exact exclusive disposition ledger with restoration events separated, and sampled mesh-to-source. Fixed-capacity libE57 chunk reads and core/halo row-band assembly implemented. Isolation matrix and smoke gate done. **Remaining:** the streamed ≡ in-memory equivalence harness (build it before band-local geometry), band-local geometry/QA, incremental output, the evidence envelope including the `_resolve_frame` path taken, the per-station observation store, and the measured memory gates |
+| 0c | Spatial contract and transform foundation | **DONE** 15 Aug 2026 — `SPATIAL-CONTRACT.md`; full pose applied once to project-axis offsets and normals; inverse E57 recovery fixed; 13 spatial-contract tests, 35 total tests **at 0c close** (the suite has since grown to 387 — see below), Ruff, strict mypy and smoke pass. Header-only validation covered 312 authorised E57 files / 313 scans, including 310 non-identity poses, with zero pose-validation failures. **The 312 file / 313 scan counts are re-verified** (16 Aug 2026, `tools/e57_inventory.py` over every E57 under the authorised sample root: 312 files, 313 scans); they do not conflict with §10, which lists only the 31 files profiled in `docs/DATA-INVENTORY.md`, not the whole authorised corpus. The 310 non-identity-pose figure is carried from the 0c run and was **not** re-verified here. Cairn unchanged |
+| 1 | QA rework (3 reports) + streamed/chunked processing + isolation matrix + smoke gate. Design-first items precede the code: halo calculus, two-pass island finalisation, versioned intermediate tile contract v0, determinism spec | **PARTIAL — ACTIVE. Gate 1 at `630008a`: 7 of 8 lines PASS, 1 PARTIAL, 0 FAIL; fidelity DEFER.** Built and gated: streamed ≡ in-memory equivalence (19/19, exact), the exclusive disposition ledger (balanced 30/30), chunk/band-size independence, wrap-seam geometry (12 tests), band-local geometry and QA, tile contract v0, the observation store, and the evidence envelope including the `_resolve_frame` path taken. **Memory gate PASSED — measured, not asserted on real data:** working ≤ 512 MB and peak RSS ≤ 1.5 GB on **30/30** stations of the documented 30-station set at `band_rows=56` under **Rule G1-M** (DEC-020 provisional, John 2 Sep 2026); worst working 489,185,280 B (+4.46%, ord 1, max-of-3), worst peak 509,759,488 B (+66.02%); geometry unchanged, 0 mismatches in 120 comparisons. The real 14.5 M-point station cannot enter the repo (§4 rule 9), so the in-tree assertion is the synthetic extent ladder — a regression guard, not the certification. Smoke gate re-run **from a fresh clone** of `630008a` this round: install, smoke, 387 pytest, ruff and mypy --strict all green. **Remaining before Gate 1 closes:** John's definition of "both reference resolutions" (line 6, memo in the Round 7 report §6 — recommends the two documented resolution classes, under which the evidence already exists), and a fidelity metric per ITEM-018. **No fidelity claim is licensed** — see §9 item 1 |
 | 2a | **Ingestion contract and Cairn baseline** — on the critical path (DEC-003). Per-axis LAS/LAZ header scale/offset preserved and reported, suspicious quantisation detected, units/CRS never inferred; LAS/LAZ and unstructured E57 accepted, validated and honestly reported "reconstruction not yet supported"; Cairn-vs-RapidMesh baseline on the *same* structured E57s, recording which converter version produced the LAZ | NOT STARTED |
 | 3 | Error-bounded decimation, LOD chain, tiled incremental writing. **ITEM-001 (combined-project representation) is investigated inside this phase** (DEC-007). Adds the mean-signed-deviation bias metric and guaranteed per-tile error bounds; the bias budget stays flat and tiny at every LOD so switching can never reveal systematic movement | NOT STARTED |
 | 4 | **Container decided by benchmark** (DEC-005), progressive browser loader, engineering alignment view. Container and manifest make the QC-only / client-audience tier distinction **structural** (DEC-004) | NOT STARTED |
@@ -99,8 +100,11 @@ server.* It becomes structural at phase 4 and enforced server-side at phase 7.
 **Already built and working:** structured E57 reader (three lattice tiers),
 band-addressable native lattice, edge-preserving despeckle, cross-station
 occlusion carving with parallax restore, discontinuity-aware triangulation,
-area-based island culling, oriented normals, synthetic fixtures, CLI.
-43 tests pass.
+area-based island culling, oriented normals, synthetic fixtures, CLI, and the
+band-streamed two-pass pipeline with its tile contract v0, observation store and
+evidence envelope.
+**387 tests pass** — re-run 2 September 2026 from a fresh clone of `630008a`,
+alongside ruff and mypy --strict.
 
 ## 6. The heat map, exactly
 
@@ -161,8 +165,8 @@ end-to-end figure reported separately beside it. See
 
 | # | Item | Blocks |
 |---|---|---|
-| 1 | QA metric cores are corrected, but the exported evidence envelope still needs source hash, version, settings, exclusions, processing time and measured peak memory | Any real-data fidelity claim |
-| 2 | Fixed-capacity E57 chunks and row bands exist; filtering, triangulation, QA and writing still use the full-scan `mesh_station` path | 512 MB target, production scale |
+| 1 | **Envelope done; the blocker moved.** The evidence envelope now carries source digest, package and library versions, metric/contract versions, settings, exclusions, processing time, measured peak RSS and the `_resolve_frame` path taken (`src/rapidmesh/evidence.py`, 23 tests). **What blocks a real-data fidelity claim is now ITEM-018, not the envelope:** ITEM-015 is DIAGNOSED — forward QA reads 0.000 mm by construction on undecimated data and reverse QA is bounded below by triangle size, so **neither direction is a fidelity measurement on this data**. Lead register: `OPEN-ITEMS.md` ITEM-015 (DIAGNOSED), ITEM-018 (OPEN) | Any real-data fidelity claim — **which is therefore not licensed** |
+| 2 | **Streamed path built and measured.** Band-local filtering, triangulation, QA and writing run through the two-pass streamed pipeline; `mesh_station` is the equivalence reference, not the production path. Memory gate met on **30/30** stations at `band_rows=56` under Rule G1-M — see §5 phase 1. **Residual:** ord 1 clears the working budget by only +4.46% and its run-to-run spread is bimodal and uncharacterised; S must be re-measured on any host or settings change | Nothing at the documented 30-station scale. The 309-file corpus is **not** this set and is unmeasured |
 | 3 | Surveyor/admin QC comparison engine does not exist | Later phase 5 QC |
 | 4 | No model for site 02516.182 | Mode B validation |
 | 5 | Observation-selection rule for site-level comparison undecided | Phase 5 |
@@ -174,6 +178,16 @@ end-to-end figure reported separately beside it. See
 | 12 | Combination method for minimum defensible tolerance undefined | The computed project-specific floor. Different statistics, different confidence levels; do not simply add them |
 | 13 | LAS/LAZ reconstruction path not selected; neither format carries E57's native lattice | Required input parity in phase 2 |
 | 14 | Combined-project representation: coordinated per-station display, fused display-only surface, or both. **Scheduled — investigated inside phase 3** (DEC-007, project-lead decision 15 Aug 2026: a display-only site coarse tier is pre-approved if phase 3's measurements show per-station LOD0s cannot meet the 1 s site first paint; it never produces numbers and never replaces per-station evidence) | Phase 3 measurement, then phase 4 architecture and acceptance tests |
+
+**Supervision-level items live in the project-lead register**, not here:
+`E:\Claude Projects\Lead AI SW Eng\RapidMesh\OPEN-ITEMS.md`. Currently open
+against Gate 1:
+
+| Item | Subject | Status |
+|---|---|---|
+| ITEM-015 | Reverse QA reports metre-scale figures | **DIAGNOSED** 2 Sep 2026 — the metric is a triangle-size statistic, not an error figure. Not broken; misread |
+| ITEM-018 | No working fidelity metric on undecimated real data | **OPEN** — blocks the Gate 1 fidelity line. Needs John's ruling plus a work package; more runs of the current metrics cannot close it |
+| ITEM-019 | Gate 1 line 6's "both reference resolutions" is undefined | **OPEN** — needs John's definition only. Memo with three readings and a recommendation in the Round 7 report §6 |
 
 ## 10. Reference data
 
