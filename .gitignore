@@ -29,6 +29,9 @@ tmp/
 # Test fixtures that are generated, not authored
 tests/fixtures/generated/
 
+# Implementer session claim (SUPERVISION-PROTOCOL §9)
+.agent-session
+
 # Editors / OS
 .vscode/
 .idea/
