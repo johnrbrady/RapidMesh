@@ -36,11 +36,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .e57_reader import (
-    FRAME_IDENTITY_POSE,
-    FRAME_LEFT_AS_LOCAL,
-    FRAME_REWRITTEN_TO_LOCAL,
-    FRAME_TOO_FEW_SAMPLES,
+    FRAME_MIN_SAMPLES,
+    MAX_PLAUSIBLE_RANGE_M,
     RawChunk,
+    assert_plausible_range,
+    decide_frame,
 )
 from .streaming import StationMetadata, iter_band_filter_results
 from .types import LatticeInfo, LatticeSource, StructuredScan
@@ -75,6 +75,10 @@ class FramePolicy:
 
     rewrite_to_local: bool
     shift_colour: bool
+    #: The plausibility setting in force for this station, carried with the
+    #: policy so a band cannot be built under a different limit than the one the
+    #: frame was decided under.
+    max_plausible_range_m: float = MAX_PLAUSIBLE_RANGE_M
 
 
 def e57_station_metadata(
@@ -99,6 +103,7 @@ def e57_station_metadata(
 
     from .e57_reader import (
         _RGB,
+        _SPHERICAL,
         _angular_steps_from_indices,
         _classify,
         _column_azimuth_spread,
@@ -157,25 +162,41 @@ def e57_station_metadata(
     )
     lattice = LatticeInfo(rows, cols, az_step, el_step, az0, el0, LatticeSource.ROW_COL)
 
-    frame_path = FRAME_TOO_FEW_SAMPLES
-    rewrite = False
-    if frame_sub["xyz"].shape[0] >= 64:
-        translation = np.asarray(pose.translation, np.float64)
-        rotation = np.asarray(pose.rotation, np.float64)
-        posed = float(np.linalg.norm(translation)) >= 0.01 or not np.allclose(
-            rotation, np.eye(3), rtol=1e-12, atol=1e-12
+    # F1. This block used to re-implement the frame rule *without* the
+    # spherical short-circuit, so every real station — all of which are
+    # spherical — took the rewrite branch and was meshed 5.8 x 10^6 m from
+    # where it belonged. There is now exactly one decision function and both
+    # paths call it; the streamed path differs only in feeding it a bounded
+    # subsample's statistics instead of the whole scan's.
+    translation = np.asarray(pose.translation, np.float64)
+    rotation = np.asarray(pose.rotation, np.float64)
+    posed = float(np.linalg.norm(translation)) >= 0.01 or not np.allclose(
+        rotation, np.eye(3), rtol=1e-12, atol=1e-12
+    )
+    frame_xyz = frame_sub["xyz"]
+    sample_count = int(frame_xyz.shape[0])
+    if not posed or sample_count < FRAME_MIN_SAMPLES:
+        evidence = decide_frame(
+            has_spherical=all(name in fields for name in _SPHERICAL),
+            has_row_column=True, posed=posed, sample_count=sample_count,
+            as_local=float("nan"), as_world=float("nan"),
+            max_range_local=float("nan"), max_range_world=float("nan"), az_step=az_step,
         )
-        if posed:
-            as_world = _column_azimuth_spread(
-                pose.world_to_local(frame_sub["xyz"]), frame_sub["col"]
-            )
-            as_local = _column_azimuth_spread(frame_sub["xyz"], frame_sub["col"])
-            rewrite = as_world < as_local * 0.2
-            frame_path = (
-                FRAME_REWRITTEN_TO_LOCAL if rewrite else FRAME_LEFT_AS_LOCAL
-            )
-        else:
-            frame_path = FRAME_IDENTITY_POSE
+    else:
+        world_candidate = pose.world_to_local(frame_xyz)
+        evidence = decide_frame(
+            has_spherical=all(name in fields for name in _SPHERICAL),
+            has_row_column=True,
+            posed=True,
+            sample_count=sample_count,
+            as_local=_column_azimuth_spread(frame_xyz, frame_sub["col"]),
+            as_world=_column_azimuth_spread(world_candidate, frame_sub["col"]),
+            max_range_local=float(np.max(np.linalg.norm(frame_xyz, axis=1))),
+            max_range_world=float(np.max(np.linalg.norm(world_candidate, axis=1))),
+            az_step=az_step,
+        )
+    frame_path = evidence.path
+    rewrite = evidence.rewrite
 
     name = str(getattr(header, "name", "") or "")
     del source_file
@@ -286,6 +307,15 @@ def e57_band_to_scan(
     if policy.rewrite_to_local:
         xyz = metadata.pose.world_to_local(xyz)
         rng = np.linalg.norm(xyz, axis=1)
+    # A2. Every band F1 produced carried ranges above 10^5 m and nothing asked.
+    # Checked on the band's own valid samples, after the policy has been
+    # applied, so a wrong station-level decision fails here instead of being
+    # meshed into a scene kilometres wide.
+    assert_plausible_range(
+        rng[keep],
+        where=f"e57_band_to_scan (frame: {metadata.frame_path})",
+        limit=policy.max_plausible_range_m,
+    )
 
     rgb = None
     if metadata.has_rgb and all(name in raw for name in _RGB):

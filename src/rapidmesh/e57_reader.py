@@ -411,6 +411,10 @@ def _build(
     valid = _validity(raw, rng)
     frame_path = frame_decision(raw, pose, valid)
     xyz_local, rng = _resolve_frame(xyz_local, rng, raw, pose, valid)
+    # After the frame is settled and before anything derives an angle from it.
+    # Only the valid samples: no-return records legitimately carry sentinel
+    # ranges and are excluded from the mesh anyway.
+    assert_plausible_range(rng[valid], where=f"read_scan (frame: {frame_path})")
     row, col, lattice = _lattice(raw, xyz_local, rng, valid)
 
     source_sample_count = int(valid.size)
@@ -525,6 +529,223 @@ FRAME_IDENTITY_POSE = "identity-pose-nothing-to-detect"
 FRAME_TOO_FEW_SAMPLES = "too-few-valid-samples-to-discriminate"
 FRAME_LEFT_AS_LOCAL = "left-as-local"
 FRAME_REWRITTEN_TO_LOCAL = "rewritten-to-local"
+FRAME_UNDECIDED = "frame-undecided-left-as-local"
+FRAME_IMPLAUSIBLE = "both-candidates-implausible"
+
+#: No terrestrial scanner measures ten kilometres. A candidate frame that puts
+#: samples further away than this is not a frame, it is arithmetic on the wrong
+#: numbers — the F1 failure produced ranges of 5.8 x 10^6 m. Configurable
+#: because an airborne or mobile survey would want a different setting; the
+#: value in force is recorded rather than assumed.
+MAX_PLAUSIBLE_RANGE_M = 10_000.0
+
+#: How many lattice angular steps of column spread still count as "aligned".
+FRAME_ALIGNMENT_STEPS = 4.0
+
+#: Floor under the alignment ceiling, so a degenerate az_step of 0 cannot make
+#: the bar unreachable and force every station to `frame-undecided`.
+FRAME_ALIGNMENT_FLOOR = 1e-12
+
+#: How decisively the rewritten candidate must beat leaving it alone.
+FRAME_DECISIVE_RATIO = 0.2
+
+#: Below this many valid samples the spread statistic is not discriminating.
+FRAME_MIN_SAMPLES = 64
+
+
+class ImplausibleRange(ValueError):
+    """Samples lie further from the scanner origin than any scanner can measure.
+
+    Named rather than generic because the one thing this must never be is
+    quiet. It is the guard that would have failed F1's first real run on
+    31 August instead of letting eight reports be written on wrong geometry.
+    """
+
+
+@dataclass(frozen=True)
+class FrameEvidence:
+    """What the frame decision saw, not merely what it concluded.
+
+    `SPATIAL-CONTRACT.md` §3 rule 7 requires the heuristic to record which path
+    it took; recording only the verdict is what let F1 run for two days without
+    anyone able to see *why* it fired. The spreads and both candidates' maximum
+    ranges are carried so a campaign record can be audited after the fact.
+    """
+
+    path: str
+    as_local: float = float("nan")
+    as_world: float = float("nan")
+    max_range_local: float = float("nan")
+    max_range_world: float = float("nan")
+    alignment_ceiling: float = float("nan")
+    undecided: bool = False
+
+    @property
+    def rewrite(self) -> bool:
+        return self.path == FRAME_REWRITTEN_TO_LOCAL
+
+    def describe(self) -> str:
+        return (
+            f"{self.path} (as_local={self.as_local:.3g} as_world={self.as_world:.3g} "
+            f"max_range_local={self.max_range_local:.4g} m "
+            f"max_range_world={self.max_range_world:.4g} m)"
+        )
+
+
+def column_alignment_ceiling(az_step: float) -> float:
+    """Largest circular variance still consistent with aligned lattice columns.
+
+    **This is what makes the rule scale-aware.** A bare ratio between two
+    spreads compares one artefact against another: subtracting a 10^6 m
+    translation from a 10^1 m scene collapses every azimuth onto one value, so
+    the wrong candidate scores ~10^-15 and wins by twelve orders of magnitude
+    however wrong it is. An absolute bar, set by the lattice the scanner
+    actually sampled, cannot be gamed that way.
+
+    For a small angular spread sigma the circular variance ``1 - R`` is
+    approximately ``sigma^2 / 2``. A column whose samples sit within a few
+    lattice steps of one plane is aligned; anything wider is not.
+    """
+    sigma = FRAME_ALIGNMENT_STEPS * abs(az_step)
+    return max(0.5 * sigma * sigma, FRAME_ALIGNMENT_FLOOR)
+
+
+def decide_frame(
+    *,
+    has_spherical: bool,
+    has_row_column: bool,
+    posed: bool,
+    sample_count: int,
+    as_local: float,
+    as_world: float,
+    max_range_local: float,
+    max_range_world: float,
+    az_step: float,
+    max_plausible_range_m: float = MAX_PLAUSIBLE_RANGE_M,
+) -> FrameEvidence:
+    """The one frame decision, shared by the in-memory and streamed paths.
+
+    Pure: it takes scalars, so the streamed path can feed it a bounded
+    subsample's statistics and the in-memory path can feed it the whole scan's,
+    and both provably reach the same verdict. Having two implementations of
+    this rule is what F1 was — the streamed copy omitted the spherical
+    short-circuit and rewrote every real station into a frame 5.8 x 10^6 m from
+    where it belonged.
+
+    Order matters, and it is the owner's ruling of 2 September 2026:
+
+    1. **Spherical is local by definition.** No detection, no exceptions.
+    2. **Physical plausibility first.** A candidate frame whose maximum range
+       exceeds `max_plausible_range_m` is rejected outright — no terrestrial
+       scanner measures ten kilometres, so such a frame is not a frame. This
+       alone would have stopped F1 on its first real run.
+    3. **Only when both candidates are physically plausible** does the
+       azimuth-spread margin get a say, and then it must clear an absolute bar
+       set by the lattice angular step, not merely beat the other candidate.
+    4. **Fail closed.** Undecided means left-as-local and said so, never a
+       rewrite on weak evidence (`SPATIAL-CONTRACT.md` §3 rule 7).
+    """
+    if has_spherical:
+        return FrameEvidence(FRAME_SPHERICAL_IS_LOCAL)
+    if not has_row_column:
+        return FrameEvidence(FRAME_NO_ROW_COLUMN)
+    if not posed:
+        return FrameEvidence(FRAME_IDENTITY_POSE)
+    if sample_count < FRAME_MIN_SAMPLES:
+        return FrameEvidence(FRAME_TOO_FEW_SAMPLES, undecided=True)
+
+    ceiling = column_alignment_ceiling(az_step)
+
+    def verdict(path: str, *, undecided: bool = False) -> FrameEvidence:
+        return FrameEvidence(
+            path=path,
+            as_local=float(as_local),
+            as_world=float(as_world),
+            max_range_local=float(max_range_local),
+            max_range_world=float(max_range_world),
+            alignment_ceiling=ceiling,
+            undecided=undecided,
+        )
+
+    local_plausible = max_range_local <= max_plausible_range_m
+    world_plausible = max_range_world <= max_plausible_range_m
+
+    if not local_plausible and not world_plausible:
+        # Neither frame puts the samples within reach of a scanner. The file is
+        # not describable by this rule; `assert_plausible_range` raises on the
+        # data itself rather than letting a mesh be built somewhere impossible.
+        return verdict(FRAME_IMPLAUSIBLE, undecided=True)
+    if local_plausible and not world_plausible:
+        return verdict(FRAME_LEFT_AS_LOCAL)
+    if world_plausible and not local_plausible:
+        return verdict(FRAME_REWRITTEN_TO_LOCAL)
+
+    # Both plausible: the ordinary case, and the only one where the spread
+    # comparison is meaningful. Require the rewritten candidate to be aligned
+    # *in absolute terms* as well as decisively better than leaving it alone.
+    if as_world <= ceiling and as_world < as_local * FRAME_DECISIVE_RATIO:
+        return verdict(FRAME_REWRITTEN_TO_LOCAL)
+    if as_local <= ceiling:
+        return verdict(FRAME_LEFT_AS_LOCAL)
+    return verdict(FRAME_UNDECIDED, undecided=True)
+
+
+def frame_evidence(
+    raw: dict[str, Any],
+    pose: ScanPose,
+    valid: Any,
+    *,
+    az_step: float | None = None,
+    max_plausible_range_m: float = MAX_PLAUSIBLE_RANGE_M,
+) -> FrameEvidence:
+    """`decide_frame` fed from a whole raw scan — the in-memory path's entry."""
+    import numpy as np
+
+    has_spherical = all(f in raw for f in _SPHERICAL)
+    has_row_column = all(f in raw for f in _ROWCOL)
+    if has_spherical or not has_row_column:
+        return decide_frame(
+            has_spherical=has_spherical, has_row_column=has_row_column,
+            posed=False, sample_count=0, as_local=float("nan"), as_world=float("nan"),
+            max_range_local=float("nan"), max_range_world=float("nan"), az_step=1.0,
+        )
+
+    t = np.asarray(pose.translation, np.float64)
+    rotation = np.asarray(pose.rotation, np.float64)
+    posed = not (
+        float(np.linalg.norm(t)) < 0.01
+        and np.allclose(rotation, np.eye(3), rtol=1e-12, atol=1e-12)
+    )
+
+    col = np.asarray(raw["columnIndex"], np.int64)
+    idx = np.nonzero(valid)[0]
+    if idx.size > 100_000:
+        idx = idx[:: idx.size // 100_000]
+    if not posed or idx.size < FRAME_MIN_SAMPLES:
+        return decide_frame(
+            has_spherical=False, has_row_column=True, posed=posed,
+            sample_count=int(idx.size), as_local=float("nan"), as_world=float("nan"),
+            max_range_local=float("nan"), max_range_world=float("nan"), az_step=1.0,
+        )
+
+    xyz, _rng = _positions(raw)
+    local_candidate = xyz[idx]
+    world_candidate = pose.world_to_local(xyz)[idx]
+    if az_step is None:
+        az_step = 2 * math.pi / max(int(col.max()) + 1, 1)
+
+    return decide_frame(
+        has_spherical=False,
+        has_row_column=True,
+        posed=True,
+        sample_count=int(idx.size),
+        as_local=_column_azimuth_spread(local_candidate, col[idx]),
+        as_world=_column_azimuth_spread(world_candidate, col[idx]),
+        max_range_local=float(np.max(np.linalg.norm(local_candidate, axis=1))),
+        max_range_world=float(np.max(np.linalg.norm(world_candidate, axis=1))),
+        az_step=az_step,
+        max_plausible_range_m=max_plausible_range_m,
+    )
 
 
 def frame_decision(raw: dict[str, Any], pose: ScanPose, valid: Any) -> str:
@@ -535,37 +756,30 @@ def frame_decision(raw: dict[str, Any], pose: ScanPose, valid: Any) -> str:
     station instead of once per band — a band holds a fraction of each lattice
     column, and this test reads azimuth spread *within* columns.
     """
+    return frame_evidence(raw, pose, valid).path
+
+
+def assert_plausible_range(rng: Any, *, where: str, limit: float = MAX_PLAUSIBLE_RANGE_M) -> None:
+    """Refuse samples no terrestrial scanner could have produced.
+
+    The cheapest check in the codebase and the one whose absence cost the most:
+    every band F1 corrupted carried ranges above 10^5 m, and nothing between the
+    reader and the triangulator ever asked. Raising here converts a silently
+    wrong mesh into a named failure at the point of ingest.
+    """
     import numpy as np
 
-    if all(f in raw for f in _SPHERICAL):
-        return FRAME_SPHERICAL_IS_LOCAL
-    if not all(f in raw for f in _ROWCOL):
-        return FRAME_NO_ROW_COLUMN
-    t = np.asarray(pose.translation, np.float64)
-    rotation = np.asarray(pose.rotation, np.float64)
-    if float(np.linalg.norm(t)) < 0.01 and np.allclose(
-        rotation, np.eye(3), rtol=1e-12, atol=1e-12
-    ):
-        return FRAME_IDENTITY_POSE
-
-    col = np.asarray(raw["columnIndex"], np.int64)
-    idx = np.nonzero(valid)[0]
-    if idx.size > 100_000:
-        idx = idx[:: idx.size // 100_000]
-    if idx.size < 64:
-        return FRAME_TOO_FEW_SAMPLES
-
-    xyz, _rng = _positions(raw)
-    as_local = _column_azimuth_spread(xyz[idx], col[idx])
-    as_world = _column_azimuth_spread(pose.world_to_local(xyz)[idx], col[idx])
-
-    # Require a decisive margin. A borderline result means the test did not
-    # discriminate — a partial-FOV scan, or a station whose pose translation is
-    # small relative to the scene — and silently rewriting coordinates on weak
-    # evidence would be worse than the problem.
-    if as_world < as_local * 0.2:
-        return FRAME_REWRITTEN_TO_LOCAL
-    return FRAME_LEFT_AS_LOCAL
+    values = np.asarray(rng, dtype=np.float64)
+    if values.size == 0:
+        return
+    worst = float(np.max(np.abs(values)))
+    if worst > limit:
+        raise ImplausibleRange(
+            f"{where}: maximum range {worst:,.1f} m exceeds the plausibility "
+            f"setting of {limit:,.1f} m. Either the frame decision is wrong or "
+            "this is not terrestrial scanner data; refusing to mesh coordinates "
+            "no scanner could have measured"
+        )
 
 
 def _column_azimuth_spread(xyz: Any, col: Any) -> float:
@@ -796,12 +1010,37 @@ def _angular_steps_from_indices(
 
 
 def _circular_step(az: Any, row: Any, col: Any, default: float) -> float:
-    """Median azimuth increment per column, immune to the +/-pi branch cut."""
+    """Median azimuth increment per column, immune to the +/-pi branch cut.
+
+    **Sorted by (row, col) before differencing — F2.** The pairs this needs are
+    same-row neighbours, but the samples arrive in the file's order, and every
+    authorised structured E57 is *column-major*: consecutive picks share a
+    column, not a row, so same-row pairs essentially never occurred and this
+    returned `default` on every real file. That default is right for a full
+    360 degree sweep, which is why it went unnoticed; on a partial field of
+    view it is wrong by the FOV ratio, and `columns_wrap` — which compares
+    `az_step * cols` against 2*pi — then returns True on every lattice and
+    joins the two ends of a 180 degree scan across the room.
+
+    Sorting costs one `lexsort` and makes the estimator independent of the
+    file's storage order, which is the property it needed all along.
+    """
     import numpy as np
+
+    order = np.lexsort((col, row))
+    row, col, az = row[order], col[order], az[order]
 
     same_row = np.diff(row) == 0
     dcol = np.diff(col)
-    ok = same_row & (dcol > 0)
+    # A pair spanning more than half the lattice cannot be unwrapped
+    # unambiguously: the wrap below would fold a genuine multi-column gap into
+    # the wrong branch, and subsampling makes such gaps common. The bound comes
+    # from the column span in the data, not from `default` — `default` is a
+    # fallback value, and using it as a scale estimate would make this filter
+    # depend on the caller's choice of fallback.
+    span = int(col[-1] - col[0]) + 1 if col.size else 1
+    unambiguous = dcol < max(span // 2, 1)
+    ok = same_row & (dcol > 0) & unambiguous
     if not np.any(ok):
         return default
     daz = np.diff(az)[ok]
