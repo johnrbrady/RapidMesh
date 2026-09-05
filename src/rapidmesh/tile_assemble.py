@@ -38,6 +38,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from .memory import record_phase, record_top_allocations
 from .tile_io import TileJoin, TilePayload
 
 if TYPE_CHECKING:
@@ -49,6 +50,7 @@ if TYPE_CHECKING:
 
     F32 = npt.NDArray[np.float32]
     F64 = npt.NDArray[np.float64]
+    I32 = npt.NDArray[np.int32]
     I64 = npt.NDArray[np.int64]
 
 
@@ -79,17 +81,32 @@ def assemble_tile(
     if records.shape[0] == 0:
         return None, None
 
+    # WP-11m.2. These indices are int32 on disk — `tile_build._SPOOL_FIELDS`
+    # stores `v0`, `v1` and `v2` as `<i4` — so widening them on arrival bought
+    # nothing and doubled the two largest arrays in the pipeline's hottest step:
+    # 423.2 MB each on ordinal 20's largest tile, against a tile whose finished
+    # mesh is 425.4 MB. `searchsorted` returns `intp`, so `local` needs the cast
+    # written out; `spooled` only needs its widening removed.
     spooled = np.stack(
         [records["v0"], records["v1"], records["v2"]], axis=1
-    ).astype(np.int64)
+    ).astype(np.int32, copy=False)
     used = np.unique(spooled)
-    local = np.searchsorted(used, spooled)
+    local = np.searchsorted(used, spooled).astype(np.int32)
 
     rows = keep_idx[used]
     local_verts = retained.xyz[rows]
     normals_all = _accumulate_normals(local_verts, local, retained.pose)
+    record_phase(
+        "assemble_arrays", tile_id=int(tile_id),
+        records_bytes=int(records.nbytes), spooled_bytes=int(spooled.nbytes),
+        local_bytes=int(local.nbytes), used_bytes=int(used.nbytes),
+        rows_bytes=int(rows.nbytes), local_verts_bytes=int(local_verts.nbytes),
+        normals_all_bytes=int(normals_all.nbytes),
+    )
 
-    emitted = np.asarray(records["owner"], np.int64) == tile_id
+    # `owner` is `<i4` in the spool too, and the comparison never needed a
+    # widened copy of it — one more (R,) int64 temporary, 147.9 MB on that tile.
+    emitted = records["owner"] == tile_id
     owned = vertex_tile[used] == tile_id
     if not bool(emitted.any() or owned.any()):
         return None, None
@@ -101,8 +118,8 @@ def assemble_tile(
     order = np.concatenate((slots[owned[slots]], slots[~owned[slots]]))
     owned_count = int(owned[slots].sum())
 
-    place = np.full(used.shape[0], -1, np.int64)
-    place[order] = np.arange(order.size, dtype=np.int64)
+    place = np.full(used.shape[0], -1, np.int32)
+    place[order] = np.arange(order.size, dtype=np.int32)
     faces = place[local[emitted]]
     if faces.size and int(faces.min()) < 0:
         raise ValueError(f"tile {tile_id} emitted a triangle with an unstored corner")
@@ -125,35 +142,82 @@ def assemble_tile(
     )
     join = TileJoin(
         source_sample_id=sample_id,
-        global_vertex_index=used[order],
+        # `used` is int32 from WP-11m.2; the join's declared width is I64 and the
+        # narrowing is internal to this function, so the cast is part of the
+        # change rather than left to dtype propagation. `write_tile_join` would
+        # coerce it on the way to disk in any case — this keeps the in-memory
+        # object matching its own annotation.
+        global_vertex_index=used[order].astype(np.int64),
         row=retained.row[rows[order]].astype(np.int32),
         owned=np.arange(order.size) < owned_count,
     )
     return payload, join
 
 
-def _accumulate_normals(local_verts: F32, faces: I64, pose: Any) -> F32:
+def _accumulate_normals(local_verts: F32, faces: I32, pose: Any) -> F32:
     """`build_mesh`'s normals, over one tile's incident set.
 
-    Copied expression for expression from `triangulate.build_mesh`, including
+    The same operations on the same bits as `triangulate.build_mesh`, including
     two details that look cosmetic and are not: the first difference promotes to
     float64 before subtracting, and the three `np.add.at` calls are per column
     over all faces rather than per face over all columns. Reordering either
     changes the last bits of a float64 sum, and normals are compared at
     `PHASE1-DETERMINISM-SPEC.md` §7's T3 tier where that would show up as a real
     angle rather than as noise.
+
+    **Not copied expression for expression any more.** WP-11m.t writes the cross
+    product out by component to bound its scratch; see the note below for why
+    that is the same arithmetic, and `test_tile_cross_scratch.py` for the digests
+    that hold it to `np.cross`'s own output.
     """
     import numpy as np
 
     count = int(local_verts.shape[0])
     acc = np.zeros((count, 3), np.float64)
     if faces.shape[0]:
-        fn = np.cross(
-            local_verts[faces[:, 1]].astype(np.float64) - local_verts[faces[:, 0]],
-            local_verts[faces[:, 2]].astype(np.float64) - local_verts[faces[:, 0]],
-        )
+        # WP-11m.t. The same arithmetic on the same bits, in a third of the
+        # scratch. Measured, on a 2,000,000-row fixture, in multiples of one
+        # `(R,3)` float64 array:
+        #
+        #     np.cross(a.astype(f64) - c, b.astype(f64) - c)      5.33
+        #       of which the two arguments np.cross needs           2.00
+        #       of which np.cross's own internal working set        2.33
+        #       of which the finished `fn`                          1.00
+        #
+        # So the scratch is not the arguments — rewriting how they are built
+        # saves 544 bytes. It is what `np.cross` allocates inside itself. Here
+        # the shared corner is widened once rather than twice, and the cross
+        # product is written component by component into a preallocated output
+        # with one `(R,)` scratch: 3.33 instead of 5.33.
+        #
+        # `np.cross` on 3-vectors is `cp0 = a1*b2 - a2*b1` and its two
+        # rotations. These are the same two products and the same subtraction,
+        # in the same order, in float64 — bit-identical, and
+        # `test_normals_are_bitwise_what_np_cross_produced` holds that line.
+        # `fn` and the `np.add.at` order below are untouched: this is not a
+        # chunk of either.
+        base = local_verts[faces[:, 0]].astype(np.float64)
+        d1 = local_verts[faces[:, 1]].astype(np.float64)
+        d1 -= base
+        d2 = local_verts[faces[:, 2]].astype(np.float64)
+        d2 -= base
+        del base
+        fn = np.empty_like(d1)
+        scratch = np.empty(d1.shape[0], np.float64)
+        for i, (j, k) in enumerate(((1, 2), (2, 0), (0, 1))):
+            np.multiply(d1[:, j], d2[:, k], out=fn[:, i])
+            np.multiply(d1[:, k], d2[:, j], out=scratch)
+            fn[:, i] -= scratch
+        del d1, d2, scratch
         for col in range(3):
             np.add.at(acc, faces[:, col], fn)
+        # WP-11m.s. The stage's true high-water mark is *here*, not after this
+        # function returns: `fn` and `acc` are both live and `fn` is released on
+        # the next line. Measuring after the return would miss 668 MB of the
+        # thing being measured. Scalars only; the ranking is one-shot and armed
+        # by `_finalise_tiles` for the largest tile alone.
+        record_phase("normals_peak", acc_bytes=int(acc.nbytes), fn_bytes=int(fn.nbytes))
+        record_top_allocations()
     norm = np.linalg.norm(acc, axis=1, keepdims=True)
     acc /= np.maximum(norm, 1e-12)
     facing = np.einsum("ij,ij->i", acc, -local_verts.astype(np.float64))

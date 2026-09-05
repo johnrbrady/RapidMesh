@@ -54,6 +54,7 @@ import json
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
+from .memory import arm_top_allocations, record_phase
 from .tiles import CURRENT_NAME, MANIFEST_NAME, TILE_CONTRACT, TileGrid, TileStore
 
 if TYPE_CHECKING:
@@ -127,6 +128,17 @@ def build_tiles(
     grid = _grid_for(retained.pose, retained.xyz, keep_idx, tile_size)
     vertex_tile = _assign_tiles(retained.pose, retained.xyz, keep_idx, grid)
 
+    # WP-11m.s. Scalars only, and only when the environment asks — `nbytes`,
+    # never the array, so the snapshot cannot keep alive what it is measuring.
+    record_phase(
+        "assign",
+        retained_xyz_bytes=int(retained.xyz.nbytes),
+        cells_bytes=int(cells.nbytes),
+        before_bytes=int(before.nbytes), final_bytes=int(final.nbytes),
+        keep_idx_bytes=int(keep_idx.nbytes), remap_bytes=int(remap.nbytes),
+        vertex_tile_bytes=int(vertex_tile.nbytes),
+    )
+
     dtype = np.dtype(_SPOOL_FIELDS)
     spool = TileSpoolSet(work_dir / "tilespool", "tri", dtype)
     written = 0
@@ -143,9 +155,18 @@ def build_tiles(
             written += int(corners.shape[0])
             _spool_block(spool, corners, vertex_tile, dtype)
         spool.finish()
+        # WP-11m.1 (ITEM-022). `remap` is the spool phase's own station-scale
+        # array — one int32 per retained sample, 52.4 MB on ordinal 20 — and the
+        # `_spool_block` call above is its last reader. It stayed bound through
+        # finalise, which is where this function peaks. Round 6b' made the same
+        # correction in `pass_b.py` for the same reason: being allocated before
+        # the peak is not being freed before it.
+        del remap
+        record_phase("spooled", spooled_records=int(spool.total))
         entries, stats = _finalise_tiles(
             spool, retained, keep_idx, vertex_tile, grid, root
         )
+        record_phase("finalised", tiles_written=len(entries))
     finally:
         spool.finish()
     # Every spool was removed as its tile was finalised; the directory itself is
@@ -303,17 +324,23 @@ def _finalise_tiles(
     root: Path,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Assemble, write, digest and release one tile at a time."""
-    import numpy as np
-
     from .tile_assemble import assemble_tile
     from .tile_io import tile_digest, write_tile, write_tile_join
 
     entries: list[dict[str, Any]] = []
     stats = {"largest_triangles": 0, "largest_vertices": 0, "boundary": 0, "bytes": 0}
-    for tile_id in spool.tile_ids():
-        blocks = [block for block in spool.read(tile_id)]
-        records = np.concatenate(blocks) if blocks else np.empty(0, spool.dtype)
-        del blocks
+    ids = spool.tile_ids()
+    # WP-11m.s. The stage peaks inside the largest tile's assembly, and only
+    # that one is worth a `tracemalloc` ranking — the counts are already known,
+    # so which tile it is does not have to be discovered by watching.
+    largest = max(ids, key=spool.count) if ids else None
+    for tile_id in ids:
+        records = _read_tile_records(spool, tile_id)
+        record_phase(
+            "tile_records", tile_id=int(tile_id), records_bytes=int(records.nbytes)
+        )
+        if tile_id == largest:
+            arm_top_allocations("assemble_peak_largest_tile")
         payload, join = assemble_tile(
             tile_id, records, retained, keep_idx, vertex_tile, grid
         )
@@ -340,6 +367,34 @@ def _finalise_tiles(
         del payload, join
         spool.remove(tile_id)
     return entries, stats
+
+
+def _read_tile_records(spool: Any, tile_id: int) -> Any:
+    """One tile's spool as a single array, without ever holding it twice.
+
+    `read` already yields bounded blocks and `count` is exact, so the destination
+    can be allocated once and filled in place. Collecting the blocks into a list
+    and concatenating them held the whole tile's records a second time at the
+    moment finalise peaks — 282.2 MB of duplicate on ordinal 20's largest tile,
+    against a tile whose own mesh is 425.4 MB.
+
+    The count check is not redundant with `read`'s. `read` returns without
+    yielding when the spool file is missing, and its own check never runs; a tile
+    that silently came back empty would be dropped from the generation with its
+    geometry, and the manifest would still look complete.
+    """
+    import numpy as np
+
+    records = np.empty(spool.count(tile_id), spool.dtype)
+    at = 0
+    for block in spool.read(tile_id):
+        records[at : at + block.shape[0]] = block
+        at += block.shape[0]
+    if at != records.shape[0]:
+        raise ValueError(
+            f"tile {tile_id} yielded {at} records, {records.shape[0]} were appended"
+        )
+    return records
 
 
 def _publish(

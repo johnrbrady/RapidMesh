@@ -404,3 +404,98 @@ def build_kdtree(points: int, seed: int = 0) -> dict[str, Any]:
     tree = cKDTree(cloud)
     distances, _ = tree.query(cloud[:1000], k=1, workers=1)
     return {"points": int(points), "mean_self_distance": float(distances.mean())}
+
+
+# WP-11m.s — phase snapshots inside the tile build.
+#
+# WP-11m.r left ~1.15 GB of the tiles stage's live allocation unnamed on ordinal
+# 20. Naming it from the source is guesswork; the two instruments this module
+# keeps apart can say it directly, read *at* the phase that peaks rather than at
+# the end of the stage. Off unless the environment asks — a flag and not a
+# parameter, because these phases sit three calls below anything a caller can
+# reach and threading one through would change three signatures.
+
+TILE_SNAPSHOT_ENV = "RAPIDMESH_TILE_SNAPSHOTS"
+
+_phases: list[dict[str, Any]] = []
+_armed: list[str] = []
+
+
+def snapshots_enabled() -> bool:
+    """Whether the tile build should record phase snapshots."""
+    return bool(os.environ.get(TILE_SNAPSHOT_ENV))
+
+
+def record_phase(phase: str, **scalars: Any) -> None:
+    """One phase boundary, as scalars only.
+
+    Callers pass `nbytes`, never the array: a snapshot holding a reference would
+    keep alive the thing it measures, and every figure would then be wrong in
+    the same direction — the one failure mode that does not look like one.
+    """
+    if not snapshots_enabled():
+        return
+    entry: dict[str, Any] = {"phase": phase}
+    entry.update(scalars)
+    entry.update(_instrument_now())
+    _phases.append(entry)
+
+
+def _instrument_now() -> dict[str, Any]:
+    """Both instruments, side by side, per this module's opening note."""
+    import tracemalloc
+
+    out: dict[str, Any] = {}
+    if tracemalloc.is_tracing():
+        current, peak = tracemalloc.get_traced_memory()
+        out["traced_current"], out["traced_peak"] = int(current), int(peak)
+    try:
+        sample = rss_sample()
+    except PeakMemoryUnavailable:                           # pragma: no cover
+        return out
+    out["rss_current"] = int(sample.current_bytes)
+    out["rss_peak"] = int(sample.peak_bytes)
+    return out
+
+
+def arm_top_allocations(phase: str) -> None:
+    """Ask for one ranking at the next `record_top_allocations` call. One-shot:
+    the caller that knows which tile is largest is not the one holding the
+    arrays when it peaks, and ranking every tile would cost 364 snapshots on
+    ordinal 3 to answer a question about one."""
+    if snapshots_enabled():
+        _armed.append(phase)
+
+
+def record_top_allocations(limit: int = 30) -> None:
+    """`tracemalloc`'s own ranking at this instant, by allocation site.
+
+    The one call here that costs something: a snapshot allocates. The traced
+    figure is read either side and the difference recorded, so the cost is
+    reported rather than folded into the peak it measures.
+    """
+    import tracemalloc
+
+    if not _armed or not tracemalloc.is_tracing():
+        return
+    phase = _armed.pop()
+    before, _ = tracemalloc.get_traced_memory()
+    snapshot = tracemalloc.take_snapshot()
+    ranked = [
+        {"where": f"{os.path.basename(s.traceback[0].filename)}:{s.traceback[0].lineno}",
+         "bytes": int(s.size), "blocks": int(s.count)}
+        for s in snapshot.statistics("lineno")[:limit]
+    ]
+    del snapshot
+    after, _ = tracemalloc.get_traced_memory()
+    _phases.append(
+        {"phase": phase, "top": ranked, "snapshot_cost_bytes": int(after - before)}
+    )
+
+
+def drain_phases() -> list[dict[str, Any]]:
+    """Everything recorded since the last drain, and reset."""
+    out = list(_phases)
+    _phases.clear()
+    _armed.clear()
+    return out

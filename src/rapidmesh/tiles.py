@@ -231,24 +231,35 @@ class TileStore:
     def vertex_blocks(self) -> Iterator[VertexBlock]:
         """Every owned vertex once, tile by tile, with its global index.
 
-        One tile is the block. That is the whole point of the tiling: tile size
-        is the parameter that bounds this, which is why ADR-006 2a makes it a
-        measured one rather than a constant.
+        A tile used to *be* the block. WP-13b makes it the unit of **reading** —
+        which is all a tile file ever was — and hands QA slices of it that
+        honour `QA_VERTEX_BLOCK_BYTES`, exactly as `ResidentMesh` always has.
+        Same vertices, same order, more blocks: nothing downstream can tell the
+        difference except by its own peak.
+
+        ADR-006 2a still makes tile size the measured parameter that bounds the
+        *output*. WP-13a is why it no longer also bounds QA's resident set —
+        ordinal 20 packs its surface into 5 tiles, so "one tile is the block"
+        made a single QA block 2.74 GB.
         """
         import numpy as np
 
-        from .qa_stream import VertexBlock
+        from .qa_stream import VertexBlock, vertex_block_step
 
+        step = vertex_block_step()
         for tile_id in self.tile_ids:
             payload = self.payload(tile_id)
             owned = payload.owned_count
             if owned == 0:
                 continue
             join = self.join(tile_id)
-            yield VertexBlock(
-                ids=np.asarray(join.global_vertex_index[:owned], np.int64),
-                xyz=payload.positions[:owned].astype(np.float64),
-            )
+            ids = np.asarray(join.global_vertex_index[:owned], np.int64)
+            for lo in range(0, owned, step):
+                hi = min(lo + step, owned)
+                yield VertexBlock(
+                    ids=ids[lo:hi],
+                    xyz=payload.positions[lo:hi].astype(np.float64),
+                )
 
     def triangle_blocks(self) -> Iterator[TriangleBlock]:
         """Every emitted triangle once, with global corner ids and positions.
@@ -256,21 +267,32 @@ class TileStore:
         The corners come from the tile's own vertex array, which is why a tile
         stores positions for boundary vertices it does not own: a triangle must
         be resolvable inside the tile that emitted it, with no cross-tile join.
+
+        Sliced to `QA_TRIANGLE_BLOCK_BYTES` — see `vertex_blocks`.
         """
         import numpy as np
 
-        from .qa_stream import TriangleBlock
+        from .qa_stream import TriangleBlock, triangle_block_step
 
+        step = triangle_block_step()
         for tile_id in self.tile_ids:
             payload = self.payload(tile_id)
-            if payload.triangle_count == 0:
+            count = payload.triangle_count
+            if count == 0:
                 continue
             join = self.join(tile_id)
-            local = payload.triangles.astype(np.int64)
-            yield TriangleBlock(
-                ids=np.asarray(join.global_vertex_index, np.int64)[local],
-                corners=payload.positions[local].astype(np.float64),
-            )
+            globals_ = np.asarray(join.global_vertex_index, np.int64)
+            for lo in range(0, count, step):
+                # Slice, *then* widen. Widening the tile's triangles or corners
+                # whole and slicing the result would still build the arrays this
+                # package exists to remove: 443,786,352 B of int64 indices and
+                # 1,331,359,056 B of float64 corners on ordinal 20's largest
+                # tile (WP-13a §2.2).
+                local = payload.triangles[lo : lo + step].astype(np.int64)
+                yield TriangleBlock(
+                    ids=globals_[local],
+                    corners=payload.positions[local].astype(np.float64),
+                )
 
     def identified_triangle_blocks(self) -> Iterator[IdentifiedTriangleBlock]:
         """The same triangles, with each corner's `source_sample_id` beside it.
@@ -278,22 +300,29 @@ class TileStore:
         The ids come from the tile's own server-only join file, so a reader that
         was handed only the client-eligible payload cannot produce this block at
         all — DEC-004's boundary is the file split, not a runtime check.
+
+        Sliced to `QA_TRIANGLE_BLOCK_BYTES` — see `vertex_blocks`.
         """
         import numpy as np
 
-        from .qa_stream import IdentifiedTriangleBlock
+        from .qa_stream import IdentifiedTriangleBlock, triangle_block_step
 
+        step = triangle_block_step()
         for tile_id in self.tile_ids:
             payload = self.payload(tile_id)
-            if payload.triangle_count == 0:
+            count = payload.triangle_count
+            if count == 0:
                 continue
             join = self.join(tile_id)
-            local = payload.triangles.astype(np.int64)
-            yield IdentifiedTriangleBlock(
-                sample_ids=np.asarray(join.source_sample_id, np.int64)[local],
-                ids=np.asarray(join.global_vertex_index, np.int64)[local],
-                corners=payload.positions[local].astype(np.float64),
-            )
+            samples = np.asarray(join.source_sample_id, np.int64)
+            globals_ = np.asarray(join.global_vertex_index, np.int64)
+            for lo in range(0, count, step):
+                local = payload.triangles[lo : lo + step].astype(np.int64)
+                yield IdentifiedTriangleBlock(
+                    sample_ids=samples[local],
+                    ids=globals_[local],
+                    corners=payload.positions[local].astype(np.float64),
+                )
 
     # -- reconstitution, for the equivalence harness only --------------------
 

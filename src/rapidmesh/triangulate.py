@@ -305,6 +305,11 @@ class AreaResult:
     fallback: npt.NDArray[np.bool_]  # (C,) True where fsum was authoritative
     max_ratio: float
     fallback_components: int
+    # WP-12a (ITEM-022): the inner product of `counts` and `fallback`. It sizes
+    # what `exact_component_areas` buffers, which follows the flagged components
+    # and not the station — 10mb recorded *that* ordinal 20 flagged one of 1,295,
+    # never how big it is.
+    fallback_triangle_count: int
     version: str = COMPONENT_AREA_VERSION
 
 
@@ -368,6 +373,7 @@ def component_area_v1(
         fallback=over,
         max_ratio=float(ratios.max()) if ratios.size else 0.0,
         fallback_components=int(np.count_nonzero(over)),
+        fallback_triangle_count=int(counts[over].sum()),
     )
 
 

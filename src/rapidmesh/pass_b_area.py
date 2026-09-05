@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Any
 from .pass_b_merge import RunSet, merge_runs
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     import numpy as np
     import numpy.typing as npt
 
@@ -105,16 +107,22 @@ class StreamedAreaAccumulator:
 
         roots = np.fromiter(sorted(self.totals), np.int64, len(self.totals))
         ratios = self.ratios()
+        # WP-12a. `counts` and `fallback` were built inline; they are named here
+        # only so `fallback_triangle_count` can be their inner product. No value
+        # changes, and nothing about the accumulation is touched.
+        counts = np.array([self.counts[int(r)] for r in roots], np.int64)
+        fallback = np.array([int(r) in fallback_roots for r in roots], bool)
         return AreaResult(
             root_ids=roots,
             areas=np.array([self.totals[int(r)] for r in roots], np.float64),
-            counts=np.array([self.counts[int(r)] for r in roots], np.int64),
+            counts=counts,
             smallest_positive=np.array(
                 [self.smallest.get(int(r), 0.0) for r in roots], np.float64
             ),
-            fallback=np.array([int(r) in fallback_roots for r in roots], bool),
+            fallback=fallback,
             max_ratio=max(ratios.values()) if ratios else 0.0,
             fallback_components=len(fallback_roots),
+            fallback_triangle_count=int(counts[fallback].sum()),
         )
 
     def needs_exact(self) -> set[int]:
@@ -182,15 +190,55 @@ def stream_component_areas(
     return accumulator
 
 
+def _flagged_counts(runs: RunSet, wanted: I64) -> dict[int, int]:
+    """Triangles per flagged component, from the run keys alone.
+
+    `StreamedAreaAccumulator.counts` already holds these numbers exactly, and
+    `pass_b_finalise` is holding that accumulator when it calls the second pass
+    — but it does not pass them and `pass_b.py` is not this package's to change
+    (WP-12b scope). Recomputing them costs one pass over the run records with
+    **no geometry**: no `searchsorted` into `cells`, no vertex gather, no cross
+    product, none of the three things that make the second pass expensive. The
+    alternative the brief rules out is guessing a length and growing.
+    """
+    import numpy as np
+
+    counts = {int(root): 0 for root in wanted}
+    for block in merge_runs(runs):
+        block_roots = block["root"]
+        hit = np.isin(block_roots, wanted)
+        if not bool(hit.any()):
+            continue
+        values, seen = np.unique(block_roots[hit], return_counts=True)
+        for value, count in zip(values, seen, strict=True):
+            counts[int(value)] += int(count)
+    return counts
+
+
 def exact_component_areas(
-    runs: RunSet, cells: I64, xyz: Any, roots: set[int]
+    runs: RunSet, cells: I64, xyz: Any, roots: set[int],
+    counts: Mapping[int, int] | None = None,
 ) -> dict[int, float]:
     """`math.fsum` for components the streamed total cannot vouch for.
 
     Runs only for components flagged by `needs_exact`, and buffers only those
     components' areas — so the cost is paid by the geometry that earns it
-    rather than by every station. Zero components have been flagged on any
-    fixture measured so far.
+    rather than by every station.
+
+    **WP-12b — the buffer is a pre-sized float64 array, not a list of CPython
+    floats.** Same summands, in the same merge order, through the same
+    `math.fsum`: a storage change, not an arithmetic one. A list costs 32 B a
+    triangle — a 24-byte float object plus an 8-byte slot — against 8 B in the
+    array. On ordinal 20's one flagged component that is 819,161,152 B against
+    204,790,288 B (WP-12a §5.4). `counts` supplies the sizes when a caller has
+    them; without it `_flagged_counts` recovers the same integers.
+
+    **This path does run on real data.** Every synthetic fixture in the
+    repository still takes the empty early return below, which is why this
+    docstring used to say no component had ever been flagged. That sentence was
+    true of fixtures and false of the campaign: WP-10mb measured
+    `fallback_components = 1` on ordinal 20 and WP-12a sized that one component
+    at 25,598,786 triangles, 94% of the station.
     """
     import math
 
@@ -198,14 +246,31 @@ def exact_component_areas(
 
     if not roots:
         return {}
-    collected: dict[int, list[float]] = {root: [] for root in roots}
     wanted = np.fromiter(sorted(roots), dtype=np.int64, count=len(roots))
+    sizes = _flagged_counts(runs, wanted) if counts is None else counts
+    buffers = {int(r): np.empty(int(sizes[int(r)]), np.float64) for r in wanted}
+    filled = {int(r): 0 for r in wanted}
     for block in merge_runs(runs):
         hit = np.isin(block["root"], wanted)
         if not bool(hit.any()):
             continue
         chosen = block[hit]
         areas = _block_areas(_block_indices(chosen, cells), xyz)
-        for root, value in zip(chosen["root"], areas, strict=True):
-            collected[int(root)].append(float(value))
-    return {root: math.fsum(values) for root, values in collected.items()}
+        block_roots = chosen["root"]
+        # One slice assignment per root per block, so no CPython object is made
+        # per triangle. `merge_runs` is sorted by `root` first, so in practice
+        # this loop runs once; selecting by mask keeps the arrival order either
+        # way, and arrival order is what `math.fsum` is being given.
+        for root in np.unique(block_roots):
+            key = int(root)
+            take = areas[block_roots == root]
+            at = filled[key]
+            buffers[key][at : at + take.shape[0]] = take
+            filled[key] = at + take.shape[0]
+    for key, buffer in buffers.items():
+        if filled[key] != buffer.shape[0]:
+            raise ValueError(
+                f"component {key} buffered {filled[key]} areas, "
+                f"{buffer.shape[0]} were counted"
+            )
+    return {root: math.fsum(buffer) for root, buffer in buffers.items()}

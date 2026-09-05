@@ -202,6 +202,23 @@ def _records_per_block(byte_cap: int, record_bytes: int) -> int:
     return max(int(byte_cap // record_bytes), 1)
 
 
+def vertex_block_step() -> int:
+    """Owned vertices per QA block, from `QA_VERTEX_BLOCK_BYTES`.
+
+    Public because `TileStore` slices to the same cap (WP-13b), and a second
+    copy of this arithmetic living in `tiles.py` is exactly how the two
+    `GeometrySource` implementations drifted apart in the first place.
+    `ResidentMesh` keeps its per-instance override, which is what the QA tests
+    vary; this is the default the two sources share.
+    """
+    return _records_per_block(QA_VERTEX_BLOCK_BYTES, _VERTEX_RECORD_BYTES)
+
+
+def triangle_block_step() -> int:
+    """Triangles per QA block, from `QA_TRIANGLE_BLOCK_BYTES`. See above."""
+    return _records_per_block(QA_TRIANGLE_BLOCK_BYTES, _TRIANGLE_RECORD_BYTES)
+
+
 # ---------------------------------------------------------------------------
 # stage two — distance to the triangles incident to those vertices
 # ---------------------------------------------------------------------------
