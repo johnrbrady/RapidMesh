@@ -36,7 +36,7 @@ second-nearest vertex, which happens on elongated triangles near edges.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .types import DeviationReport, MeshData
 
@@ -101,13 +101,25 @@ def deviation_report(
         mesh, points, max_samples=max_samples, k=k, seed=seed, workers=workers,
         block=block,
     )
+    population = point_count(points)
     return _summarise(
         d,
         metric="retained-source-to-mesh",
-        population=int(points.shape[0]),
-        exact=points.shape[0] <= max_samples,
+        population=population,
+        exact=population <= max_samples,
         source_of_truth="retained source observations",
     )
+
+
+def point_count(points: Any) -> int:
+    """How many observations there are, without needing to hold them.
+
+    WP-C: `points` is either the float32 array QA has always taken or an
+    `ObservationWindows` over the written store. Both answer this; only one of
+    them costs 165 MB on ordinal 20 to be able to.
+    """
+    count = getattr(points, "count", None)
+    return int(count) if count is not None else int(points.shape[0])
 
 
 def mesh_to_source_report(
@@ -297,15 +309,31 @@ def distances(
 
     if block < 1:
         raise ValueError(f"block must be a positive query count, got {block}")
-    if mesh.triangle_count == 0 or points.shape[0] == 0:
+    total = point_count(points)
+    if mesh.triangle_count == 0 or total == 0:
         return np.empty(0, np.float64)
 
-    q = points
-    if max_samples is not None and q.shape[0] > max_samples:
-        rs = np.random.default_rng(seed)
-        q = q[rs.choice(q.shape[0], max_samples, replace=False)]
-    q64 = q.astype(np.float64)
-    del q, points
+    # WP-C (ITEM-022 T4). The draw depends only on `(n, seed, max_samples)`, so
+    # the sample can be chosen before the population exists and then read out of
+    # the store one stretch at a time. `gather` returns them **in the drawn
+    # order**, which is what `points[rs.choice(...)]` produced — a sorted read
+    # would be a permutation of the same points, and this function's contract is
+    # per-point distances, not a multiset of them.
+    if hasattr(points, "gather"):
+        index = (
+            np.random.default_rng(seed).choice(total, max_samples, replace=False)
+            if max_samples is not None and total > max_samples
+            else np.arange(total, dtype=np.int64)
+        )
+        q64 = points.gather(index).astype(np.float64)
+    else:
+        q = points
+        if max_samples is not None and q.shape[0] > max_samples:
+            rs = np.random.default_rng(seed)
+            q = q[rs.choice(q.shape[0], max_samples, replace=False)]
+        q64 = q.astype(np.float64)
+        del q
+    del points
 
     return surface_distances(
         as_source(mesh), q64, k=k, workers=workers, block=block

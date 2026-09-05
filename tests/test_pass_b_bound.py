@@ -165,7 +165,7 @@ def test_streamed_component_areas_match_the_reference(station, tmp_path) -> None
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
     runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
-    streamed = stream_component_areas(runs, cells, retained.xyz).as_area_result(set())
+    streamed = stream_component_areas(runs).as_area_result(set())
 
     from rapidmesh.segments_io import read_triangles_and_final_roots
 
@@ -193,7 +193,7 @@ def test_the_streamed_cull_selects_the_same_triangles(station, tmp_path) -> None
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
     runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
-    area = stream_component_areas(runs, cells, retained.xyz).as_area_result(set())
+    area = stream_component_areas(runs).as_area_result(set())
 
     # A threshold chosen to be *discriminating on this fixture*: at the 0.005
     # default nothing here is culled, and a cull comparison that culls nothing
@@ -318,11 +318,11 @@ def test_the_exact_pass_reads_only_the_flagged_components(station, tmp_path) -> 
     retained, cells = _retained(station, pass_a)
     alias = _alias(pass_a)
     runs, _mesh_cells = build_triangle_runs(pass_a.segments, alias, tmp_path)
-    accumulator = stream_component_areas(runs, cells, retained.xyz)
+    accumulator = stream_component_areas(runs)
 
     assert accumulator.needs_exact() == set()          # nothing flagged naturally
     root = next(iter(accumulator.totals))
-    exact = exact_component_areas(runs, cells, retained.xyz, {root})
+    exact = exact_component_areas(runs, {root})
     assert set(exact) == {root}
     assert exact[root] == accumulator.totals[root], (
         "under the condition the exact sum and the streamed sum are one number"

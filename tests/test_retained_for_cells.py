@@ -68,6 +68,7 @@ def _write_pos_only(tmp_path: Path, owned: StructuredScan) -> object:
         core_row_start=0,
         core_row_stop=int(owned.row.max()) + 1 if len(owned) else 1,
         tri_cells=empty,
+        tri_areas=np.empty(0, np.float32),
         tri_components=np.empty(0, np.int64),
         owned=owned,
         cols=owned.lattice.cols,

@@ -30,10 +30,10 @@ from rapidmesh.reverse_qa import (
     REVERSE_QA_METRIC,
     REVERSE_QA_VERSION,
     _windowed_distances,
-    calibrate_window,
     mesh_to_source_report_v2,
     run_reverse_qa,
 )
+from rapidmesh.reverse_qa_calibration import calibrate_window
 from rapidmesh.triangulate import build_mesh, cull_islands, triangulate, used_vertices
 from rapidmesh.types import MeshData
 

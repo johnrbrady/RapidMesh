@@ -55,7 +55,16 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from .memory import arm_top_allocations, record_phase
-from .tiles import CURRENT_NAME, MANIFEST_NAME, TILE_CONTRACT, TileGrid, TileStore
+from .tiles import (
+    CURRENT_NAME,
+    DEFAULT_WINDOW_COLS,
+    DEFAULT_WINDOW_ROWS,
+    MANIFEST_NAME,
+    TILE_CONTRACT,
+    LatticeGrid,
+    Partition,
+    TileStore,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -66,14 +75,9 @@ if TYPE_CHECKING:
     from .pass_b_merge import RunSet
     from .types import ScanPose, StructuredScan
 
-    F32 = npt.NDArray[np.float32]
     F64 = npt.NDArray[np.float64]
     I64 = npt.NDArray[np.int64]
     BOOL = npt.NDArray[np.bool_]
-
-# Vertices projected per block while the grid bounds and the ownership map are
-# built. 262,144 float32 positions is 3.1 MB, the same order as the QA caps.
-PROJECT_BLOCK = 262_144
 
 _SPOOL_FIELDS = [("v0", "<i4"), ("v1", "<i4"), ("v2", "<i4"), ("owner", "<i4")]
 
@@ -83,9 +87,13 @@ class TileBuildResult:
     """A written generation, plus the counts Pass B's ledger and report need."""
 
     store: TileStore
-    before: BOOL
-    final: BOOL
-    grid: TileGrid
+    #: Membership over **lattice cells**, not over a station-wide array: which
+    #: cells any triangle named, and which survived the cull. WP-B replaced the
+    #: two bool arrays over `retained` with these; the ledger reads their
+    #: `total`, which is the same integer `mask.sum()` gave.
+    meshed: Any
+    surviving: Any
+    grid: Partition
     triangles_written: int
     tile_count: int
     largest_tile_triangles: int
@@ -94,8 +102,14 @@ class TileBuildResult:
     tile_bytes: int
 
     def describe(self) -> str:
+        cut = self.grid.describe()
+        how = (
+            f"{cut['window_rows']}x{cut['window_cols']} lattice windows"
+            if cut.get("kind") == "lattice"
+            else f"tiles at {cut.get('size_m', 0.0):g} m"
+        )
         return (
-            f"{self.tile_count} tiles at {self.grid.size:g} m, "
+            f"{self.tile_count} {how}, "
             f"{self.triangles_written:,} triangles, {self.tile_bytes:,} B written, "
             f"largest tile {self.largest_tile_triangles:,} tris / "
             f"{self.largest_tile_vertices:,} verts, "
@@ -104,40 +118,107 @@ class TileBuildResult:
 
 
 def build_tiles(
-    retained: StructuredScan,
     runs: RunSet,
-    cells: I64,
     keep_root: Any,
     *,
     work_dir: Path,
+    lattice: Any,
+    pose: ScanPose,
+    segments: Any,
+    has_rgb: bool,
+    has_sample_id: bool,
+    wrap: bool,
     tile_size: float,
+    partition: str = "lattice",
+    window: tuple[int, int] | None = None,
     generation: str = "00000000",
+    retained: StructuredScan | None = None,
 ) -> TileBuildResult:
-    """Stream the surviving triangles into an immutable spatial generation."""
+    """Stream the surviving triangles into an immutable spatial generation.
+
+    `partition` selects how the intermediate is cut. **`"lattice"` is the
+    production partition** (DEC-021): windows of `window` = (rows, cols) lattice
+    cells, which bound a window's owned vertices at `W x H` by construction.
+    `"metric"` is the pre-WP-A behaviour, kept because `test_tiles.py` pins
+    tile-independent outputs against it and because ADR-006's later decimated
+    tiers are still metric — it is **not** a memory lever and DEC-021 says so.
+
+    **WP-B (ITEM-022 T1).** The lattice partition takes no station-wide arrays
+    at all. Membership is two bitsets over the lattice, the global vertex index
+    is rank in the surviving one, ownership is an integer divide on the cell id,
+    and positions arrive through a per-tile vertex spool filled by one pass over
+    `pos`. `retained` is accepted **only** for the metric partition, which
+    decides ownership by projecting positions and therefore cannot be filled
+    from a lattice ring; passing it on the lattice path is a caller error rather
+    than a fallback, because a fallback is how a station-wide array quietly
+    comes back.
+
+    `tile_size` is read only by the metric partition. It stays in the signature
+    because it is a recorded setting of the generation either way, and dropping
+    it would silently change what a caller's argument means.
+    """
     import numpy as np
 
-    from .pass_b_area import _block_indices
+    from .cellrank import CellRank
+    from .pass_b_area import _block_cells
     from .pass_b_merge import merge_runs
+    from .tile_metric import _assign_tiles, _grid_for
     from .tile_spool import TileSpoolSet
-
-    before, final = _membership(runs, cells, keep_root, len(retained))
-    keep_idx = np.flatnonzero(final)
-    remap = np.full(len(retained), -1, np.int32)
-    remap[keep_idx] = np.arange(keep_idx.size, dtype=np.int32)
-
-    grid = _grid_for(retained.pose, retained.xyz, keep_idx, tile_size)
-    vertex_tile = _assign_tiles(retained.pose, retained.xyz, keep_idx, grid)
-
-    # WP-11m.s. Scalars only, and only when the environment asks — `nbytes`,
-    # never the array, so the snapshot cannot keep alive what it is measuring.
-    record_phase(
-        "assign",
-        retained_xyz_bytes=int(retained.xyz.nbytes),
-        cells_bytes=int(cells.nbytes),
-        before_bytes=int(before.nbytes), final_bytes=int(final.nbytes),
-        keep_idx_bytes=int(keep_idx.nbytes), remap_bytes=int(remap.nbytes),
-        vertex_tile_bytes=int(vertex_tile.nbytes),
+    from .vertex_spool import (
+        spool_vertices_from_segments,
+        vertex_dtype,
+        vertices_from_scan,
     )
+
+    lattice_rows, lattice_cols = int(lattice.rows), int(lattice.cols)
+    meshed_flags, final_flags = _membership(runs, keep_root, lattice_rows * lattice_cols)
+    meshed = CellRank.of(meshed_flags)
+    surviving = CellRank.of(final_flags)
+
+    vertex_spool: Any = None
+    lattice_grid: LatticeGrid | None = None
+    keep_idx: Any = None
+    vertex_tile: Any = None
+    if partition == "lattice":
+        if retained is not None:
+            raise ValueError(
+                "the lattice partition does not take a station-wide scan; "
+                "passing one would defeat the change that removed it"
+            )
+        del meshed_flags, final_flags
+        window_rows, window_cols = window or (DEFAULT_WINDOW_ROWS, DEFAULT_WINDOW_COLS)
+        lattice_grid = LatticeGrid(
+            lattice_rows=lattice_rows, lattice_cols=lattice_cols,
+            window_rows=int(window_rows), window_cols=int(window_cols),
+            wrap=bool(wrap),
+        )
+        grid: Partition = lattice_grid
+        vertex_spool = TileSpoolSet(work_dir / "vertspool", "vert", vertex_dtype())
+        spooled_vertices = spool_vertices_from_segments(
+            vertex_spool, segments, grid=lattice_grid, final=surviving,
+            meshed=meshed, lattice_rows=lattice_rows, lattice_cols=lattice_cols,
+            has_sample_id=has_sample_id,
+        )
+        vertex_spool.finish()
+        record_phase(
+            "vertices_spooled",
+            surviving=int(surviving.total), spooled=int(spooled_vertices),
+            packed_bytes=int(surviving.packed.nbytes),
+            cumulative_bytes=int(surviving.cumulative.nbytes),
+        )
+    elif partition == "metric":
+        if retained is None:
+            raise ValueError("the metric partition needs the retained scan")
+        cells_sorted = np.flatnonzero(meshed_flags)
+        keep_idx = np.flatnonzero(final_flags[cells_sorted])
+        del meshed_flags, final_flags, cells_sorted
+        metric_scan: StructuredScan = retained
+        grid = _grid_for(pose, metric_scan.xyz, keep_idx, tile_size)
+        vertex_tile = _assign_tiles(pose, metric_scan.xyz, keep_idx, grid)
+    else:
+        raise ValueError(
+            f"unknown partition {partition!r}; expected 'lattice' or 'metric'"
+        )
 
     dtype = np.dtype(_SPOOL_FIELDS)
     spool = TileSpoolSet(work_dir / "tilespool", "tri", dtype)
@@ -148,31 +229,57 @@ def build_tiles(
             survives = keep_root[block["root"]]
             if not bool(survives.any()):
                 continue
-            rows = _block_indices(block[survives], cells)
-            corners = remap[rows]
-            if corners.size and int(corners.min()) < 0:
-                raise ValueError("a surviving triangle names an unmeshed sample")
+            triple = _block_cells(block[survives])
+            corners = surviving.rank(triple).astype(np.int32)
+            # Ownership: arithmetic on the cell for the lattice, the projected
+            # assignment for the metric grid. Either way it is per corner, and
+            # `_spool_block` never learns which partition produced it.
+            # Narrowed to the concrete grid on purpose: `index_of` takes cell
+            # ids on the lattice and projected positions on the metric grid, and
+            # `mypy --strict` will not let the `Partition` union hide that.
+            tiles = (
+                lattice_grid.index_of(triple).astype(np.int32)
+                if lattice_grid is not None
+                else vertex_tile[corners]
+            )
             written += int(corners.shape[0])
-            _spool_block(spool, corners, vertex_tile, dtype)
+            _spool_block(spool, corners, tiles, dtype)
         spool.finish()
-        # WP-11m.1 (ITEM-022). `remap` is the spool phase's own station-scale
-        # array — one int32 per retained sample, 52.4 MB on ordinal 20 — and the
-        # `_spool_block` call above is its last reader. It stayed bound through
-        # finalise, which is where this function peaks. Round 6b' made the same
-        # correction in `pass_b.py` for the same reason: being allocated before
-        # the peak is not being freed before it.
-        del remap
         record_phase("spooled", spooled_records=int(spool.total))
+
+        def vertices_for(tile_id: int, tile_records: Any) -> Any:
+            """The vertices one tile needs, bounded by that tile either way.
+
+            The lattice partition reads them from the spool the `pos` pass
+            filled; the metric partition gathers them from the station for the
+            indices this tile actually spooled. Bounded by the tile either way,
+            so keeping the old partition for the tests does not reintroduce the
+            station-scale array this package removes.
+            """
+            if vertex_spool is not None:
+                return _read_tile_records(vertex_spool, tile_id)
+            used = np.unique(
+                np.stack(
+                    [tile_records["v0"], tile_records["v1"], tile_records["v2"]],
+                    axis=1,
+                )
+            ).astype(np.int64)
+            return vertices_from_scan(metric_scan, keep_idx, vertex_tile, used)
+
         entries, stats = _finalise_tiles(
-            spool, retained, keep_idx, vertex_tile, grid, root
+            spool, vertices_for, pose, grid, root, has_rgb=has_rgb
         )
         record_phase("finalised", tiles_written=len(entries))
     finally:
         spool.finish()
-    # Every spool was removed as its tile was finalised; the directory itself is
-    # scratch and has no place in a published generation.
-    with contextlib.suppress(OSError):
-        (work_dir / "tilespool").rmdir()
+        if vertex_spool is not None:
+            for spooled_tile in vertex_spool.tile_ids():
+                vertex_spool.remove(spooled_tile)
+    # Every spool was removed as its tile was finalised; the directories are
+    # scratch and have no place in a published generation.
+    for scratch in ("tilespool", "vertspool"):
+        with contextlib.suppress(OSError):
+            (work_dir / scratch).rmdir()
 
     manifest = {
         "contract": TILE_CONTRACT,
@@ -183,22 +290,22 @@ def build_tiles(
         # all — a station whose every component was culled — still has one. A
         # reader that took it from the first tile would get zeros for that case
         # and would be reassembling geometry against the wrong origin.
-        "origin": [float(v) for v in retained.pose.translation],
+        "origin": [float(v) for v in pose.translation],
         # Whether the *source* carried colour, which is not the same question as
         # whether any tile did. A generation with no tiles at all still has to
         # reproduce the resident path's empty colour array rather than its
         # absence, or a station that meshes to nothing compares unequal on a
         # field neither run has any data for.
-        "has_rgb": retained.rgb is not None,
-        "owned_vertex_count": int(keep_idx.size),
+        "has_rgb": bool(has_rgb),
+        "owned_vertex_count": int(surviving.total),
         "triangle_count": written,
         "tiles": entries,
     }
     _publish(work_dir, root, manifest, generation)
     return TileBuildResult(
         store=TileStore.open(work_dir),
-        before=before,
-        final=final,
+        meshed=meshed,
+        surviving=surviving,
         grid=grid,
         triangles_written=written,
         tile_count=len(entries),
@@ -210,80 +317,35 @@ def build_tiles(
 
 
 def _membership(
-    runs: RunSet, cells: I64, keep_root: Any, vertices: int
+    runs: RunSet, keep_root: Any, cell_count: int
 ) -> tuple[BOOL, BOOL]:
-    """Pre-cull and post-cull vertex-membership masks, no triangles retained.
+    """Pre-cull and post-cull membership, as flags over the **lattice**.
 
-    The same two masks `pass_b.stream_kept_triangles` produced, without its third
-    return value — the station's kept triangle array, which is exactly what this
-    package removes. `dropped_island` and retained-but-unmeshed are derived from
-    these, so the ledger is unchanged.
+    The same two masks `pass_b.stream_kept_triangles` produced, keyed by lattice
+    cell instead of by position in a station-wide array — so no such array has
+    to exist for the ledger to be computed. `dropped_island` and
+    retained-but-unmeshed are derived from their counts, unchanged.
+
+    Canonical corner order is used deliberately: membership is a set question
+    and the winding cannot change which cells a triangle names.
     """
     import numpy as np
 
-    from .pass_b_area import _block_indices
     from .pass_b_merge import merge_runs
 
-    before = np.zeros(vertices, dtype=bool)
-    final = np.zeros(vertices, dtype=bool)
+    meshed = np.zeros(cell_count, dtype=bool)
+    final = np.zeros(cell_count, dtype=bool)
     for block in merge_runs(runs):
-        indices = _block_indices(block, cells)
-        before[indices.ravel()] = True
+        triple = np.stack([block["c0"], block["c1"], block["c2"]], axis=1)
+        meshed[triple.ravel()] = True
         survives = keep_root[block["root"]]
         if not bool(survives.any()):
             continue
-        final[indices[survives].ravel()] = True
-    return before, final
+        final[triple[survives].ravel()] = True
+    return meshed, final
 
 
-def _grid_for(
-    pose: ScanPose, xyz: F32, keep_idx: I64, tile_size: float
-) -> TileGrid:
-    """Bounds of the projected vertices, one block at a time."""
-    import numpy as np
-
-    low = np.full(3, np.inf)
-    high = np.full(3, -np.inf)
-    for start in range(0, keep_idx.size, PROJECT_BLOCK):
-        piece = _project(pose, xyz, keep_idx[start : start + PROJECT_BLOCK])
-        low = np.minimum(low, piece.min(axis=0))
-        high = np.maximum(high, piece.max(axis=0))
-    if not np.all(np.isfinite(low)):
-        low = np.zeros(3)
-        high = np.zeros(3)
-    return TileGrid.covering(low, high, tile_size)
-
-
-def _assign_tiles(
-    pose: ScanPose, xyz: F32, keep_idx: I64, grid: TileGrid
-) -> Any:
-    """Owning tile per mesh vertex, as int32. Four bytes a vertex, and the only
-    station-wide array this package adds."""
-    import numpy as np
-
-    out = np.empty(keep_idx.size, np.int32)
-    for start in range(0, keep_idx.size, PROJECT_BLOCK):
-        stop = min(start + PROJECT_BLOCK, keep_idx.size)
-        out[start:stop] = grid.index_of(
-            _project(pose, xyz, keep_idx[start:stop])
-        ).astype(np.int32)
-    return out
-
-
-def _project(pose: ScanPose, xyz: F32, index: I64) -> F32:
-    """Scanner-local offsets to project-axis float32, exactly as `build_mesh`.
-
-    The rotation is applied once and only then narrowed, per
-    `SPATIAL-CONTRACT.md`; doing it on a subset is the same arithmetic row by
-    row, so a tile's stored position is bitwise what the resident mesh held.
-    """
-    import numpy as np
-
-    out: F32 = pose.rotate_local(xyz[index]).astype(np.float32)
-    return out
-
-
-def _spool_block(spool: Any, corners: Any, vertex_tile: Any, dtype: Any) -> None:
+def _spool_block(spool: Any, corners: Any, tiles: Any, dtype: Any) -> None:
     """File one merge block's triangles under each distinct corner tile.
 
     Ordered by `(triangle, corner)` before being handed over, and the spool sorts
@@ -297,7 +359,6 @@ def _spool_block(spool: Any, corners: Any, vertex_tile: Any, dtype: Any) -> None
     count = int(corners.shape[0])
     if count == 0:
         return
-    tiles = vertex_tile[corners]
     record = np.empty(count, dtype)
     for column, name in enumerate(("v0", "v1", "v2")):
         record[name] = corners[:, column]
@@ -317,11 +378,12 @@ def _spool_block(spool: Any, corners: Any, vertex_tile: Any, dtype: Any) -> None
 
 def _finalise_tiles(
     spool: Any,
-    retained: StructuredScan,
-    keep_idx: I64,
-    vertex_tile: Any,
-    grid: TileGrid,
+    vertices_for: Any,
+    pose: ScanPose,
+    grid: Partition,
     root: Path,
+    *,
+    has_rgb: bool,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """Assemble, write, digest and release one tile at a time."""
     from .tile_assemble import assemble_tile
@@ -341,10 +403,11 @@ def _finalise_tiles(
         )
         if tile_id == largest:
             arm_top_allocations("assemble_peak_largest_tile")
+        vertices = vertices_for(tile_id, records)
         payload, join = assemble_tile(
-            tile_id, records, retained, keep_idx, vertex_tile, grid
+            tile_id, records, vertices, pose, grid, has_rgb=has_rgb
         )
-        del records
+        del records, vertices
         if payload is None or join is None:
             spool.remove(tile_id)
             continue

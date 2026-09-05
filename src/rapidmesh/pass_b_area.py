@@ -162,8 +162,32 @@ def _block_indices(block: Any, cells: I64) -> I64:
     return out
 
 
+def _block_cells(block: Any) -> I64:
+    """A block's corner **cell ids**, in the winding Pass A produced.
+
+    `pass_b_area._block_indices` without its `searchsorted`: the stored rotation
+    is undone for the same reason recorded there, and the result is cell ids
+    rather than positions in a station-wide array — because there is no longer
+    such an array to be a position in.
+    """
+    import numpy as np
+
+    triple = np.stack([block["c0"], block["c1"], block["c2"]], axis=1)
+    rot = block["rot"].astype(np.int64)
+    rows = np.arange(triple.shape[0])
+    out: I64 = np.stack([triple[rows, (j - rot) % 3] for j in range(3)], axis=1)
+    return out
+
+
 def _block_areas(indices: I64, xyz: Any) -> F64:
-    """`cull_islands`' own float32 expression, widened for accumulation only."""
+    """`cull_islands`' own float32 expression, widened for accumulation only.
+
+    **No longer on the production path** (WP-B, DEC-022): Pass A computes this
+    value once, on the band's own positions, and the `tri` record carries it.
+    Kept because it is the *reference* the carried field is proved against —
+    `tests/test_vertex_store.py` compares the two as raw uint32 bits — and
+    because deleting the expression would leave nothing to compare to.
+    """
     import numpy as np
 
     corners = xyz[indices]
@@ -174,19 +198,24 @@ def _block_areas(indices: I64, xyz: Any) -> F64:
     return widened
 
 
-def stream_component_areas(
-    runs: RunSet, cells: I64, xyz: Any
-) -> StreamedAreaAccumulator:
+def stream_component_areas(runs: RunSet) -> StreamedAreaAccumulator:
     """Phase one: accumulate per-component area without holding the station.
 
     One block of triangles is resident at a time. What survives the pass is one
     entry per component, not one per triangle — the reduction the whole
     external merge exists to make affordable.
+
+    **WP-B / DEC-022.** The block carries its own float32 areas, so this pass no
+    longer takes the station's positions or the cell index at all. It is widened
+    to float64 here for exactly the reason `_block_areas` widened: the summands
+    are float32 values and the *accumulation* is float64, which is what the
+    component totals have always been.
     """
+    import numpy as np
+
     accumulator = StreamedAreaAccumulator.empty()
     for block in merge_runs(runs):
-        indices = _block_indices(block, cells)
-        accumulator.add_block(block["root"], _block_areas(indices, xyz))
+        accumulator.add_block(block["root"], block["area"].astype(np.float64))
     return accumulator
 
 
@@ -216,7 +245,7 @@ def _flagged_counts(runs: RunSet, wanted: I64) -> dict[int, int]:
 
 
 def exact_component_areas(
-    runs: RunSet, cells: I64, xyz: Any, roots: set[int],
+    runs: RunSet, roots: set[int],
     counts: Mapping[int, int] | None = None,
 ) -> dict[int, float]:
     """`math.fsum` for components the streamed total cannot vouch for.
@@ -255,7 +284,9 @@ def exact_component_areas(
         if not bool(hit.any()):
             continue
         chosen = block[hit]
-        areas = _block_areas(_block_indices(chosen, cells), xyz)
+        # DEC-022: the same float32 summands, in the same merge order, through
+        # the same `math.fsum` — read from the record instead of recomputed.
+        areas = chosen["area"].astype(np.float64)
         block_roots = chosen["root"]
         # One slice assignment per root per block, so no CPython object is made
         # per triangle. `merge_runs` is sorted by `root` first, so in practice

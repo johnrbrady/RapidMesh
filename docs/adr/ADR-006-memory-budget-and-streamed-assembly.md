@@ -6,6 +6,10 @@
 earlier the same day. That target was derived from the range-image working set
 and never carried through to the output mesh. It is not physically achievable
 as stated.
+**Amended:** 5 September 2026 (DEC-021, WP-A) — Decision 2a is scoped to the
+decimated **output** tiers. It never described the full-resolution intermediate
+Pass B writes while converting, and read as though it did, it was wrong about
+memory. The amendment is inside Decision 2a; nothing else in this ADR changes.
 
 ---
 
@@ -105,6 +109,43 @@ Consequences:
 
 ## Decision 2a — Tile boundary strategy
 
+> ### Amendment — 5 September 2026 (DEC-021, WP-A)
+>
+> **This decision is about decimated output tiles (Phase 3b/4). It does not
+> describe the full-resolution intermediate that Pass B writes while converting,
+> and that intermediate is no longer partitioned in metres at all.**
+>
+> The reading removed is *"smaller tiles → lower peak working memory"*, in the
+> three-way tension below. For a metric partition of a terrestrial range image
+> that is false, and it was measured false before it was amended:
+>
+> | station | range | metric tiles at 4 m | largest tile |
+> |:--|:--|--:|--:|
+> | ordinal 20 | close | **5** | 9,341,715 vertices |
+> | ordinal 3 | long | **364** | comparable point count |
+>
+> Sample density on a range image goes as 1/r², so a fixed square of floor holds
+> a variable and unbounded number of samples. Choosing a smaller metre count
+> does not repair this: it moves the pathology to a different range and
+> multiplies tile count on the far stations. **A metric cell size is not a bound
+> on anything, and WP-10m through WP-11m.t spent four packages reducing the cost
+> of assembling one tile while the thing that decides a tile's size stayed
+> unbounded.**
+>
+> DEC-021 therefore defines the **intermediate** partition on the native
+> structured lattice: a tile is a window of `W × H` lattice cells, a vertex
+> belongs to the window holding its own cell, and a window owns at most `W × H`
+> vertices **by construction** rather than by measurement. The default is
+> 512 × 512 = 262,144 owned, 514 × 514 = 264,196 resident with the 1-cell halo.
+>
+> **What is unchanged.** Every rule in the table below still holds for the
+> intermediate — the halo, the locked boundary ring, deterministic ownership,
+> and seam-local QA. Window ids are row-major, which is the total order the
+> ownership rule requires; the table's "(x, y, z) of the tile origin" was always
+> given as *an example* of such an order, not as the order. The tile-size
+> benchmark below remains live for the output tiers, where the tension it
+> describes is real, because there a tile is a thing a viewer loads.
+
 Independent per-tile decimation creates cracks, T-junctions and inconsistent
 LOD transitions where tiles meet. The strategy is explicit:
 
@@ -122,7 +163,9 @@ LOD transitions where tiles meet. The strategy is explicit:
 lattice of full-resolution seams running through the surface, which eats
 directly into the size budget that decimation exists to serve.
 
-That produces a three-way tension:
+That produces a three-way tension **for output tiers** (see the amendment
+above — the first bullet does not hold for a metric partition of the
+full-resolution intermediate, which is why the intermediate no longer has one):
 
 - **smaller tiles** → lower peak working memory, but more locked-boundary
   vertices and a larger share of undecimated geometry;
@@ -132,11 +175,15 @@ That produces a three-way tension:
 - **streaming granularity** → smaller tiles give finer view-dependent loading
   and faster first paint; larger tiles give fewer requests.
 
-**Tile size is therefore a measured parameter, not a chosen constant.**
+**Tile size is therefore a measured parameter, not a chosen constant** — for
+the decimated output tiers. The intermediate partition is not metric and is not
+benchmarked for size: its window is a recorded setting whose bound is
+arithmetic (DEC-021).
 
 ### Phase 3b tile-size benchmark
 
-Run across a range of tile sizes on the largest real station and record:
+Unchanged, and still required — for **output** tiers. Run across a range of tile
+sizes on the largest real station and record:
 
 - peak working memory
 - total output size

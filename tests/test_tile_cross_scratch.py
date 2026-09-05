@@ -153,6 +153,10 @@ def test_the_written_tiles_are_unchanged(tmp_path: pathlib.Path) -> None:
     result = mesh_station_streamed(
         station.scan, band_rows=16, chunk_points=5_000, halo=3,
         measure=False, out_dir=str(out), tile_size=tile_size,
+        # Metric on purpose: these are pre-WP-11m.t bits (see the header). The
+        # cut under test is in `_accumulate_normals` and is partition-blind, so
+        # holding the partition fixed keeps the comparison to the old code exact.
+        partition="metric",
     )
     assert result.tiles is not None
     gen = out / "generations" / "00000000" / "tile"

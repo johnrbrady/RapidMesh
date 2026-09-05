@@ -32,8 +32,13 @@ from rapidmesh.tile_io import read_tile
 
 # Phases the tile build must report when asked. `normals_peak` is the one that
 # matters: it is the only point at which `fn` and `acc` are both live.
+#: WP-B renamed the first of these. `assign` recorded the station-scale arrays
+#: the spool phase built — `cells`, `keep_idx`, `remap`, `vertex_tile` — and
+#: none of them exists any more, so recording their sizes would be recording
+#: zeroes. `vertices_spooled` is the phase that replaced it: the one pass over
+#: `pos` that fills the per-tile vertex spools.
 EXPECTED_PHASES = {
-    "assign", "spooled", "tile_records", "assemble_arrays",
+    "vertices_spooled", "spooled", "tile_records", "assemble_arrays",
     "normals_peak", "finalised",
 }
 

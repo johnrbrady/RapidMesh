@@ -55,6 +55,16 @@ FLAGGED_TRIANGLES = 4
 
 
 def _runs(work: pathlib.Path) -> Any:
+    """The four triangles as run records, carrying their DEC-022 areas.
+
+    The area column is filled with `_block_areas` over `CELLS`/`XYZ` — the same
+    float32 values Pass A now computes and writes into the `tri` segment, and
+    the same ones this fixture used to make the reduction compute for itself. So
+    `GOLDEN_BITS` below still pins the identical sum: what moved is where the
+    summands come from, not what they are.
+    """
+    from rapidmesh.pass_b_area import _block_areas
+
     dtype = np.dtype(TRIANGLE_RUN_FIELDS)
     record = np.empty(len(TRIPLES), dtype)
     record["root"] = FLAGGED_ROOT
@@ -63,6 +73,10 @@ def _runs(work: pathlib.Path) -> Any:
         record["c0"][index] = c0
         record["c1"][index] = c1
         record["c2"][index] = c2
+    triple = np.array(TRIPLES, np.int64)
+    record["area"] = _block_areas(
+        np.searchsorted(CELLS, triple).astype(np.int64), XYZ
+    ).astype(np.float32)
     return write_runs([record], work, "tri", TRIANGLE_RUN_KEY)
 
 
@@ -75,7 +89,7 @@ def test_the_fixture_actually_trips_the_exactness_condition(
     that failed to trip the condition would make the buffer tests vacuous
     without failing.
     """
-    accumulator = stream_component_areas(_runs(tmp_path), CELLS, XYZ)
+    accumulator = stream_component_areas(_runs(tmp_path))
     ratios = accumulator.ratios()
     assert ratios[FLAGGED_ROOT] > EXACTNESS_RATIO_LIMIT * BOUNDARY_SAFETY
     assert accumulator.needs_exact() == {FLAGGED_ROOT}
@@ -100,8 +114,8 @@ def _fsum_arguments(
 
     monkeypatch.setattr(math, "fsum", spy)
     runs = _runs(tmp_path)
-    accumulator = stream_component_areas(runs, CELLS, XYZ)
-    exact_component_areas(runs, CELLS, XYZ, accumulator.needs_exact())
+    accumulator = stream_component_areas(runs)
+    exact_component_areas(runs, accumulator.needs_exact())
     return seen
 
 
@@ -157,7 +171,7 @@ def test_a_wrong_size_is_refused_rather_than_summed(
     runs = _runs(tmp_path)
     with pytest.raises(ValueError, match="were counted"):
         exact_component_areas(
-            runs, CELLS, XYZ, {FLAGGED_ROOT},
+            runs, {FLAGGED_ROOT},
             counts={FLAGGED_ROOT: FLAGGED_TRIANGLES + 1},
         )
 
@@ -174,8 +188,8 @@ def test_the_fsum_value_is_bitwise_what_the_list_path_produced(
     would be the wrong instrument.
     """
     runs = _runs(tmp_path)
-    accumulator = stream_component_areas(runs, CELLS, XYZ)
-    exact = exact_component_areas(runs, CELLS, XYZ, accumulator.needs_exact())
+    accumulator = stream_component_areas(runs)
+    exact = exact_component_areas(runs, accumulator.needs_exact())
 
     assert set(exact) == {FLAGGED_ROOT}
     value = exact[FLAGGED_ROOT]
@@ -192,4 +206,4 @@ def test_nothing_flagged_still_returns_the_empty_dict(
     It must not start allocating, and it must not start a counting pass over
     the merge for an empty root set.
     """
-    assert exact_component_areas(_runs(tmp_path), CELLS, XYZ, set()) == {}
+    assert exact_component_areas(_runs(tmp_path), set()) == {}

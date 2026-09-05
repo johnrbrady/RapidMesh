@@ -62,6 +62,13 @@ def _run(station: synthetic.SyntheticScan, out: pathlib.Path) -> Any:
     return mesh_station_streamed(
         station.scan, band_rows=16, chunk_points=5_000, halo=3,
         measure=False, out_dir=str(out), tile_size=2.0,
+        # Pinned to the metric partition **on purpose**. These digests were
+        # recorded from code that no longer exists, and that chain is the whole
+        # evidence value of this test — regenerating them under WP-A's lattice
+        # partition would silently reset the baseline to "whatever it does now".
+        # DEC-021 moved production to lattice windows; it did not licence
+        # throwing away the record of what the old assembler emitted.
+        partition="metric",
     )
 
 

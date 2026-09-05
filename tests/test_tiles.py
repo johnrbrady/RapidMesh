@@ -15,9 +15,11 @@ same way `test_pass_b_bound.py`'s pair does:
   canonical oriented triangle multiset;
 * nothing in the tiled path may materialise a whole-station vertex array and a
   whole-station triangle array at once, and no `MeshData` for the station at all;
-* the tile-independent outputs must not depend on the tile size, because ADR-006
-  Decision 2a makes tile size a **measured parameter** and anything that moved
-  with it would be a number with no fixed meaning.
+* the tile-independent outputs must not depend on **how the station was cut** —
+  neither the partition kind nor its parameter. ADR-006 Decision 2a made tile
+  size a measured parameter and WP-A (DEC-021) made the production partition a
+  lattice window instead; both are settings, so anything that moved with either
+  would be a number with no fixed meaning.
 
 Equality is `np.array_equal`, never `np.allclose`. Ownership rules are asserted
 as counts rather than described: ADR-006 2a calls deterministic ownership a
@@ -55,6 +57,13 @@ TOOLS = str(pathlib.Path(__file__).resolve().parent.parent / "tools")
 # the whole streamed pipeline rather than QA against a mesh loaded from disk.
 LADDER = ((120, 480), (240, 960), (400, 1600))
 GATE_TILE_SIZE = 4.0
+#: Windows for the fixtures below. The production default is 512 x 512, which
+#: swallows every fixture in this file whole — a 48 x 192 lattice is one window —
+#: and a one-tile generation cannot exercise ownership, the boundary ring, or
+#: reassembly across a seam. These are deliberately small so the multi-tile
+#: properties are still tested; DEC-021's bound does not depend on the size.
+FIXTURE_WINDOW = (16, 64)      # 48 x 192  -> 3 x 3 = 9 windows
+LADDER_WINDOW = (64, 128)      # 120x480 -> 8, 240x960 -> 32, 400x1600 -> 91
 
 # WP-3.3: QA's peak above the tile working set.
 QA_MARGINAL_GATE_BYTES = 128_000_000
@@ -80,11 +89,14 @@ def _tiled(
     tile_size: float = 2.0,
     band_rows: int = 16,
     measure: bool = True,
+    partition: str = "lattice",
+    window: tuple[int, int] | None = FIXTURE_WINDOW,
 ) -> Any:
     return mesh_station_streamed(
         station.scan, band_rows=band_rows, chunk_points=5_000, halo=3,
         measure=measure, measure_samples=20_000,
         out_dir=str(out), tile_size=tile_size,
+        partition=partition, window=window,
     )
 
 
@@ -288,19 +300,33 @@ def test_two_runs_produce_identical_tiles(
     assert left == right
 
 
-@pytest.mark.parametrize("tile_size", (1.5, 3.0, 6.0))
-def test_tile_independent_outputs_do_not_move_with_tile_size(
-    station: synthetic.SyntheticScan, resident: Any, tile_size: float,
-    tmp_path: pathlib.Path,
+@pytest.mark.parametrize(
+    ("partition", "tile_size", "window"),
+    (
+        ("metric", 1.5, None), ("metric", 3.0, None), ("metric", 6.0, None),
+        ("lattice", 2.0, (16, 64)), ("lattice", 2.0, (32, 32)),
+        ("lattice", 2.0, (512, 512)),
+    ),
+)
+def test_tile_independent_outputs_do_not_move_with_the_partition(
+    station: synthetic.SyntheticScan, resident: Any, partition: str,
+    tile_size: float, window: tuple[int, int] | None, tmp_path: pathlib.Path,
 ) -> None:
-    """The tile parameter may change the tiling and nothing else.
+    """How the station is cut may change the tiling and nothing else.
 
-    ADR-006 2a makes tile size a measured parameter, which is only meaningful if
-    varying it cannot move an output. Three sizes, spanning a factor of four, all
-    reassembling to the same mesh and reporting the same ledger and the same two
-    QA figures.
+    Both partitions are settings, so varying either is only meaningful if it
+    cannot move an output. Six cuts across **two different partition kinds** —
+    metric sizes spanning a factor of four, and lattice windows from 9 tiles down
+    to the degenerate single window — all reassembling to the same mesh and
+    reporting the same ledger and the same two QA figures.
+
+    This is the load-bearing test for WP-A: it is what makes the lattice
+    partition a memory change rather than a geometry change. The mesh is decided
+    by the filters and the triangulator; a partition only decides which file each
+    finished triangle is written to.
     """
-    tiled = _tiled(station, tmp_path / "out", tile_size=tile_size)
+    tiled = _tiled(station, tmp_path / "out", tile_size=tile_size,
+                   partition=partition, window=window)
     rebuilt = reconstitute_mesh(tiled.tiles)
     assert np.array_equal(rebuilt.vertices, resident.mesh.vertices)
     assert np.array_equal(rebuilt.normals, resident.mesh.normals)
@@ -309,14 +335,22 @@ def test_tile_independent_outputs_do_not_move_with_tile_size(
     assert tiled.stats == resident.stats
 
 
-def test_the_tile_size_actually_changes_the_tiling(
+def test_the_cut_actually_changes_the_tiling(
     station: synthetic.SyntheticScan, tmp_path: pathlib.Path
 ) -> None:
-    """Guard on the guard above: invariance across sizes that produced the same
-    tiling would be invariance across nothing."""
-    small = _tiled(station, tmp_path / "s", tile_size=1.5, measure=False).tiles
-    large = _tiled(station, tmp_path / "l", tile_size=6.0, measure=False).tiles
+    """Guard on the guard above: invariance across cuts that produced the same
+    tiling would be invariance across nothing. Asserted for **both** kinds, so
+    neither arm of the test above can quietly become a no-op."""
+    small = _tiled(station, tmp_path / "s", tile_size=1.5, measure=False,
+                   partition="metric").tiles
+    large = _tiled(station, tmp_path / "l", tile_size=6.0, measure=False,
+                   partition="metric").tiles
     assert len(small.tile_ids) > len(large.tile_ids)
+
+    fine = _tiled(station, tmp_path / "f", measure=False, window=(16, 64)).tiles
+    coarse = _tiled(station, tmp_path / "c", measure=False,
+                    window=(512, 512)).tiles
+    assert len(fine.tile_ids) > len(coarse.tile_ids) == 1
 
 
 # ---------------------------------------------------------------------------
@@ -437,12 +471,14 @@ def ladder(tmp_path_factory: pytest.TempPathFactory) -> list[dict[str, Any]]:
         quiet = measure_in_child(
             "measure_peak_memory", "tiled_station",
             {"fixture": fixture, "band_rows": 64, "tile_size": GATE_TILE_SIZE,
+             "window": list(LADDER_WINDOW),
              "measure": False},
             label=f"tiles {lattice_rows}x{cols}", sys_path=[TOOLS], timeout=1800.0,
         )
         run = measure_in_child(
             "measure_peak_memory", "tiled_station",
             {"fixture": fixture, "band_rows": 64, "tile_size": GATE_TILE_SIZE,
+             "window": list(LADDER_WINDOW),
              "measure": True},
             label=f"tiled {lattice_rows}x{cols}", sys_path=[TOOLS], timeout=1800.0,
         )

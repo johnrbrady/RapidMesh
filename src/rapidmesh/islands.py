@@ -231,6 +231,28 @@ def pass_a_sweep(
     )
 
 
+def _triangle_areas(xyz: F32, tris: I64) -> F32:
+    """Per-triangle float32 area, `pass_b_area._block_areas`' own expression.
+
+    DEC-022. Deliberately duplicated rather than imported: `_block_areas` widens
+    to float64 for accumulation, and what the `tri` record must carry is the
+    float32 value *before* that widening. Writing the expression out here keeps
+    the two visibly the same term rather than coupling Pass A to Pass B's
+    accumulator, and `tests/test_vertex_store.py` compares the two as raw
+    uint32 bits so the duplication cannot drift silently.
+    """
+    import numpy as np
+
+    if tris.shape[0] == 0:
+        return np.empty(0, np.float32)
+    corners = xyz[tris]
+    area = 0.5 * np.linalg.norm(
+        np.cross(corners[:, 1] - corners[:, 0], corners[:, 2] - corners[:, 0]), axis=1
+    )
+    out: F32 = area.astype(np.float32)
+    return out
+
+
 def pass_a_sweep_bands(
     metadata: StationMetadata,
     bands: Iterable[BandFilterResult],
@@ -290,6 +312,7 @@ def pass_a_sweep_bands(
 
         tris = np.empty((0, 3), np.int64)
         cells = np.empty(0, np.int64)
+        areas = np.empty(0, np.float32)
         local = combined
         if len(combined):
             band_grid = ScanGrid.build(combined)
@@ -301,6 +324,14 @@ def pass_a_sweep_bands(
                 band_grid, b0, min(b1 + 1, rows), wrap=wrap, step=step,
                 tan_limit=tan_limit, noise_floor=noise_floor, min_quality=min_quality,
             )
+            # DEC-022. Computed here and nowhere else: these are the band's own
+            # float32 positions in the winding `band_triangle_indices` just
+            # produced, which is the winding `_block_areas` used to see after
+            # `_block_indices` undid the merge's canonical rotation. Computing
+            # it before canonicalisation is the whole point — `cross(B-A, C-A)`
+            # and `cross(C-B, A-B)` round differently, and one ULP of drift here
+            # would move a component total and could move a cull decision.
+            areas = _triangle_areas(local.xyz, tris)
 
         comp_of_triangle, new_frontier = _label_band(
             table, tris, cells, local=local,
@@ -317,7 +348,8 @@ def pass_a_sweep_bands(
             write_band_segments(
                 work_dir, core_row_start=b0, core_row_stop=b1, cols=cols,
                 tri_cells=cells[tris] if tris.shape[0] else np.empty((0, 3), np.int64),
-                tri_components=comp_of_triangle, owned=band.retained,
+                tri_components=comp_of_triangle, tri_areas=areas,
+                owned=band.retained,
                 dropped_despeckle=band.dropped_despeckle,
                 dropped_mover_carve=band.dropped_mover_carve,
                 restored_from_carve=band.restored_from_carve,

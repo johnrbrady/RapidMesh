@@ -343,6 +343,8 @@ def tiled_station(
     tile_size: float = 4.0,
     measure: bool = False,
     out: str = "",
+    partition: str = "lattice",
+    window: list[int] | None = None,
 ) -> dict[str, Any]:
     """`mesh_station_streamed` writing an incremental spatial generation.
 
@@ -364,6 +366,8 @@ def tiled_station(
         result = mesh_station_streamed(
             scan, band_rows=band_rows, chunk_points=250_000, halo=3,
             measure=measure, out_dir=str(root), tile_size=tile_size,
+            partition=partition,
+            window=None if window is None else (int(window[0]), int(window[1])),
         )
         diagnostics = result.diagnostics
         store = result.tiles
@@ -373,6 +377,8 @@ def tiled_station(
             "triangles": 0 if store is None else store.triangle_count,
             "tiles": 0 if store is None else len(store.tile_ids),
             "tile_size": tile_size,
+            "partition": partition,
+            "window": None if window is None else [int(window[0]), int(window[1])],
             "tile_bytes": 0 if diagnostics is None else diagnostics.tile_bytes,
             "segment_bytes": 0 if diagnostics is None else diagnostics.segment_bytes,
             "resident_mesh": result.mesh is not None,

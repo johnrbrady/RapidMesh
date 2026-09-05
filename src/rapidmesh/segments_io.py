@@ -57,7 +57,10 @@ if TYPE_CHECKING:
     I64 = npt.NDArray[np.int64]
 
 SEGMENT_MAGIC = b"RMSEG_V0"
-SEGMENT_CONTRACT_VERSION = 0
+#: v1 (WP-B, DEC-022): the `tri` record gained a 4-byte f32 `area`. A v0 segment
+#: fails the dtype/length check rather than being read short; segments are
+#: scratch under `work_dir`, so none outlives the Pass A that wrote it.
+SEGMENT_CONTRACT_VERSION = 1
 
 KIND_TRI = 1
 KIND_POS = 2
@@ -76,7 +79,13 @@ _HEADER = struct.Struct("<8sIHHIQQ32s")
 # ask for an arbitrary allocation.
 MAX_RECORDS = 1 << 32
 
-_TRI_FIELDS = [("cell0", "<i8"), ("cell1", "<i8"), ("cell2", "<i8"), ("component", "<i8")]
+_TRI_FIELDS = [
+    ("cell0", "<i8"), ("cell1", "<i8"), ("cell2", "<i8"), ("component", "<i8"),
+    # DEC-022. The triangle's own float32 area, from Pass A on the band's
+    # positions in the winding it produced, so Pass B never rematerialises
+    # positions. f32: the reference's own summand, not a widened recomputation.
+    ("area", "<f4"),
+]
 _POS_FIELDS = [
     ("cell", "<i8"), ("sample_id", "<i8"),
     ("x", "<f4"), ("y", "<f4"), ("z", "<f4"), ("rng", "<f4"),
@@ -185,6 +194,7 @@ def write_band_segments(
     core_row_stop: int,
     tri_cells: I64,
     tri_components: I64,
+    tri_areas: Any,
     owned: StructuredScan,
     cols: int,
     dropped_despeckle: int,
@@ -203,6 +213,7 @@ def write_band_segments(
             tri_cells[:, 0], tri_cells[:, 1], tri_cells[:, 2]
         )
         tri["component"] = tri_components
+        tri["area"] = tri_areas
     tri_path = _write_records(root / f"{stem}.rmseg.tri", KIND_TRI, tri)
 
     n = len(owned)
@@ -242,15 +253,23 @@ def write_band_segments(
     )
 
 
-def read_tri_segment(path: Path) -> tuple[I64, I64]:
-    """`(T,3)` stable-id triples and the `(T,)` provisional component ids."""
+def read_tri_segment(path: Path) -> tuple[I64, I64, Any]:
+    """`(T,3)` triples, provisional component ids, and **unwidened** f32 areas.
+
+    DEC-022: the float32 value Pass A computed, widened once by the reduction
+    exactly as `_block_areas` did.
+    """
     import numpy as np
 
     records, _ = _read_records(path, KIND_TRI)
     cells = np.stack(
         [records["cell0"], records["cell1"], records["cell2"]], axis=1
     ).astype(np.int64)
-    return cells, records["component"].astype(np.int64)
+    return (
+        cells,
+        records["component"].astype(np.int64),
+        np.asarray(records["area"], np.float32),
+    )
 
 
 def read_pos_segment(path: Path) -> dict[str, Any]:
@@ -468,7 +487,7 @@ def read_triangles_and_final_roots(
     provisional = np.empty(total, np.int64)
     at = 0
     for seg in segments:
-        band_cells, band_ids = read_tri_segment(seg.tri_path)
+        band_cells, band_ids, _ = read_tri_segment(seg.tri_path)
         n = band_cells.shape[0]
         cells[at : at + n] = band_cells
         provisional[at : at + n] = band_ids

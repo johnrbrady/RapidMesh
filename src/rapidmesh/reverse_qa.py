@@ -128,9 +128,9 @@ class ReverseQAEvidence:
 
 def mesh_to_source_report_v2(
     mesh: MeshData | Any,
-    source_points: F32,
+    source_points: Any,
     *,
-    source_rows: I32,
+    source_rows: I32 | None = None,
     qa_window_rows: int | None = DEFAULT_QA_WINDOW_ROWS,
     max_samples: int = 500_000,
     seed: int = 0,
@@ -159,9 +159,9 @@ def mesh_to_source_report_v2(
 
 def run_reverse_qa(
     mesh: MeshData | Any,
-    source_points: F32,
+    source_points: Any,
     *,
-    source_rows: I32,
+    source_rows: I32 | None = None,
     qa_window_rows: int | None = DEFAULT_QA_WINDOW_ROWS,
     max_samples: int = 500_000,
     seed: int = 0,
@@ -178,11 +178,12 @@ def run_reverse_qa(
     """
     import numpy as np
 
+    from .qa import point_count
     from .qa_stream import as_source
 
     if (
         mesh.triangle_count == 0
-        or source_points.shape[0] == 0
+        or point_count(source_points) == 0
         or max_samples <= 0
         or (isinstance(mesh, MeshData) and mesh.source_sample_id is None)
     ):
@@ -211,11 +212,21 @@ def run_reverse_qa(
         corners, triples, vertex_index = select_and_gather(runs, targets)
 
     samples = _interior_points(corners, triples, seed)
-    rows = np.asarray(source_rows, dtype=np.int64)
-    tri_rows = rows[vertex_index]
+    # WP-C. Only the selected triangles' corner rows are needed — at most
+    # `3 x max_samples` — so the store is asked rather than a station-wide
+    # `rows` array being built to be indexed three times.
+    store = source_points if hasattr(source_points, "row_range") else None
+    if store is None:
+        rows = np.asarray(source_rows, dtype=np.int64)
+        tri_rows = rows[vertex_index]
+        points64 = np.asarray(source_points, np.float64)
+    else:
+        rows = None
+        tri_rows = store.rows_at(vertex_index)
+        points64 = None
     distances, unmatched, windows, largest = _windowed_distances(
-        samples, np.asarray(source_points, np.float64), rows,
-        tri_rows.min(axis=1), tri_rows.max(axis=1), qa_window_rows,
+        samples, points64, rows,
+        tri_rows.min(axis=1), tri_rows.max(axis=1), qa_window_rows, store=store,
     )
     return distances, ReverseQAEvidence(
         metric_version=REVERSE_QA_VERSION,
@@ -285,11 +296,13 @@ def _interior_points(corners: F64, triples: I64, seed: int) -> F64:
 
 def _windowed_distances(
     samples: F64,
-    source_points: F64,
-    source_rows: I64,
+    source_points: F64 | None,
+    source_rows: I64 | None,
     lo_rows: I64,
     hi_rows: I64,
     qa_window_rows: int | None,
+    *,
+    store: Any = None,
 ) -> tuple[F64, int, int, int]:
     """Nearest retained observation within each sample's own row window.
 
@@ -302,78 +315,63 @@ def _windowed_distances(
     import numpy as np
     from scipy.spatial import cKDTree
 
+    # Bound once so neither branch carries an optional: the array path is what
+    # `calibrate_window` and the resident tests use, the store path is
+    # production. The unused placeholders cost three empty arrays.
+    if store is None:
+        if source_points is None or source_rows is None:
+            raise ValueError(
+                "the array path needs both source_points and source_rows"
+            )
+        points_array = np.asarray(source_points, np.float64)
+        row_order = np.argsort(source_rows, kind="stable")
+        sorted_rows = source_rows[row_order]
+    else:
+        points_array = np.empty((0, 3), np.float64)
+        row_order = np.empty(0, np.int64)
+        sorted_rows = np.empty(0, np.int64)
+
     if qa_window_rows is None:
-        tree = cKDTree(source_points)
+        # The unbounded control: `calibrate_window` only, never production. It
+        # is station-scale by definition — that is what it controls against —
+        # so the store path reads the whole thing rather than pretend.
+        all_points = (
+            points_array if store is None else store.positions(0, store.count)
+        )
+        tree = cKDTree(all_points)
         distances, _ = tree.query(samples, k=1, workers=1)
-        return np.asarray(distances, np.float64), 0, 1, int(source_points.shape[0])
+        return np.asarray(distances, np.float64), 0, 1, int(all_points.shape[0])
 
     out = np.full(samples.shape[0], np.nan, np.float64)
     keys = np.stack([lo_rows, hi_rows], axis=1)
     unique, inverse = np.unique(keys, axis=0, return_inverse=True)
-    order = np.argsort(source_rows, kind="stable")
-    sorted_rows = source_rows[order]
     largest = 0
     for group in range(unique.shape[0]):
         members = np.nonzero(inverse == group)[0]
         lo = int(unique[group, 0]) - qa_window_rows
         hi = int(unique[group, 1]) + qa_window_rows
-        start, stop = np.searchsorted(sorted_rows, [lo, hi + 1])
+        # WP-C. Ascending cell order makes `row` non-decreasing, so `argsort`
+        # is the identity and this window is a contiguous slice: the same
+        # points in the same order, hence bitwise-equal distances.
+        if store is None:
+            found = np.searchsorted(sorted_rows, [lo, hi + 1])
+            start, stop = int(found[0]), int(found[1])
+        else:
+            start, stop = store.row_range(lo, hi)
         if stop <= start:
             continue                      # no retained observation in the window
-        candidates = order[start:stop]
-        largest = max(largest, int(candidates.size))
-        tree = cKDTree(source_points[candidates])
+        window_points = (
+            points_array[row_order[start:stop]]
+            if store is None
+            else store.positions(start, stop)
+        )
+        largest = max(largest, int(window_points.shape[0]))
+        tree = cKDTree(window_points)
         distances, _ = tree.query(samples[members], k=1, workers=1)
         out[members] = distances
 
     matched = np.isfinite(out)
     return out[matched], int((~matched).sum()), int(unique.shape[0]), largest
-
-
-def calibrate_window(
-    mesh: MeshData | Any,
-    source_points: F32,
-    *,
-    source_rows: I32,
-    qa_window_rows: int = DEFAULT_QA_WINDOW_ROWS,
-    max_samples: int = 500_000,
-    seed: int = 0,
-) -> dict[str, float]:
-    """Bounded against unbounded, on the *same* samples.
-
-    Selection and interior points are deterministic functions of the mesh, so
-    the two runs measure identical points and only the candidate set differs.
-    Any disagreement is therefore attributable to the window and to nothing
-    else. **"Match" means bitwise-equal float64 distance**, not "close": a
-    window that moved an answer by a rounding step would still have moved it.
-    """
-    import numpy as np
-
-    near, evidence = run_reverse_qa(
-        mesh, source_points, source_rows=source_rows,
-        qa_window_rows=qa_window_rows, max_samples=max_samples, seed=seed,
-    )
-    far, unbounded = run_reverse_qa(
-        mesh, source_points, source_rows=source_rows,
-        qa_window_rows=None, max_samples=max_samples, seed=seed,
-    )
-    if near.size != far.size:
-        raise ValueError(
-            "bounded and unbounded runs measured different sample counts: "
-            f"{near.size} != {far.size}"
-        )
-    identical = int(np.count_nonzero(near == far))
-    difference = near - far
-    return {
-        "samples": float(near.size),
-        "identical": float(identical),
-        "identical_fraction": identical / near.size if near.size else 1.0,
-        "max_overestimate_m": float(difference.max()) if near.size else 0.0,
-        "min_difference_m": float(difference.min()) if near.size else 0.0,
-        "unmatched": float(evidence.samples_unmatched),
-        "largest_candidate_set": float(evidence.largest_window_candidates),
-        "unbounded_candidate_set": float(unbounded.largest_window_candidates),
-    }
 
 
 # ---------------------------------------------------------------------------

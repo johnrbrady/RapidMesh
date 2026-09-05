@@ -68,12 +68,16 @@ if TYPE_CHECKING:
 
 TRIANGLE_RUN_FIELDS = [
     ("root", "<i8"), ("c0", "<i8"), ("c1", "<i8"), ("c2", "<i8"), ("rot", "i1"),
+    # DEC-022. Carried, never recomputed: the merge canonicalises the triple and
+    # a rotated triple is a different float32 expression, so an area derived
+    # after the sort would not be the reference's summand. It rides along.
+    ("area", "<f4"),
 ]
 TRIANGLE_RUN_KEY = ("root", "c0", "c1", "c2")
 
 
 def build_triangle_runs(
-    segments: Sequence[Any], alias: I64, work_dir: Path
+    segments: Sequence[Any], alias: I64, work_dir: Path, *, need_cells: bool = True
 ) -> tuple[RunSet, I64]:
     """One sorted run per band segment, keyed `(root, canonical cell triple)`.
 
@@ -93,6 +97,13 @@ def build_triangle_runs(
     Also returns the sorted unique lattice cells named by any triangle. Pass B
     loads only those samples from `pos` (Round 4c): the rest of `pos` is
     retained-but-unmeshed and is counted, not materialised.
+
+    **WP-B.** `need_cells=False` skips that list entirely. On the tiled path
+    nothing indexes a station-wide array any more, so the only thing the list
+    was still doing was costing 110 MB on ordinal 20 plus the `np.unique`
+    transient Round 4e measured at 110,825,472 B — the largest single rise in
+    the pass. The lattice-cell bitset answers the same question in 1.13 bits a
+    cell, and the count it needs is `CellRank.total`.
     """
     import numpy as np
 
@@ -102,20 +113,24 @@ def build_triangle_runs(
 
     def blocks() -> Iterator[Any]:
         for segment in segments:
-            cells, provisional = read_tri_segment(segment.tri_path)
+            cells, provisional, areas = read_tri_segment(segment.tri_path)
             if cells.shape[0] == 0:
                 continue
-            unique_chunks.append(np.unique(cells))
+            if need_cells:
+                unique_chunks.append(np.unique(cells))
             pick = np.argmin(cells, axis=1)
             rows = np.arange(cells.shape[0])
             record = np.empty(cells.shape[0], dtype=np.dtype(TRIANGLE_RUN_FIELDS))
             record["root"] = alias[provisional]
             record["rot"] = pick.astype(np.int8)
+            record["area"] = areas
             for offset, name in enumerate(("c0", "c1", "c2")):
                 record[name] = cells[rows, (pick + offset) % 3]
             yield record
 
     runs = write_runs(blocks(), work_dir, "tri", TRIANGLE_RUN_KEY)
+    if not need_cells:
+        return runs, np.empty(0, np.int64)
     if not unique_chunks:
         return runs, np.empty(0, np.int64)
     # Round 4e. `np.unique(np.concatenate(chunks))` held three copies at once —
@@ -179,6 +194,7 @@ def pass_b_finalise(
     qa_window_rows: int, timings: dict[str, float], streaming: tuple[int, int, int],
     settings: dict[str, float | int | bool | str],
     out_dir: Path | None = None, tile_size: float = DEFAULT_TILE_SIZE_M,
+    tile_partition: str = "lattice", tile_window: tuple[int, int] | None = None,
     qa_workers: int = 1, qa_seed: int = 0,
 ) -> MeshResult:
     """Re-read the segments, cull on completed components, mesh and measure.
@@ -212,7 +228,8 @@ def pass_b_finalise(
     """
     import numpy as np
 
-    from .obs_store import write_store
+    from .obs_store import write_store_streamed
+    from .obs_windows import ObservationWindows
     from .pipeline import MeshResult, StreamedDiagnostics
     from .qa import deviation_report
     from .retained_io import retained_scan_for_cells
@@ -231,31 +248,44 @@ def pass_b_finalise(
     # is read here. `mesh_station_from_chunks` releases that in-memory table at
     # the handoff, because it is 30.8 MB on a 175,274-component station and is
     # otherwise still live at the moment this pass sets its peak.
+    # WP-B (ITEM-022 T1). The mesh vertex store is built **only** where something
+    # still indexes it: the resident reference path, and the metric partition,
+    # whose ownership is decided by projecting positions and so cannot be
+    # answered from the lattice. Production is the lattice partition and reaches
+    # neither, which is the whole of this package.
+    needs_station = out_dir is None or tile_partition == "metric"
     alias = read_component_alias(pass_a.component_table_path)
-    runs, mesh_cells = build_triangle_runs(pass_a.segments, alias, work_dir)
+    runs, mesh_cells = build_triangle_runs(
+        pass_a.segments, alias, work_dir, need_cells=needs_station
+    )
 
-    # Round 4c: load only triangle-named pos samples (the mesh vertex store).
     pos_samples_total = sum(seg.sample_count for seg in pass_a.segments)
-    retained = retained_scan_for_cells(scan, pass_a.segments, mesh_cells)
-    retained_unmeshed = pos_samples_total - len(retained)
-    cells = retained.row.astype(np.int64) * scan.lattice.cols + retained.col
-    if cells.size and not bool(np.all(np.diff(cells) > 0)):
-        raise ValueError("pos segments are not in strictly increasing cell order")
-    if cells.size != mesh_cells.size or (
-        cells.size and not bool(np.array_equal(cells, mesh_cells))
-    ):
-        raise ValueError("mesh vertex store does not match the triangle cell set")
+    retained: Any = None
+    cells: Any = None
+    if needs_station:
+        # Round 4c: load only triangle-named pos samples (the mesh vertex store).
+        retained = retained_scan_for_cells(scan, pass_a.segments, mesh_cells)
+        cells = retained.row.astype(np.int64) * scan.lattice.cols + retained.col
+        if cells.size and not bool(np.all(np.diff(cells) > 0)):
+            raise ValueError("pos segments are not in strictly increasing cell order")
+        if cells.size != mesh_cells.size or (
+            cells.size and not bool(np.array_equal(cells, mesh_cells))
+        ):
+            raise ValueError("mesh vertex store does not match the triangle cell set")
     # Round 6b'. The check above is the last reader: from here `cells` *is* the
     # mesh vertex store and `mesh_cells` is a second, byte-identical copy of it.
     # 16,449,288 B on ord 1, and it stayed live to function exit — including
     # through `build_tiles`, which is where this pass now peaks.
     del mesh_cells
 
-    accumulator = stream_component_areas(runs, cells, retained.xyz)
+    # DEC-022. No positions reach this reduction: every summand was computed by
+    # Pass A and travels in the run record. This is what lets the mesh vertex
+    # store stop existing — the area pass was one of its three readers.
+    accumulator = stream_component_areas(runs)
     flagged = accumulator.needs_exact()
     if flagged:
         accumulator.totals.update(
-            exact_component_areas(runs, cells, retained.xyz, flagged)
+            exact_component_areas(runs, flagged, counts=accumulator.counts)
         )
     area = accumulator.as_area_result(flagged)
     # Round 6b' (ITEM-016). `area` holds its own numpy copies, so the three
@@ -292,10 +322,18 @@ def pass_b_finalise(
     qa_source: Any = None
     observation_bytes = 0
     observation_count = 0
+    retained_unmeshed = 0
+    retained_count = 0
+    dropped_island = 0
+    offsets: Any = None
+    qa_rows: Any = None
     if out_dir is None:
         kept_tris, before, final = stream_kept_triangles(
             runs, cells, keep_root, kept_total, len(retained)
         )
+        retained_unmeshed = pos_samples_total - len(retained)
+        retained_count = int(final.sum())
+        dropped_island = int((before & ~final).sum())
         # Released before the mesh is assembled: the cell index and the run
         # buffers have no reader left, and `build_mesh` is the largest single
         # allocation in this pass. Holding them across it is how the old shape
@@ -305,24 +343,51 @@ def pass_b_finalise(
         triangles_after_cull = int(kept_tris.shape[0])
         del kept_tris
         qa_source = mesh
+        if measure:
+            offsets = retained.pose.rotate_local(
+                retained.xyz[final]
+            ).astype(np.float32)
+            qa_rows = retained.row[final]
     else:
+        from .filters import columns_wrap
+
         built = build_tiles(
-            retained, runs, cells, keep_root,
-            work_dir=out_dir, tile_size=tile_size,
+            runs, keep_root,
+            work_dir=out_dir, lattice=scan.lattice, pose=scan.pose,
+            segments=pass_a.segments,
+            has_rgb=scan.rgb is not None,
+            has_sample_id=scan.sample_id is not None,
+            wrap=columns_wrap(scan), tile_size=tile_size,
+            partition=tile_partition, window=tile_window,
+            retained=retained if tile_partition == "metric" else None,
         )
         del cells
-        before, final = built.before, built.final
+        retained_unmeshed = pos_samples_total - int(built.meshed.total)
+        retained_count = int(built.surviving.total)
+        dropped_island = int(built.meshed.total) - retained_count
         triangles_after_cull = built.triangles_written
         tiles = built.store
         # WP-1.G1b B2. Written here because this is the one moment the pipeline
         # holds the retained set and knows which of it survived the cull, and
         # because the generation directory is already open. Costs one sequential
         # write and no second read of the source.
-        observation_bytes = write_store(
-            out_dir / "generations" / "00000000" / "obs" / "observations.rmobs",
-            retained, final, retained.pose,
+        observation_path = (
+            out_dir / "generations" / "00000000" / "obs" / "observations.rmobs"
         )
-        observation_count = int(final.sum())
+        observation_bytes = write_store_streamed(
+            observation_path, pass_a.segments,
+            lattice=scan.lattice, pose=scan.pose,
+            surviving=built.surviving, meshed=built.meshed,
+            has_sample_id=scan.sample_id is not None,
+        )
+        observation_count = retained_count
+        # WP-C (ITEM-022 T4). Both QA directions are handed the *store*, not
+        # arrays read out of it. The forward draw depends only on `(n, seed)`
+        # and the reverse windows are contiguous slices of ascending cell
+        # order, so neither needs the population resident to ask its question.
+        # WP-B read them back here; that array is what this package removes.
+        if measure:
+            offsets = ObservationWindows.open(observation_path)
         # WP-3.3: both QA directions read the written generation. `TileStore` is
         # a `qa_stream.GeometrySource`, so neither direction has to know whether
         # it was handed a resident mesh or a tile store.
@@ -335,9 +400,8 @@ def pass_b_finalise(
     triangle_count = (
         triangles_after_cull if mesh is None else mesh.triangle_count
     )
-    if measure and triangle_count and qa_source is not None:
+    if measure and triangle_count and qa_source is not None and offsets is not None:
         t0 = time.perf_counter()
-        offsets = retained.pose.rotate_local(retained.xyz[final]).astype(np.float32)
         deviation = deviation_report(
             qa_source, offsets, max_samples=measure_samples,
             seed=qa_seed, workers=qa_workers,
@@ -345,7 +409,7 @@ def pass_b_finalise(
         # §4.4: both directions run here, after culling and the ledger, against
         # final dispositions only.
         reverse, reverse_evidence = mesh_to_source_report_v2(
-            qa_source, offsets, source_rows=retained.row[final],
+            qa_source, offsets, source_rows=qa_rows,
             qa_window_rows=qa_window_rows, max_samples=measure_samples,
             seed=qa_seed, work_dir=work_dir,
         )
@@ -358,11 +422,11 @@ def pass_b_finalise(
             if source_count is not None
             else len(scan) + scan.dropped_no_return + scan.dropped_other
         ),
-        retained=int(final.sum()),
+        retained=retained_count,
         dropped_no_return=scan.dropped_no_return,
         dropped_despeckle=pass_a.dropped_despeckle,
         dropped_mover_carve=pass_a.dropped_mover_carve,
-        dropped_island=int((before & ~final).sum()),
+        dropped_island=dropped_island,
         dropped_other=scan.dropped_other + retained_unmeshed,
         restored_from_carve=pass_a.restored_from_carve,
     )

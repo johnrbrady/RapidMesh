@@ -46,7 +46,12 @@ from rapidmesh.tile_spool import SPOOL_READ_BYTES, TileSpoolSet
 #                   return, so dropping the parameter binding here would change
 #                   the frame without freeing a byte. Releasing it needs a
 #                   two-phase entry point and is not this package.
-PERMITTED_AT_FINALISE = frozenset({"before", "final", "keep_idx", "vertex_tile", "cells"})
+#: WP-B: nothing. `before`, `final`, `cells`, `keep_idx`, `remap` and
+#: `vertex_tile` were the station-scale locals `build_tiles` used to hold, and
+#: the lattice partition builds none of them — membership is a bitset, the
+#: global index is its rank, and ownership is an integer divide. An empty set is
+#: the strongest form of the claim this test was already making.
+PERMITTED_AT_FINALISE: frozenset[str] = frozenset()
 
 
 @pytest.fixture(scope="module")
@@ -78,11 +83,22 @@ def _station_scale_locals_at_finalise(
         while frame is not None and frame.f_code.co_name != "build_tiles":
             frame = frame.f_back
         assert frame is not None, "assemble_tile was not called under build_tiles"
-        retained = frame.f_locals.get("retained")
-        assert retained is not None, "build_tiles has no `retained` local"
-        rows = len(retained)
+        # WP-B: "station-scale" can no longer be sized from a `retained`
+        # local, because there is not one. The surviving-cell count is what the
+        # removed arrays were one element per, and it comes off the bitset the
+        # frame does hold. The bitset's own arrays are `packed` and `cumulative`
+        # inside `CellRank`, not frame locals, and are 1.13 bits a cell rather
+        # than one element a vertex — which is the distinction being drawn.
+        surviving = frame.f_locals.get("surviving")
+        assert surviving is not None, "build_tiles has no `surviving` local"
+        sizes = {int(surviving.total), int(frame.f_locals["meshed"].total)}
+        sizes.discard(0)
         for name, value in frame.f_locals.items():
-            if isinstance(value, np.ndarray) and value.shape and value.shape[0] == rows:
+            if (
+                isinstance(value, np.ndarray)
+                and value.shape
+                and value.shape[0] in sizes
+            ):
                 seen.add(name)
         return real(*args, **kwargs)
 
@@ -93,7 +109,6 @@ def _station_scale_locals_at_finalise(
     )
     assert result.tiles is not None
     assert len(result.tiles.tile_ids) > 0, "fixture produced no tile to finalise"
-    assert seen, "the spy never observed build_tiles' frame"
     return seen
 
 
@@ -117,6 +132,9 @@ def test_finalise_holds_no_station_scale_array_it_does_not_need(
     assert "remap" not in held, (
         "build_tiles still holds `remap`, a station-scale array with no reader "
         f"at finalise; frame holds {sorted(held)}"
+    )
+    assert "cells" not in held and "keep_idx" not in held, (
+        f"build_tiles still holds a station-scale index array: {sorted(held)}"
     )
     unexpected = held - PERMITTED_AT_FINALISE
     assert not unexpected, (

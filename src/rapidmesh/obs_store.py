@@ -63,7 +63,14 @@ if TYPE_CHECKING:
     U8 = npt.NDArray[np.uint8]
 
 OBS_MAGIC = b"RMOBS_V0"
-OBS_CONTRACT_VERSION = 0
+#: v1 (WP-C, ITEM-022 T4): the payload gains a per-lattice-row offset table
+#: after the records — `rows + 1` int64s, where `offsets[r]` is the number of
+#: records with a lattice row below `r`. The store is written in ascending cell
+#: order, so rows are non-decreasing and a row window is a **contiguous slice**;
+#: this table is what makes that slice addressable without reading the station.
+#: 19 KB on the high-resolution lattice, against the 165 MB of sorted-copy and
+#: permutation arrays reverse QA used to build.
+OBS_CONTRACT_VERSION = 1
 
 # Dispositions. v0 writes only RETAINED; the rest are reserved so a later
 # version can widen the store without renumbering what is already on disk.
@@ -171,6 +178,18 @@ def build_records(
     return out
 
 
+def _row_offsets(records: Any, lattice_rows: int) -> Any:
+    """`rows + 1` int64s: how many records have a lattice row below each row."""
+    import numpy as np
+
+    per_row = np.zeros(int(lattice_rows), np.int64)
+    if records.shape[0]:
+        np.add.at(per_row, records["row"].astype(np.int64), 1)
+    offsets = np.zeros(int(lattice_rows) + 1, np.int64)
+    np.cumsum(per_row, out=offsets[1:])
+    return offsets
+
+
 def write_store(
     path: Path, retained: StructuredScan, keep: Any, pose: ScanPose
 ) -> int:
@@ -195,6 +214,11 @@ def write_store(
             int(lattice.rows), int(lattice.cols),
         ),
         np.ascontiguousarray(records).tobytes(),
+        # v1 (WP-C): the per-lattice-row offset table, after the records and
+        # inside the digest. Built the same way the streamed writer builds it —
+        # a per-row tally then a cumulative sum — because the records are in
+        # ascending cell order and that tally is already a sorted histogram.
+        np.ascontiguousarray(_row_offsets(records, int(lattice.rows))).tobytes(),
     ))
     header = _HEADER.pack(
         OBS_MAGIC, OBS_CONTRACT_VERSION, 0, _HEADER.size,
@@ -209,6 +233,192 @@ def write_store(
         os.fsync(handle.fileno())
     os.replace(tmp, path)
     return int(path.stat().st_size)
+
+
+#: Observations converted per read block. 262,144 records is 10.5 MB of store
+#: bytes, the same order as every other streaming cap in the pipeline.
+OBS_READ_BLOCK = 262_144
+
+
+def _band_records(
+    cell: Any, sample_id: Any, xyz: Any, rng: Any, keep: Any,
+    *, lattice: Any, pose: ScanPose,
+) -> Any:
+    """One band's retained observations, in the layout `build_records` produces.
+
+    Term for term the same expressions as `build_records`, on the same values —
+    the angles from the lattice rather than from the narrowed position, and the
+    projected triple from `pose.rotate_local(...)` narrowed once. What differs
+    is only where the inputs came from: a `pos` segment rather than a
+    station-wide scan.
+    """
+    import numpy as np
+
+    rows = (cell[keep] // int(lattice.cols)).astype(np.int64)
+    cols = (cell[keep] % int(lattice.cols)).astype(np.int64)
+    out = np.zeros(rows.shape[0], dtype=dtype())
+    out["sample_id"] = sample_id[keep]
+    out["row"] = rows.astype(np.int32)
+    out["col"] = cols.astype(np.int32)
+    out["range"] = np.asarray(rng, np.float32)[keep]
+    out["azimuth"] = (lattice.az0 + cols * lattice.az_step).astype(np.float32)
+    out["elevation"] = (lattice.el0 + rows * lattice.el_step).astype(np.float32)
+    project = pose.rotate_local(xyz[keep]).astype(np.float32)
+    for axis, name in enumerate(("x", "y", "z")):
+        out[name] = project[:, axis]
+    out["disposition"] = DISP_RETAINED
+    return out
+
+
+def write_store_streamed(
+    path: Path,
+    segments: Any,
+    *,
+    lattice: Any,
+    pose: ScanPose,
+    surviving: Any,
+    meshed: Any,
+    has_sample_id: bool,
+) -> int:
+    """Write the store from the `pos` segments, one band resident at a time.
+
+    **WP-B (ITEM-022 T3).** `write_store` masked every field of a station-wide
+    `retained` scan, which meant the store could only be written while that scan
+    existed. The bytes here are the same bytes in the same order — `pos` is in
+    ascending lattice-cell order and so was `retained` — and the digest is
+    computed incrementally, so nothing larger than one band plus the header is
+    ever held.
+
+    The header carries a count and a payload length that are not known until the
+    last band is written, so it is stamped as a placeholder and rewritten in
+    place at the end. That is safe here for the reason `_publish` is safe: the
+    file is a temp under the destination directory and is `os.replace`d into
+    position only once it is complete.
+    """
+    import hashlib
+    import os
+
+    import numpy as np
+
+    from .segments_io import read_pos_segment
+
+    digest = hashlib.sha256()
+    per_row = np.zeros(int(lattice.rows), np.int64)
+    fixed = _FIXED.pack(
+        *np.asarray(pose.translation, np.float64).tolist(),
+        float(lattice.az0), float(lattice.el0),
+        float(lattice.az_step), float(lattice.el_step),
+        int(lattice.rows), int(lattice.cols),
+    )
+    digest.update(fixed)
+    count = 0
+    payload_bytes = len(fixed)
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as handle:
+        handle.write(bytes(_HEADER.size))
+        handle.write(fixed)
+        for segment in segments:
+            block = read_pos_segment(segment.pos_path)
+            cell = block["cell"]
+            if cell.size == 0:
+                continue
+            keep = surviving.contains(cell)
+            if not bool(keep.any()):
+                continue
+            ids = block["sample_id"] if has_sample_id else meshed.rank(cell)
+            records = _band_records(
+                cell, ids, block["xyz"], block["rng"], keep,
+                lattice=lattice, pose=pose,
+            )
+            raw = np.ascontiguousarray(records).tobytes()
+            handle.write(raw)
+            digest.update(raw)
+            count += int(records.shape[0])
+            payload_bytes += len(raw)
+            np.add.at(per_row, records["row"].astype(np.int64), 1)
+        # The table, after the records and inside the digest. Cumulative from a
+        # per-row tally rather than from a sort: the records arrived in
+        # ascending cell order, which is ascending row order, so the tally is
+        # already the histogram of a sorted column.
+        offsets = np.zeros(int(lattice.rows) + 1, np.int64)
+        np.cumsum(per_row, out=offsets[1:])
+        table = np.ascontiguousarray(offsets).tobytes()
+        handle.write(table)
+        digest.update(table)
+        payload_bytes += len(table)
+        handle.flush()
+        handle.seek(0)
+        handle.write(_HEADER.pack(
+            OBS_MAGIC, OBS_CONTRACT_VERSION, 0, _HEADER.size,
+            count, payload_bytes, digest.digest(),
+        ))
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp, path)
+    return int(path.stat().st_size)
+
+
+def read_store_offsets(path: Path) -> tuple[Any, Any]:
+    """The projected positions and lattice rows QA needs, and nothing else.
+
+    `read_store` reads the whole file into `bytes` and then builds the record
+    array from it, which holds the store twice. Both QA directions want only
+    `x, y, z` and `row`, so this fills those two arrays from bounded reads and
+    verifies the payload digest as it goes — the check is not dropped for speed,
+    because a store that came back short would move a QA figure silently.
+    """
+    import hashlib
+
+    import numpy as np
+
+    record_dtype = dtype()
+    with open(path, "rb") as handle:
+        head = handle.read(_HEADER.size)
+        if len(head) < _HEADER.size:
+            raise ObservationStoreError(f"observation store is truncated: {path.name}")
+        magic, contract, _flags, header_bytes, count, payload_bytes, want = (
+            _HEADER.unpack(head)
+        )
+        if magic != OBS_MAGIC:
+            raise ObservationStoreError(f"not an observation store: {path.name}")
+        if contract > OBS_CONTRACT_VERSION:
+            raise ObservationStoreError(
+                f"observation store contract {contract} is newer than this reader"
+            )
+        if header_bytes != _HEADER.size or count > MAX_OBSERVATIONS:
+            raise ObservationStoreError(
+                f"store header is not self-consistent: {path.name}"
+            )
+        digest = hashlib.sha256()
+        fixed = handle.read(_FIXED.size)
+        digest.update(fixed)
+        table_bytes = (int(_FIXED.unpack(fixed)[7]) + 1) * 8
+        if payload_bytes != _FIXED.size + count * record_dtype.itemsize + table_bytes:
+            raise ObservationStoreError(f"store length fields disagree: {path.name}")
+        offsets = np.empty((int(count), 3), np.float32)
+        rows = np.empty(int(count), np.int32)
+        at = 0
+        while at < count:
+            take = min(OBS_READ_BLOCK, int(count) - at)
+            raw = handle.read(take * record_dtype.itemsize)
+            if len(raw) != take * record_dtype.itemsize:
+                raise ObservationStoreError(
+                    f"observation store payload is truncated: {path.name}"
+                )
+            digest.update(raw)
+            block = np.frombuffer(raw, dtype=record_dtype, count=take)
+            for axis, name in enumerate(("x", "y", "z")):
+                offsets[at : at + take, axis] = block[name]
+            rows[at : at + take] = block["row"]
+            at += take
+        digest.update(handle.read(table_bytes))
+        if digest.digest() != want:
+            raise ObservationStoreError(
+                f"observation store payload digest does not match: {path.name}"
+            )
+    return offsets, rows
 
 
 def read_store(path: Path) -> ObservationStore:
@@ -245,7 +455,11 @@ def read_store(path: Path) -> ObservationStore:
 
     fields = _FIXED.unpack(payload[: _FIXED.size])
     kind = dtype()
-    body = payload[_FIXED.size :]
+    # v1: the row offset table follows the records. It is part of the payload
+    # and therefore of the digest, and is skipped here — `read_store` returns
+    # the records, and a caller that wants the table opens `ObservationWindows`.
+    table_bytes = (int(fields[7]) + 1) * 8
+    body = payload[_FIXED.size : len(payload) - table_bytes]
     if len(body) != count * kind.itemsize:
         raise ObservationStoreError(
             f"store body is not {count} records: {path.name}"

@@ -71,8 +71,20 @@ DEFAULT_TILE_SIZE_M = 4.0
 # silent 10^9-cell grid would be a memory fault dressed as geometry.
 MAX_TILE_CELLS = 1 << 22
 
+#: DEC-021's intermediate partition: a tile is W x H lattice cells.
+#: 512 x 512 caps a window at 262,144 owned vertices, which is ~116 MB at the
+#: 442 B/vertex WP-10m measured. A setting, not a constant — the manifest
+#: records it, and `PHASE1-DETERMINISM-SPEC.md` §3 requires that of anything
+#: that can move a figure.
+DEFAULT_WINDOW_ROWS = 512
+DEFAULT_WINDOW_COLS = 512
+
 MANIFEST_NAME = "manifest.json"
 CURRENT_NAME = "current.json"
+#: v1 (WP-A, DEC-021): the grid block gained `kind` and, for lattice
+#: generations, the window and lattice dimensions. A v0 store cannot be read by
+#: this code and is not meant to be — the partition it describes is not the one
+#: Pass B now produces.
 TILE_CONTRACT = "rapidmesh-tile-v1"
 
 
@@ -146,11 +158,141 @@ class TileGrid:
 
     def describe(self) -> dict[str, Any]:
         return {
+            "kind": "metric",
             "origin": [float(v) for v in self.origin],
             "size_m": self.size,
             "shape": list(self.shape),
             "cells": self.count,
         }
+
+
+@dataclass(frozen=True)
+class LatticeGrid:
+    """A partition of one station into windows of `W x H` **lattice cells**.
+
+    DEC-021. The metric grid above cuts the floor; this cuts the range image
+    the scanner actually produced, and that is the difference between a bound
+    and a hope.
+
+    **Why the metric grid could not bound anything.** Sample density on a
+    terrestrial range image goes as 1/r². A 4 m cell two metres from the
+    scanner subtends a large part of the lattice and holds most of a station;
+    the same cell at forty metres holds a handful of samples. WP-10m through
+    WP-11m.t measured exactly that: ordinal 20 packs its surface into **5**
+    tiles whose largest holds 9,341,715 vertices, while ordinal 3 — comparable
+    point count, longer range — spreads the same work over 364. Shrinking the
+    metre count does not fix it; it moves the pathology to a different range
+    and multiplies tiles on the far stations (advisory candidate B).
+
+    **Why this one bounds by construction.** A vertex belongs to the window
+    containing its own lattice cell, so a window owns at most `W x H` vertices
+    whatever the geometry does. A triangle joins cells that are adjacent on the
+    lattice, so every corner a window does not own lies in its 1-cell ring and
+    the resident set is at most `(W+2) x (H+2)`. Both are arithmetic on the cell
+    id — no lookup, no sort, and nothing to measure before trusting.
+
+    The ring needs no code of its own: `tile_build._spool_block` already files a
+    triangle under each distinct corner window, which *is* the ring, and it
+    crosses the azimuth seam wherever the filters already joined across it.
+    `wrap` is recorded because a reader should not have to infer it, not because
+    the arithmetic needs it.
+    """
+
+    lattice_rows: int
+    lattice_cols: int
+    window_rows: int = DEFAULT_WINDOW_ROWS
+    window_cols: int = DEFAULT_WINDOW_COLS
+    wrap: bool = False
+
+    def __post_init__(self) -> None:
+        for name in ("lattice_rows", "lattice_cols", "window_rows", "window_cols"):
+            if int(getattr(self, name)) <= 0:
+                raise ValueError(f"{name} must be positive, got {getattr(self, name)}")
+        if self.windows > MAX_TILE_CELLS:
+            raise ValueError(
+                f"a {self.window_rows}x{self.window_cols} window over a "
+                f"{self.lattice_rows}x{self.lattice_cols} lattice implies "
+                f"{self.windows:,} windows; choose a larger window"
+            )
+
+    @property
+    def across(self) -> int:
+        """Windows across the lattice, so a window id is row-major."""
+        return -(-int(self.lattice_cols) // int(self.window_cols))
+
+    @property
+    def down(self) -> int:
+        return -(-int(self.lattice_rows) // int(self.window_rows))
+
+    @property
+    def windows(self) -> int:
+        return self.across * self.down
+
+    @property
+    def count(self) -> int:
+        return self.windows
+
+    @property
+    def owned_cap(self) -> int:
+        """The most vertices one window can own. The point of the whole change."""
+        return int(self.window_rows) * int(self.window_cols)
+
+    @property
+    def resident_cap(self) -> int:
+        """Owned plus the 1-cell ring: the most one window can be resident for."""
+        return (int(self.window_rows) + 2) * (int(self.window_cols) + 2)
+
+    def index_of(self, cell_ids: I64) -> I64:
+        """Window id per **lattice cell id** (`row * lattice_cols + col`).
+
+        Takes cell ids, not positions — the metric grid's `index_of` takes
+        positions and the two are not interchangeable. Row-major, so a lower id
+        is a lower (row-window, col-window) exactly as ADR-006 2a's ownership
+        rule requires of *some* total order on tiles.
+        """
+        import numpy as np
+
+        ids = np.asarray(cell_ids, np.int64)
+        row, col = np.divmod(ids, int(self.lattice_cols))
+        out: I64 = (row // int(self.window_rows)) * self.across + (
+            col // int(self.window_cols)
+        )
+        return out
+
+    def bounds_of(self, tile_id: int) -> F64:
+        """A degenerate box: a lattice window has no metric extent of its own.
+
+        `tile_assemble._bounds` uses this only when a tile has no positions, and
+        a tile with no positions is never written, so this is the shape of an
+        answer rather than an answer. The written `bounds` are always the tile's
+        actual projected extent, which is what a viewer culls against.
+        """
+        import numpy as np
+
+        out: F64 = np.zeros(6, np.float64)
+        return out
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "kind": "lattice",
+            "window_rows": int(self.window_rows),
+            "window_cols": int(self.window_cols),
+            "lattice_rows": int(self.lattice_rows),
+            "lattice_cols": int(self.lattice_cols),
+            "across": self.across,
+            "down": self.down,
+            "cells": self.windows,
+            "columns_wrap": bool(self.wrap),
+            "owned_cap": self.owned_cap,
+            "resident_cap": self.resident_cap,
+        }
+
+
+#: Either intermediate partition. A union of two concrete grids rather than a
+#: Protocol, because `index_of` does not mean the same thing on both — the
+#: metric grid takes projected positions and the lattice grid takes cell ids.
+#: A caller has to know which one it is holding, and a Protocol would hide that.
+Partition = TileGrid | LatticeGrid
 
 
 @dataclass(frozen=True)

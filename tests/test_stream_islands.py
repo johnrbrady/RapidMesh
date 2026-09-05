@@ -331,7 +331,7 @@ def test_pass_a_triangle_counts_equal_the_pass_b_recount(
     recount: dict[int, int] = {}
     alias = {r.component_id: r.root for r in read_component_table(pass_a.component_table_path)}
     for seg in pass_a.segments:
-        _, provisional = read_tri_segment(seg.tri_path)
+        _, provisional, _ = read_tri_segment(seg.tri_path)
         for pid in provisional:
             root = alias[int(pid)]
             recount[root] = recount.get(root, 0) + 1
@@ -445,8 +445,8 @@ def _streamed_triangles(
     retained = retained_scan_from_segments(witness.scan, pass_a.segments)
     cells = retained.row.astype(np.int64) * witness.scan.lattice.cols + retained.col
     parts = [read_tri_segment(s.tri_path) for s in pass_a.segments]
-    tri_cells = np.concatenate([c for c, _ in parts])
-    provisional = np.concatenate([g for _, g in parts])
+    tri_cells = np.concatenate([c for c, _, _ in parts])
+    provisional = np.concatenate([g for _, g, _ in parts])
     alias = {r.component_id: r.root for r in read_component_table(pass_a.component_table_path)}
     roots = np.array([alias[int(p)] for p in provisional], np.int64)
     return retained.xyz, np.searchsorted(cells, tri_cells), roots, cells

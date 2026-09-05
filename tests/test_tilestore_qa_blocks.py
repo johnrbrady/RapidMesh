@@ -64,6 +64,12 @@ def store(tmp_path_factory: pytest.TempPathFactory) -> Any:
     result = mesh_station_streamed(
         station.scan, band_rows=16, chunk_points=5_000, halo=3,
         measure=False, out_dir=str(root / "out"), tile_size=FIXTURE_TILE_SIZE,
+        # Metric on purpose. This fixture exists to be *degenerate* — one tile
+        # holding the whole station, 8.0x the triangle cap — which is precisely
+        # what a lattice window cannot produce any more. The slice under test is
+        # in `TileStore`, not in the partition, so the pathological input is
+        # constructed rather than hoped for, and the WP-13b digests stay valid.
+        partition="metric",
     )
     assert result.tiles is not None
     assert len(result.tiles.tile_ids) == 1, "the fixture must land in one tile"

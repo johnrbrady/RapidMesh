@@ -82,6 +82,8 @@ def mesh_station_streamed(
     work_dir: str | None = None,
     out_dir: str | None = None,
     tile_size: float = DEFAULT_TILE_SIZE_M,
+    partition: str = "lattice",
+    window: tuple[int, int] | None = None,
 ) -> MeshResult:
     """Two-pass streamed pipeline for one station (PLAN.md §5 items 6–8).
 
@@ -123,6 +125,7 @@ def mesh_station_streamed(
         measure=measure, measure_samples=measure_samples,
         qa_window_rows=qa_window_rows, qa_workers=qa_workers, qa_seed=qa_seed,
         work_dir=work_dir, out_dir=out_dir, tile_size=tile_size,
+        partition=partition, window=window,
     )
 
 
@@ -146,6 +149,8 @@ def mesh_station_from_chunks(
     work_dir: str | None = None,
     out_dir: str | None = None,
     tile_size: float = DEFAULT_TILE_SIZE_M,
+    partition: str = "lattice",
+    window: tuple[int, int] | None = None,
     converter: Any | None = None,
     chunk_factory: Any | None = None,
 ) -> MeshResult:
@@ -242,6 +247,7 @@ def mesh_station_from_chunks(
             streaming=(band_rows, chunk_points, halo),
             out_dir=None if out_dir is None else Path(out_dir),
             tile_size=tile_size,
+            tile_partition=partition, tile_window=window,
             qa_workers=workers,
             qa_seed=qa_seed,
         )

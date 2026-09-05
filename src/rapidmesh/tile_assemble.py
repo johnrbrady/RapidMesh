@@ -45,8 +45,8 @@ if TYPE_CHECKING:
     import numpy as np
     import numpy.typing as npt
 
-    from .tiles import TileGrid
-    from .types import StructuredScan
+    from .tiles import Partition
+    from .types import ScanPose
 
     F32 = npt.NDArray[np.float32]
     F64 = npt.NDArray[np.float64]
@@ -57,16 +57,29 @@ if TYPE_CHECKING:
 def assemble_tile(
     tile_id: int,
     records: Any,
-    retained: StructuredScan,
-    keep_idx: I64,
-    vertex_tile: Any,
-    grid: TileGrid,
+    vertices: Any,
+    pose: ScanPose,
+    grid: Partition,
+    *,
+    has_rgb: bool,
 ) -> tuple[TilePayload | None, TileJoin | None]:
     """Build one tile's payload and its server-only join, or `(None, None)`.
 
     `records` is the tile's spool in merge order: one row per spooled triangle,
-    carrying the three global vertex indices and the owning tile id. `keep_idx`
-    maps a global vertex index back to its row in `retained`.
+    carrying the three global vertex indices and the owning tile id.
+
+    **WP-B (ITEM-022 T1).** `vertices` is a `tile_build._VERTEX_FIELDS` array,
+    ascending by `gidx`, carrying every vertex this tile could need — its own
+    window's survivors plus the 1-cell ring — and nothing else. It replaces the
+    station-wide `retained` scan, `keep_idx` and `vertex_tile` this function
+    used to index, which together were 783 MB on ordinal 20 and were live from
+    the `retained` stage to the end of QA.
+
+    The lookup is `searchsorted` rather than direct indexing because a tile's
+    `gidx` values are a sparse subsequence of the station's. The metric
+    partition hands the whole surviving set instead, where `gidx` *is* the
+    position, and `searchsorted` returns exactly that — so both partitions run
+    the same code and neither gets a path of its own to be wrong in.
 
     A tile is written when it owns **either** a triangle or a vertex, and both
     halves of that matter. A tile whose every triangle is owned by a
@@ -93,9 +106,16 @@ def assemble_tile(
     used = np.unique(spooled)
     local = np.searchsorted(used, spooled).astype(np.int32)
 
-    rows = keep_idx[used]
-    local_verts = retained.xyz[rows]
-    normals_all = _accumulate_normals(local_verts, local, retained.pose)
+    rows = np.searchsorted(vertices["gidx"], used).astype(np.int64)
+    if rows.size and (
+        int(rows.max(initial=-1)) >= vertices.shape[0]
+        or not bool(np.array_equal(vertices["gidx"][rows], used))
+    ):
+        raise ValueError(
+            f"tile {tile_id} spooled a triangle naming a vertex it does not hold"
+        )
+    local_verts = vertices["xyz"][rows]
+    normals_all = _accumulate_normals(local_verts, local, pose)
     record_phase(
         "assemble_arrays", tile_id=int(tile_id),
         records_bytes=int(records.nbytes), spooled_bytes=int(spooled.nbytes),
@@ -107,7 +127,7 @@ def assemble_tile(
     # `owner` is `<i4` in the spool too, and the comparison never needed a
     # widened copy of it — one more (R,) int64 temporary, 147.9 MB on that tile.
     emitted = records["owner"] == tile_id
-    owned = vertex_tile[used] == tile_id
+    owned = vertices["owner"][rows] == tile_id
     if not bool(emitted.any() or owned.any()):
         return None, None
     needed = np.zeros(used.shape[0], bool)
@@ -124,22 +144,22 @@ def assemble_tile(
     if faces.size and int(faces.min()) < 0:
         raise ValueError(f"tile {tile_id} emitted a triangle with an unstored corner")
 
-    positions = retained.pose.rotate_local(local_verts[order]).astype(np.float32)
-    colour = None if retained.rgb is None else retained.rgb[rows[order]]
+    positions = pose.rotate_local(local_verts[order]).astype(np.float32)
+    colour = None if not has_rgb else vertices["rgb"][rows[order]]
     payload = TilePayload(
         tile_id=tile_id,
-        origin=np.asarray(retained.pose.translation, np.float64),
+        origin=np.asarray(pose.translation, np.float64),
         bounds=_bounds(positions, grid, tile_id),
         positions=positions,
         normals=normals_all[order[:owned_count]],
         triangles=faces.astype(np.uint32),
         rgb=colour,
     )
-    sample_id = (
-        rows[order].astype(np.int64)
-        if retained.sample_id is None
-        else retained.sample_id[rows[order]].astype(np.int64)
-    )
+    # The spool carries the id the station would have supplied: the source
+    # sample id where the scan has one, and otherwise the vertex's position in
+    # the meshed-cell set — which is what `retained` would have been indexed by,
+    # and is decided once in `tile_build` rather than rediscovered here.
+    sample_id = vertices["sample_id"][rows[order]].astype(np.int64)
     join = TileJoin(
         source_sample_id=sample_id,
         # `used` is int32 from WP-11m.2; the join's declared width is I64 and the
@@ -148,7 +168,7 @@ def assemble_tile(
         # coerce it on the way to disk in any case — this keeps the in-memory
         # object matching its own annotation.
         global_vertex_index=used[order].astype(np.int64),
-        row=retained.row[rows[order]].astype(np.int32),
+        row=vertices["row"][rows[order]].astype(np.int32),
         owned=np.arange(order.size) < owned_count,
     )
     return payload, join
@@ -226,7 +246,7 @@ def _accumulate_normals(local_verts: F32, faces: I32, pose: Any) -> F32:
     return out
 
 
-def _bounds(positions: F32, grid: TileGrid, tile_id: int) -> F64:
+def _bounds(positions: F32, grid: Partition, tile_id: int) -> F64:
     """The tile's actual extent, clamped into nothing.
 
     The grid cell is what *decides* ownership; the recorded bounds are what the

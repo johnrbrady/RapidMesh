@@ -37,7 +37,6 @@ import pytest
 from rapidmesh import synthetic
 from rapidmesh.islands import pass_a_sweep
 from rapidmesh.pass_b import build_triangle_runs, stream_component_areas
-from rapidmesh.retained_io import retained_scan_from_segments
 from rapidmesh.segments_io import (
     ComponentRecord,
     SegmentError,
@@ -111,10 +110,10 @@ def _finalised_row_wise(
 
 
 def _area(station: synthetic.SyntheticScan, pass_a: Any, tmp_path: Path) -> Any:
-    retained = retained_scan_from_segments(station.scan, pass_a.segments)
-    cells = retained.row.astype(np.int64) * station.scan.lattice.cols + retained.col
+    # DEC-022: the reduction reads the record's own area, so this no longer
+    # needs the retained scan or a cell index to hand it.
     runs, _ = build_triangle_runs(pass_a.segments, _alias_row_wise(pass_a), tmp_path)
-    return stream_component_areas(runs, cells, retained.xyz).as_area_result(set())
+    return stream_component_areas(runs).as_area_result(set())
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +269,6 @@ def test_triangle_run_cells_are_the_sorted_unique_named_set(
 
     named: set[int] = set()
     for segment in pass_a.segments:
-        tri_cells, _ = read_tri_segment(segment.tri_path)
+        tri_cells, _, _ = read_tri_segment(segment.tri_path)
         named.update(int(c) for c in tri_cells.ravel())
     assert {int(c) for c in cells} == named

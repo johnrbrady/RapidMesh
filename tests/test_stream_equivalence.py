@@ -56,6 +56,11 @@ from rapidmesh.types import (
 # Force ≥3 bands under the smallest band_rows in the matrix.
 HARNESS_ROWS = 12
 HARNESS_COLS = 48
+#: WP-A. The production window is 512 x 512, which swallows a 12 x 48 lattice
+#: whole — one tile, and the matrix below asserts a *multi-tile* generation
+#: reassembles to the in-memory mesh. 4 x 16 gives 3 x 3 = 9 windows on this
+#: harness, so the equivalence is still tested across seams.
+HARNESS_WINDOW = (4, 16)
 
 # band_rows: one value small enough that 12 rows produce ≥3 bands.
 BAND_ROWS_MATRIX = (3, 4, 6)
@@ -415,6 +420,7 @@ def test_streamed_equals_in_memory_matrix(
         measure_samples=2_000,
         out_dir=str(tmp_path / "out"),
         tile_size=2.0,
+        window=HARNESS_WINDOW,
     )
     report = compare_mesh_results(ref, streamed, source_sha256="d" * 64)
     assert report.ok, config
