@@ -1,0 +1,6 @@
+# Cargo's build directory. Gigabytes, entirely reproducible from Cargo.toml and
+# Cargo.lock, and never committed.
+target/
+
+# maturin's wheel output, when it is not redirected elsewhere.
+wheels/

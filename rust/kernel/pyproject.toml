@@ -1,0 +1,35 @@
+# Build configuration for `rapidmesh_kernel` — WP-3.4b, Round 11.
+#
+# This is a **separate distribution** from `rapidmesh`, and that is the whole
+# point of it. The project's own `pyproject.toml` is not touched: it still
+# declares setuptools, still has no Rust in its build requirements, and
+# `pip install -e ".[e57,dev]"` in a fresh clone still needs no compiler. A tree
+# with this wheel absent behaves exactly as it did at Round 10 — the kernel is
+# an accelerator that is looked for and done without, not a dependency.
+#
+# Build it with:
+#     .venv\Scripts\python.exe -m maturin build --release -m rust\kernel\Cargo.toml
+# or, to install straight into the active environment:
+#     .venv\Scripts\python.exe -m maturin develop --release -m rust\kernel\Cargo.toml
+#
+# Both need a Rust toolchain and, on Windows, the MSVC linker. Neither is needed
+# to run RapidMesh.
+
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "rapidmesh-kernel"
+description = "Quadric collapse sweep for RapidMesh, behind the band interface"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+authors = [{ name = "John Brady" }]
+classifiers = ["Private :: Do Not Upload"]
+dynamic = ["version"]
+
+[tool.maturin]
+# The crate is at this directory's own Cargo.toml; nothing is vendored into the
+# Python package tree, so there is no Python source for maturin to mix in.
+bindings = "pyo3"
+strip = true

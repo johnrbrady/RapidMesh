@@ -177,17 +177,55 @@ class DecimatedPatch:
         return int(self.triangles.shape[0])
 
 
+def _use_kernel(choice: str) -> bool:
+    """Resolve `decimate_patch`'s `kernel` argument to a yes or a no.
+
+    `"rust"` is a demand and fails loudly when the extension is not built;
+    `"auto"` is a preference and falls back in silence, because a tree with no
+    crate compiled must behave exactly as it did before there was one.
+    """
+    from rapidmesh import decimate_kernel
+
+    if choice == "auto":
+        choice = decimate_kernel.default_choice()
+    if choice == "python":
+        return False
+    if choice == "rust":
+        if not decimate_kernel.available():
+            raise RuntimeError(
+                "kernel='rust' requested but unavailable: "
+                f"{decimate_kernel.unavailable_reason()}"
+            )
+        return True
+    if choice == "auto":
+        return decimate_kernel.available()
+    raise ValueError(f"unknown kernel {choice!r}")
+
+
 def decimate_patch(
     positions: F32 | F64,
     triangles: Any,
     locked: BOOL,
     settings: DecimationSettings | None = None,
+    *,
+    kernel: str = "auto",
 ) -> DecimatedPatch:
     """Collapse edges of one patch, cheapest first, until a stop rule bites.
 
     `positions` are offsets from the caller's own origin, in metres, returned at
     float32 — a locked vertex's bits round-trip exactly, which is what lets two
     tiles agree on a seam rather than nearly agree (`SPATIAL-CONTRACT.md` §2.4).
+
+    `kernel` picks the sweep. `"python"` is the implementation in this module,
+    which is the **equivalence reference** and is never removed; `"rust"` is
+    `decimate_kernel`'s native one and raises if the crate is not built;
+    `"auto"` consults `RAPIDMESH_DECIMATE_KERNEL`, which defaults to `"python"`.
+
+    **The native sweep is opt-in**, so a tree that merely has the crate built
+    runs exactly the code it ran before it did — see
+    `decimate_kernel.DEFAULT_CHOICE` for why that matters and what broke when it
+    did not. The two sweeps are required to produce byte-identical output and
+    `tests/test_decimate_kernel.py` holds them to it.
     """
     import numpy as np
 
@@ -204,6 +242,10 @@ def decimate_patch(
     if tris.size and (int(tris.max()) >= pos64.shape[0] or int(tris.min()) < 0):
         raise ValueError("a triangle names a vertex outside the patch")
 
+    if _use_kernel(kernel):
+        from rapidmesh import decimate_kernel
+
+        return decimate_kernel.sweep(pos64, tris, lock, settings).finish()
     state = _PatchState(pos64, tris, lock, settings)
     state.run()
     return state.finish()

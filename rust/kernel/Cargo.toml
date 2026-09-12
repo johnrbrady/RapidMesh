@@ -1,0 +1,32 @@
+[package]
+name = "rapidmesh_kernel"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+license = "Proprietary"
+description = "Quadric edge-collapse sweep for RapidMesh, behind the band interface (WP-3.4b)"
+publish = false
+
+[lib]
+name = "rapidmesh_kernel"
+crate-type = ["cdylib"]
+
+# One dependency, deliberately. The kernel takes its arrays through the Python
+# buffer protocol, which PyO3 exposes itself, so there is no `numpy`/`ndarray`
+# crate to keep version-matched with it. Fewer crates is also the honest answer
+# to the brief's adoption question 1.
+[dependencies.pyo3]
+version = "0.29"
+# `abi3-py313` builds against the stable ABI, so one built artefact serves 3.13
+# and every later CPython. That matters to the adoption question more than it
+# matters here: it is the difference between one wheel and one wheel per minor
+# version for anyone who would rather not install Rust.
+features = ["extension-module", "abi3-py313"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+# `panic = "abort"` is deliberately NOT set. PyO3 turns a Rust panic into a
+# Python exception; aborting instead would take the interpreter down on an index
+# error and lose the measurement run that found it.
