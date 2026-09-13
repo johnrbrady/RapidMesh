@@ -1,5 +1,5 @@
 """
-Quadric error metric decimation over one indexed triangle patch — WP-3.4.
+Quadric error metric decimation over one indexed triangle patch — WP-3.4/3.5.
 
 This is the first stage in RapidMesh that changes the geometry **on purpose**.
 Everything before it preserved the surface exactly, so the question was "did
@@ -15,14 +15,18 @@ the survivor where that sum is least.
 
 What this module is, and is not
 -------------------------------
+It is the **contract**: what a caller may ask for (`DecimationSettings`), what
+comes back (`DecimatedPatch`), and which of the two sweeps runs. The mechanics
+live in `decimate_sweep.py` and the quantity the error-bounded stop rule
+consults lives in `decimate_bounds.py`. That three-way split is WP-3.5's, taken
+at the boundary the module already had: contract, mechanics, guarantee.
+
 It is **one patch**: positions, triangles indexing them, and a boolean saying
 which vertices may not move. It knows nothing about tiles, files, stations or
 poses — `decimate_tiles.py` owns all of that, and the split is what makes the
 seam rule testable on a six-triangle fixture instead of on a station. It is also
-**not** the production decimator: Round 10 is a prototype and a measurement
-(DEC-013 as amended 8 September 2026), so normals, colour and the client
-container are deliberately absent and `DecimatedPatch` carries geometry and
-provenance only.
+**not** the production decimator: normals, colour and the client container are
+deliberately absent and `DecimatedPatch` carries geometry and provenance only.
 
 The locked set is the seam guarantee, and it is the caller's decision
 --------------------------------------------------------------------
@@ -70,17 +74,9 @@ asserts it rather than this docstring claiming it.
 
 from __future__ import annotations
 
-import heapq
 import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
-
-from .decimate_quadrics import (
-    doubles,
-    quadric_error,
-    solve_optimal,
-    vertex_quadrics,
-)
 
 if TYPE_CHECKING:
     import numpy as np
@@ -97,29 +93,43 @@ if TYPE_CHECKING:
 #: also refuses folds that stop short of inverting. A recorded setting.
 DEFAULT_MAX_NORMAL_TURN_DEG = 90.0
 
-#: The queue is compacted when it exceeds this multiple of the live edge count
-#: (estimated as 1.5 per live triangle). Superseded entries are dropped and the
-#: rest re-heapified; entries are distinct, so this cannot change the pop order.
-_HEAP_SLACK = 3.0
-
 
 @dataclass(frozen=True)
 class DecimationSettings:
     """Everything that can move the output, in one recordable object.
 
-    `max_error_m` caps ``sqrt(Q(v*))``: the root of the accumulated
-    area-weighted squared distance from the placed vertex to every plane merged
-    into it, which bounds the distance from that vertex to each of those planes
-    individually. So it is a *guaranteed* per-collapse bound and is reported as
-    one — and it is **not** a bound on surface-to-surface deviation, which is
-    sampled and measured separately (`decimate_qa.py`). The two are never
-    reported as though they were one quantity.
+    Three stop rules, and given more than one whichever bites first stops the
+    sweep. They are not interchangeable and the difference is the substance of
+    WP-3.5:
 
-    `target_triangles` stops the sweep at a triangle count. Either rule alone is
-    a legitimate operating point; given both, whichever bites first stops it.
+    `max_plane_deviation_m` is the **error-bounded** rule (Round 10 D6). It caps
+    the guaranteed quantity `decimate_bounds.py` derives: no collapse is
+    accepted that would place a vertex further than this from the plane of any
+    original triangle merged into it. It is in metres, it is a maximum and not a
+    percentile, and `DecimatedPatch.plane_deviation_bound_m` reports what the
+    sweep actually reached under it. Read `decimate_bounds` for what it does
+    **not** cover — it is a bound about planes, not a Hausdorff distance to the
+    surface, and that difference is stated there rather than glossed here.
+
+    `max_error_m` caps ``sqrt(Q(v*))``, the root of the accumulated
+    area-weighted squared distance from the placed vertex to the planes merged
+    into it. **It is not a distance and it is not a bound.** The weight is the
+    triangle area, so the quantity carries a factor of `sqrt(area)`: on a patch
+    whose shape is held fixed while its scale changes, the true displacement
+    scales linearly and this scales quadratically, understating the movement by
+    953x at the triangle sizes a real station carries. `decimate_bounds.py`
+    holds the measurement. It is kept, unchanged in behaviour, because every
+    recorded Round 10 and Round 11 figure was produced with it at infinity and a
+    knob removed is a run that cannot be reproduced — but it is a quadric-cost
+    threshold, it is reported as one, and it is not the error bound.
+
+    `target_triangles` stops at a triangle count. It is what Round 10 drove and
+    it is unbounded in error by construction: once the cheap collapses run out
+    it accepts whatever is left to reach its number.
     """
 
     max_error_m: float = math.inf
+    max_plane_deviation_m: float = math.inf
     target_triangles: int | None = None
     placement: str = "optimal"
     max_normal_turn_deg: float = DEFAULT_MAX_NORMAL_TURN_DEG
@@ -129,6 +139,11 @@ class DecimationSettings:
             raise ValueError(f"unknown placement {self.placement!r}")
         if not (self.max_error_m > 0.0):
             raise ValueError(f"max_error_m must be positive, got {self.max_error_m}")
+        if not (self.max_plane_deviation_m > 0.0):
+            raise ValueError(
+                "max_plane_deviation_m must be positive, got "
+                f"{self.max_plane_deviation_m}"
+            )
         if self.target_triangles is not None and self.target_triangles < 0:
             raise ValueError("target_triangles must not be negative")
         if not (0.0 < self.max_normal_turn_deg <= 180.0):
@@ -138,6 +153,11 @@ class DecimationSettings:
         return {
             "max_error_m": (
                 None if math.isinf(self.max_error_m) else float(self.max_error_m)
+            ),
+            "max_plane_deviation_m": (
+                None
+                if math.isinf(self.max_plane_deviation_m)
+                else float(self.max_plane_deviation_m)
             ),
             "target_triangles": self.target_triangles,
             "placement": self.placement,
@@ -154,18 +174,47 @@ class DecimatedPatch:
     this module knowing what a global vertex id is. `moved` says whether that
     survivor's position changed — no locked vertex is ever in it, and a reader
     can check that rather than trust it.
+
+    `representative` is the absorption map: for every input vertex, the output
+    vertex that now stands for it. It is what makes the guarantee *checkable* —
+    the plane set a survivor's bound covers is exactly the faces incident to the
+    input vertices mapping to it, and without this array a reader can only take
+    the bound on trust. `decimate_bounds.verify_plane_bound` recomputes the
+    whole claim from it and from the input geometry.
+
+    Two bounds, and the difference between them is one rounding step. The
+    stop rule governs the **swept** float64 positions, so
+    `plane_deviation_swept_m` is the figure that is at or under the budget and
+    is the rule's own guarantee. `finish()` then rounds the positions to
+    float32, which moves each survivor by up to half a ULP per axis, and
+    `plane_deviation_bound_m` is the guarantee for **the geometry that ships**
+    — so it can sit a few nanometres above the budget, and it is the one to
+    quote. A bound on geometry nobody emits would not be a bound; a budget that
+    silently absorbed the rounding would not be a budget. Both are reported and
+    neither is adjusted to make the other look tidy.
+
+    `plane_deviation_bound_m` is the **guaranteed** figure: every surviving
+    vertex of this patch is within it of the plane of every original triangle
+    merged into it, including the float32 rounding of the emitted positions.
+    `max_accepted_error_m` is the largest quadric cost accepted and is **not**
+    in metres — see `DecimationSettings`. The two are never reported as the same
+    quantity and never in the same column.
     """
 
     positions: F32              # (V', 3)
     triangles: U32              # (T', 3)
     source_index: I64           # (V',) input slot of each surviving vertex
+    representative: I64         # (V,)  output vertex each *input* vertex is now in
     moved: BOOL                 # (V',) whether its position changed
     collapses: int
     rejected_link: int
     rejected_seam: int
     rejected_turn: int
     rejected_error: int
+    rejected_deviation: int
     max_accepted_error_m: float
+    plane_deviation_bound_m: float
+    plane_deviation_swept_m: float
     locked_vertices: int
 
     @property
@@ -216,8 +265,8 @@ def decimate_patch(
     float32 — a locked vertex's bits round-trip exactly, which is what lets two
     tiles agree on a seam rather than nearly agree (`SPATIAL-CONTRACT.md` §2.4).
 
-    `kernel` picks the sweep. `"python"` is the implementation in this module,
-    which is the **equivalence reference** and is never removed; `"rust"` is
+    `kernel` picks the sweep. `"python"` is `decimate_sweep._PatchState`, which
+    is the **equivalence reference** and is never removed; `"rust"` is
     `decimate_kernel`'s native one and raises if the crate is not built;
     `"auto"` consults `RAPIDMESH_DECIMATE_KERNEL`, which defaults to `"python"`.
 
@@ -228,6 +277,8 @@ def decimate_patch(
     `tests/test_decimate_kernel.py` holds them to it.
     """
     import numpy as np
+
+    from .decimate_sweep import _PatchState
 
     settings = DecimationSettings() if settings is None else settings
     pos64 = np.asarray(positions, np.float64)
@@ -249,358 +300,3 @@ def decimate_patch(
     state = _PatchState(pos64, tris, lock, settings)
     state.run()
     return state.finish()
-
-
-# ---------------------------------------------------------------------------
-
-
-class _PatchState:
-    """The mutable half of one sweep, kept off the module's public surface."""
-
-    def __init__(
-        self, pos64: F64, tris: I64, lock: BOOL, settings: DecimationSettings
-    ) -> None:
-        self.settings = settings
-        self.count = count = int(pos64.shape[0])
-        faces = int(tris.shape[0])
-
-        self.px = doubles(pos64[:, 0])
-        self.py = doubles(pos64[:, 1])
-        self.pz = doubles(pos64[:, 2])
-        self.quad = vertex_quadrics(pos64, tris, count)
-        self.locked = lock.tolist()
-        self.moved = [False] * count
-        self.alive = [True] * count
-        self.version = [0] * count
-
-        # One int object per index, shared by `tv`, `vtris` and the queue, so
-        # the same integer in four places is four references and not four
-        # boxed objects. It matters at half a million triangles per tile.
-        self.iv = list(range(count))
-        self.it = list(range(faces))
-        self.tv: list[int] = [self.iv[i] for i in tris.ravel().tolist()]
-        self.tri_alive = bytearray(b"\x01") * faces
-        self.live_triangles = faces
-
-        self.vtris: list[set[int]] = [set() for _ in range(count)]
-        for t in self.it:
-            base = 3 * t
-            self.vtris[self.tv[base]].add(t)
-            self.vtris[self.tv[base + 1]].add(t)
-            self.vtris[self.tv[base + 2]].add(t)
-
-        self.cos_limit = math.cos(math.radians(settings.max_normal_turn_deg))
-        self.error_limit = (
-            math.inf
-            if math.isinf(settings.max_error_m)
-            else settings.max_error_m * settings.max_error_m
-        )
-        self.heap: list[tuple[float, int, int, int]] = []
-        self.heap_limit = self._heap_limit()
-        self.collapses = 0
-        self.rejected_link = 0
-        self.rejected_seam = 0
-        self.rejected_turn = 0
-        self.rejected_error = 0
-        self.max_accepted = 0.0
-
-        edges = _unique_edges(tris)
-        for u, v in zip(edges[:, 0].tolist(), edges[:, 1].tolist(), strict=True):
-            self._push(u, v)
-        del edges
-
-    # -- the sweep ----------------------------------------------------------
-
-    def run(self) -> None:
-        """Pop the cheapest live candidate until the queue or a stop rule ends it."""
-        target = self.settings.target_triangles
-        heap = self.heap
-        while heap:
-            if target is not None and self.live_triangles <= target:
-                return
-            _, u, v, versions = heapq.heappop(heap)
-            if not (self.alive[u] and self.alive[v]):
-                continue
-            if versions != self._versions(u, v):
-                continue               # superseded; the live entry is still queued
-            self._try_collapse(u, v)
-
-    def _try_collapse(self, u: int, v: int) -> None:
-        shared = self.vtris[u] & self.vtris[v]
-        if not 1 <= len(shared) <= 2:
-            self.rejected_link += 1
-            return
-        nu, nv = self._neighbours(u), self._neighbours(v)
-        if len(nu & nv) != len(shared):
-            self.rejected_link += 1
-            return
-        keep, drop = (u, v) if not self.locked[v] else (v, u)
-        if self.locked[drop]:
-            self.rejected_link += 1    # both ends locked: the edge is a seam
-            return
-        if self.locked[keep] and self._would_join_locked(keep, nu if keep == u else nv,
-                                                         nv if keep == u else nu):
-            self.rejected_seam += 1
-            return
-
-        q = self._quadric_sum(u, v)
-        x, y, z = self._place(q, u, v)
-        if not self._turn_ok(keep, drop, shared, x, y, z):
-            self.rejected_turn += 1
-            return
-        cost = quadric_error(q, x, y, z)
-        self._commit(keep, drop, shared, x, y, z)
-        self.collapses += 1
-        if cost > self.max_accepted:
-            self.max_accepted = cost
-
-    def _commit(
-        self, keep: int, drop: int, shared: set[int], x: float, y: float, z: float
-    ) -> None:
-        tv = self.tv
-        for t in shared:
-            base = 3 * t
-            for slot in (base, base + 1, base + 2):
-                self.vtris[tv[slot]].discard(t)
-            self.tri_alive[t] = 0
-        self.live_triangles -= len(shared)
-
-        for t in self.vtris[drop]:
-            base = 3 * t
-            for slot in (base, base + 1, base + 2):
-                if tv[slot] == drop:
-                    tv[slot] = self.iv[keep]
-            self.vtris[keep].add(t)
-        self.vtris[drop] = set()
-        self.alive[drop] = False
-
-        self.px[keep], self.py[keep], self.pz[keep] = x, y, z
-        if not self.locked[keep]:
-            self.moved[keep] = True
-        base_k, base_d = 10 * keep, 10 * drop
-        for i in range(10):
-            self.quad[base_k + i] += self.quad[base_d + i]
-        self.version[keep] += 1
-
-        for w in self._neighbours(keep):
-            self._push(keep, w)
-        if len(self.heap) > self.heap_limit:
-            self._compact()
-
-    # -- geometry -----------------------------------------------------------
-
-    def _would_join_locked(
-        self, keep: int, keep_nbrs: set[int], drop_nbrs: set[int]
-    ) -> bool:
-        """Would this collapse create an edge between two locked vertices?
-
-        A locked vertex's star may run on past this patch — that is what being
-        on the boundary means — so the patch cannot see whether an edge between
-        two locked vertices already exists somewhere else. Two tiles that each
-        legally close a fan onto the same pair of ring vertices then emit the
-        same face twice, which is a doubled surface rather than a crack and so
-        slips past a boundary-set check.
-
-        The rule is therefore local and exact: an edge that would be **new
-        here** and joins two locked vertices is refused, because "new here" is
-        only the same as "new anywhere" when at least one end's star is
-        complete, and an unlocked vertex is precisely one whose star is.
-        """
-        locked = self.locked
-        return any(
-            w != keep and locked[w] and w not in keep_nbrs for w in drop_nbrs
-        )
-
-    def _neighbours(self, u: int) -> set[int]:
-        out: set[int] = set()
-        tv = self.tv
-        for t in self.vtris[u]:
-            base = 3 * t
-            out.add(tv[base])
-            out.add(tv[base + 1])
-            out.add(tv[base + 2])
-        out.discard(u)
-        return out
-
-    def _quadric_sum(self, u: int, v: int) -> list[float]:
-        q, a, b = self.quad, 10 * u, 10 * v
-        return [
-            q[a] + q[b], q[a + 1] + q[b + 1], q[a + 2] + q[b + 2],
-            q[a + 3] + q[b + 3], q[a + 4] + q[b + 4], q[a + 5] + q[b + 5],
-            q[a + 6] + q[b + 6], q[a + 7] + q[b + 7], q[a + 8] + q[b + 8],
-            q[a + 9] + q[b + 9],
-        ]
-
-    def _place(
-        self, q: list[float], u: int, v: int
-    ) -> tuple[float, float, float]:
-        """Where the survivor goes: the locked end, the optimum, or the ladder.
-
-        A locked endpoint decides the answer outright, which is why a seam
-        vertex comes out carrying the bits it went in with. Otherwise
-        `placement="optimal"` takes the quadric's minimiser where the solve is
-        well conditioned and the cheapest of the two endpoints and the midpoint
-        where it is not, and `placement="endpoint"` takes the cheaper endpoint
-        and nothing else.
-        """
-        px, py, pz = self.px, self.py, self.pz
-        if self.locked[u]:
-            return px[u], py[u], pz[u]
-        if self.locked[v]:
-            return px[v], py[v], pz[v]
-        ends = ((px[u], py[u], pz[u]), (px[v], py[v], pz[v]))
-        if self.settings.placement == "endpoint":
-            # A true subset placement: every surviving vertex is still one of
-            # the scan-derived positions the patch arrived with, so the tier
-            # invents no geometry. It costs error against `optimal` and is
-            # offered because that trade is a product decision, not this
-            # module's.
-            return min(ends, key=lambda c: quadric_error(q, *c))
-        best = solve_optimal(q)
-        if best is not None:
-            return best
-        midpoint = (
-            0.5 * (px[u] + px[v]), 0.5 * (py[u] + py[v]), 0.5 * (pz[u] + pz[v])
-        )
-        return min((*ends, midpoint), key=lambda c: quadric_error(q, *c))
-
-    def _turn_ok(
-        self, keep: int, drop: int, shared: set[int], x: float, y: float, z: float
-    ) -> bool:
-        """No surviving incident triangle may turn past the limit or degenerate."""
-        px, py, pz, tv = self.px, self.py, self.pz, self.tv
-        moving = (keep, drop)
-        for source in moving:
-            for t in self.vtris[source]:
-                if t in shared:
-                    continue
-                base = 3 * t
-                i, j, m = tv[base], tv[base + 1], tv[base + 2]
-                ax, ay, az = px[i], py[i], pz[i]
-                bx, by, bz = px[j], py[j], pz[j]
-                cx, cy, cz = px[m], py[m], pz[m]
-                nb = _normal(ax, ay, az, bx, by, bz, cx, cy, cz)
-                if nb is None:
-                    continue           # already degenerate; nothing to turn
-                # A triangle holding *both* ends is in `shared` and was skipped,
-                # so exactly one corner moves and the chain is exhaustive.
-                if i in moving:
-                    ax, ay, az = x, y, z
-                elif j in moving:
-                    bx, by, bz = x, y, z
-                else:
-                    cx, cy, cz = x, y, z
-                na = _normal(ax, ay, az, bx, by, bz, cx, cy, cz)
-                if na is None:
-                    return False       # collapsed to a line or a point
-                if nb[0] * na[0] + nb[1] * na[1] + nb[2] * na[2] < self.cos_limit:
-                    return False
-        return True
-
-    # -- queue --------------------------------------------------------------
-
-    def _versions(self, u: int, v: int) -> int:
-        """Both endpoints' versions as one integer, so an entry is one tuple.
-
-        A collapse bumps only the survivor's version, and every edge whose cost
-        it changed is incident to that vertex, so this invalidates exactly the
-        stale entries. The shift is 32 bits and not the vertex count: a version
-        counts collapses, and packing it against a bound it can exceed would
-        alias two different states onto one integer.
-        """
-        return (self.version[u] << 32) | self.version[v]
-
-    def _push(self, u: int, v: int) -> None:
-        if not (self.alive[u] and self.alive[v]):
-            return
-        if self.locked[u] and self.locked[v]:
-            return
-        a, b = (u, v) if u < v else (v, u)
-        q = self._quadric_sum(a, b)
-        cost = quadric_error(q, *self._place(q, a, b))
-        if cost < 0.0:
-            cost = 0.0                 # rounding under a flat quadric
-        if cost > self.error_limit:
-            self.rejected_error += 1
-            return
-        heapq.heappush(
-            self.heap, (cost, self.iv[a], self.iv[b], self._versions(a, b))
-        )
-
-    def _heap_limit(self) -> int:
-        return max(1 << 16, int(_HEAP_SLACK * 1.5 * self.live_triangles))
-
-    def _compact(self) -> None:
-        """Drop superseded entries. Entries are distinct, so the order is kept."""
-        alive, version = self.alive, self.version
-        self.heap = [
-            e
-            for e in self.heap
-            if alive[e[1]]
-            and alive[e[2]]
-            and e[3] == (version[e[1]] << 32) | version[e[2]]
-        ]
-        heapq.heapify(self.heap)
-        self.heap_limit = max(self._heap_limit(), 2 * len(self.heap))
-
-    # -- output -------------------------------------------------------------
-
-    def finish(self) -> DecimatedPatch:
-        """Compact survivors in ascending input order, then re-index triangles."""
-        import numpy as np
-
-        keep = np.flatnonzero(np.asarray(self.alive, bool))
-        remap = np.full(self.count, -1, np.int64)
-        remap[keep] = np.arange(keep.size, dtype=np.int64)
-        faces = np.asarray(self.tv, np.int64).reshape(-1, 3)
-        live = np.flatnonzero(np.frombuffer(bytes(self.tri_alive), np.uint8))
-        faces = remap[faces[live]]
-        if faces.size and int(faces.min()) < 0:
-            raise ValueError("a surviving triangle names a removed vertex")
-        xyz = np.empty((keep.size, 3), np.float64)
-        xyz[:, 0] = np.frombuffer(self.px, np.float64)[keep]
-        xyz[:, 1] = np.frombuffer(self.py, np.float64)[keep]
-        xyz[:, 2] = np.frombuffer(self.pz, np.float64)[keep]
-        return DecimatedPatch(
-            positions=xyz.astype(np.float32),
-            triangles=faces.astype(np.uint32),
-            source_index=keep.astype(np.int64),
-            moved=np.asarray(self.moved, bool)[keep],
-            collapses=self.collapses,
-            rejected_link=self.rejected_link,
-            rejected_seam=self.rejected_seam,
-            rejected_turn=self.rejected_turn,
-            rejected_error=self.rejected_error,
-            max_accepted_error_m=math.sqrt(self.max_accepted),
-            locked_vertices=int(np.count_nonzero(np.asarray(self.locked, bool))),
-        )
-
-
-def _normal(
-    ax: float, ay: float, az: float,
-    bx: float, by: float, bz: float,
-    cx: float, cy: float, cz: float,
-) -> tuple[float, float, float] | None:
-    """Unit triangle normal, or `None` when the triangle has no area."""
-    ux, uy, uz = bx - ax, by - ay, bz - az
-    vx, vy, vz = cx - ax, cy - ay, cz - az
-    nx = uy * vz - uz * vy
-    ny = uz * vx - ux * vz
-    nz = ux * vy - uy * vx
-    length = math.sqrt(nx * nx + ny * ny + nz * nz)
-    if length <= 0.0:
-        return None
-    return nx / length, ny / length, nz / length
-
-
-def _unique_edges(tris: I64) -> Any:
-    """Every undirected edge once, as an ascending ``(E,2)`` array of pairs."""
-    import numpy as np
-
-    if tris.shape[0] == 0:
-        return np.empty((0, 2), np.int64)
-    pairs = np.concatenate(
-        (tris[:, (0, 1)], tris[:, (1, 2)], tris[:, (2, 0)]), axis=0
-    )
-    pairs.sort(axis=1)
-    return np.unique(pairs, axis=0)

@@ -53,7 +53,8 @@ A third failure is invisible to both and is refused in `decimate.py` instead:
 two tiles independently closing the same fan onto the same pair of ring
 vertices emit the same face twice, which doubles the surface rather than
 tearing it, so the boundary set is unchanged and only a union edge-use count
-sees it. `decimate._would_join_locked` refuses the collapse that would do it.
+sees it. `decimate_sweep._would_join_locked` refuses the collapse that would do
+it.
 This was a real defect, found on the synthetic station fixture at 4x reduction
 (11 edges used by four triangles instead of two), and
 `tests/test_decimate_generation.py` holds the rule red with it removed.
@@ -93,8 +94,12 @@ if TYPE_CHECKING:
 
 #: The prototype's own on-disk contract. Bumped if the key set changes, so a
 #: harness reading an older run fails loudly rather than reading a field that
-#: has moved.
-DECIMATED_CONTRACT = "rapidmesh-decimated-prototype-v0"
+#: has moved. **v1 adds the ledger keys only** — the guaranteed displacement
+#: bound and its rejection counter, both in `manifest.json`. The per-tile `.npz`
+#: arrays are byte for byte what v0 wrote, deliberately: Round 11's equivalence
+#: evidence is a SHA-256 over exactly those arrays, and an extra array would
+#: have retired that comparison to record a scalar.
+DECIMATED_CONTRACT = "rapidmesh-decimated-prototype-v1"
 
 
 @dataclass(frozen=True)
@@ -113,7 +118,10 @@ class TileDecimation:
     rejected_seam: int
     rejected_turn: int
     rejected_error: int
+    rejected_deviation: int
     max_accepted_error_m: float
+    plane_deviation_bound_m: float
+    plane_deviation_swept_m: float
     read_seconds: float
     decimate_seconds: float
     write_seconds: float
@@ -128,6 +136,8 @@ class GenerationDecimation:
     triangles_out: int = 0
     vertices_in: int = 0
     vertices_out: int = 0
+    plane_deviation_bound_m: float = 0.0
+    plane_deviation_swept_m: float = 0.0
     seam_boundary_edges_before: int = 0
     seam_boundary_edges_after: int = 0
     seam_edges_lost: int = 0
@@ -294,6 +304,7 @@ def decimate_generation(
             target = -(-payload.triangle_count // int(round(reduction)))
             tile_settings = DecimationSettings(
                 max_error_m=settings.max_error_m,
+                max_plane_deviation_m=settings.max_plane_deviation_m,
                 target_triangles=target,
                 placement=settings.placement,
                 max_normal_turn_deg=settings.max_normal_turn_deg,
@@ -335,11 +346,23 @@ def decimate_generation(
                 rejected_seam=patch.rejected_seam,
                 rejected_turn=patch.rejected_turn,
                 rejected_error=patch.rejected_error,
+                rejected_deviation=patch.rejected_deviation,
                 max_accepted_error_m=patch.max_accepted_error_m,
+                plane_deviation_bound_m=patch.plane_deviation_bound_m,
+                plane_deviation_swept_m=patch.plane_deviation_swept_m,
                 read_seconds=read_seconds,
                 decimate_seconds=decimate_seconds,
                 write_seconds=write_seconds,
             )
+        )
+        # The station bound is the largest per-tile bound, not a sum: each is
+        # a statement about its own tile's surviving vertices, and no vertex is
+        # a survivor of two tiles' patches.
+        report.plane_deviation_bound_m = max(
+            report.plane_deviation_bound_m, patch.plane_deviation_bound_m
+        )
+        report.plane_deviation_swept_m = max(
+            report.plane_deviation_swept_m, patch.plane_deviation_swept_m
         )
         report.triangles_in += payload.triangle_count
         report.triangles_out += patch.triangle_count

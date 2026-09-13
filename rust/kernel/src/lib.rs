@@ -79,6 +79,15 @@ fn encode_i64_from_u32(values: &[u32]) -> Vec<u8> {
     out
 }
 
+/// `array('i')` on the Python side, which is what `_PatchState.parent` holds.
+fn encode_i32_from_u32(values: &[u32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(values.len() * 4);
+    for v in values {
+        out.extend_from_slice(&(*v as i32).to_ne_bytes());
+    }
+    out
+}
+
 fn encode_bools(values: &[bool]) -> Vec<u8> {
     values.iter().map(|&b| u8::from(b)).collect()
 }
@@ -94,9 +103,9 @@ fn encode_bools(values: &[bool]) -> Vec<u8> {
 #[pyfunction]
 #[allow(clippy::too_many_arguments)]
 #[pyo3(signature = (
-    pos_x, pos_y, pos_z, quad, locked, triangle_vertices, edges,
-    vertex_count, triangle_count, target_triangles, error_limit, cos_limit,
-    placement_optimal,
+    pos_x, pos_y, pos_z, quad, amin, locked, triangle_vertices, edges,
+    vertex_count, triangle_count, target_triangles, error_limit, deviation_limit,
+    cos_limit, placement_optimal,
 ))]
 fn decimate_sweep<'py>(
     py: Python<'py>,
@@ -104,6 +113,7 @@ fn decimate_sweep<'py>(
     pos_y: &[u8],
     pos_z: &[u8],
     quad: &[u8],
+    amin: &[u8],
     locked: &[u8],
     triangle_vertices: &[u8],
     edges: &[u8],
@@ -111,6 +121,7 @@ fn decimate_sweep<'py>(
     triangle_count: usize,
     target_triangles: i64,
     error_limit: f64,
+    deviation_limit: f64,
     cos_limit: f64,
     placement_optimal: bool,
 ) -> PyResult<Bound<'py, PyDict>> {
@@ -118,6 +129,7 @@ fn decimate_sweep<'py>(
     let py_positions = decode_f64(pos_y, vertex_count, "pos_y")?;
     let pz = decode_f64(pos_z, vertex_count, "pos_z")?;
     let quadrics = decode_f64(quad, vertex_count * 10, "quad")?;
+    let min_areas = decode_f64(amin, vertex_count, "amin")?;
     if locked.len() != vertex_count {
         return Err(PyValueError::new_err(format!(
             "locked: expected {vertex_count} bytes, got {}",
@@ -158,6 +170,7 @@ fn decimate_sweep<'py>(
             Some(target_triangles)
         },
         error_limit,
+        deviation_limit,
         cos_limit,
         placement_optimal,
     };
@@ -175,6 +188,7 @@ fn decimate_sweep<'py>(
             py_positions,
             pz,
             quadrics,
+            min_areas,
             lock,
             tv,
             &edge_pairs,
@@ -204,6 +218,9 @@ fn decimate_sweep<'py>(
     result.set_item("rejected_seam", state.rejected_seam)?;
     result.set_item("rejected_turn", state.rejected_turn)?;
     result.set_item("rejected_error", state.rejected_error)?;
+    result.set_item("rejected_deviation", state.rejected_deviation)?;
+    result.set_item("bound", PyBytes::new(py, &encode_f64(state.bounds())))?;
+    result.set_item("parent", PyBytes::new(py, &encode_i32_from_u32(state.parents())))?;
     result.set_item("max_accepted", state.max_accepted)?;
     result.set_item("live_triangles", state.live_triangle_count())?;
     Ok(result)
@@ -216,7 +233,7 @@ fn decimate_sweep<'py>(
 /// a different answer. It is not the crate version.
 #[pyfunction]
 fn contract_version() -> u32 {
-    1
+    2
 }
 
 #[pymodule]

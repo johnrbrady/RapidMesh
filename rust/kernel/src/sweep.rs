@@ -49,6 +49,23 @@ use std::collections::BinaryHeap;
 
 use crate::quadric::{normal, quadric_error, solve_optimal};
 
+/// `decimate_bounds.plane_bound`, operand for operand.
+///
+/// `sqrt` is correctly rounded in both languages and the division is a single
+/// IEEE operation, so identical operand order is identical output — which is
+/// why this is written out rather than expressed through `powi` or `hypot`. The
+/// clamp is `_push`'s: a flat quadric at its own minimiser can come out very
+/// slightly negative, and a NaN from a negative root would compare `false`
+/// against every budget and so silently accept the collapse it was to judge.
+#[inline]
+fn plane_bound(q: &[f64; 10], amin: f64, x: f64, y: f64, z: f64) -> f64 {
+    let cost = quadric_error(q, x, y, z);
+    if cost <= 0.0 {
+        return 0.0;
+    }
+    (cost / amin).sqrt()
+}
+
 /// `decimate._HEAP_SLACK`.
 pub const HEAP_SLACK: f64 = 3.0;
 
@@ -61,6 +78,11 @@ pub struct Settings {
     pub target_triangles: Option<i64>,
     /// `max_error_m ** 2`, or `f64::INFINITY`.
     pub error_limit: f64,
+    /// `max_plane_deviation_m`, in metres and **not** squared, or
+    /// `f64::INFINITY`. The sweep compares it against a length it computes with
+    /// a square root, so squaring it and comparing squares would be a different
+    /// rounding and so a different answer.
+    pub deviation_limit: f64,
     /// `cos(radians(max_normal_turn_deg))`, computed by the caller.
     pub cos_limit: f64,
     /// `placement == "optimal"`.
@@ -145,6 +167,16 @@ pub struct PatchState {
     moved: Vec<bool>,
     alive: Vec<bool>,
     version: Vec<u32>,
+    /// `_PatchState.bound` and `_PatchState.amin`: per vertex, the guaranteed
+    /// distance to every merged plane, and the smallest merged face area it is
+    /// taken against. `decimate_bounds.py` carries the derivation and the
+    /// limits of what it guarantees.
+    bound: Vec<f64>,
+    amin: Vec<f64>,
+    /// `_PatchState.parent`: the absorption forest. A vertex is its own parent
+    /// until it is dropped into another; `finish()` on the Python side resolves
+    /// the chains.
+    parent: Vec<u32>,
     tv: Vec<u32>,
     tri_alive: Vec<bool>,
     live_triangles: i64,
@@ -158,6 +190,7 @@ pub struct PatchState {
     pub rejected_seam: u64,
     pub rejected_turn: u64,
     pub rejected_error: u64,
+    pub rejected_deviation: u64,
     pub max_accepted: f64,
 
     mark_u: Marks,
@@ -176,6 +209,7 @@ impl PatchState {
         py: Vec<f64>,
         pz: Vec<f64>,
         quad: Vec<f64>,
+        amin: Vec<f64>,
         locked: Vec<bool>,
         tv: Vec<u32>,
         edges: &[i64],
@@ -200,6 +234,9 @@ impl PatchState {
             moved: vec![false; count],
             alive: vec![true; count],
             version: vec![0; count],
+            bound: vec![0.0; count],
+            amin,
+            parent: (0..count as u32).collect(),
             locked,
             tv,
             tri_alive: vec![true; faces],
@@ -213,6 +250,7 @@ impl PatchState {
             rejected_seam: 0,
             rejected_turn: 0,
             rejected_error: 0,
+            rejected_deviation: 0,
             max_accepted: 0.0,
             mark_u: Marks::new(count),
             mark_v: Marks::new(count),
@@ -338,7 +376,12 @@ impl PatchState {
             return;
         }
         let cost = quadric_error(&q, x, y, z);
-        self.commit(keep, drop, &shared, x, y, z);
+        // Recomputed rather than carried on the entry, exactly as
+        // `_try_collapse` does: `versions` is the guarantee that neither end
+        // has moved, changed quadric or changed `amin` since the push, so this
+        // reproduces the value `push` tested against the budget.
+        let bound = plane_bound(&q, self.amin_pair(u, v), x, y, z);
+        self.commit(keep, drop, &shared, x, y, z, bound);
         self.collapses += 1;
         if cost > self.max_accepted {
             self.max_accepted = cost;
@@ -351,7 +394,17 @@ impl PatchState {
     }
 
     /// `_PatchState._commit`.
-    fn commit(&mut self, keep: usize, drop: usize, shared: &[u32], x: f64, y: f64, z: f64) {
+    #[allow(clippy::too_many_arguments)]
+    fn commit(
+        &mut self,
+        keep: usize,
+        drop: usize,
+        shared: &[u32],
+        x: f64,
+        y: f64,
+        z: f64,
+        bound: f64,
+    ) {
         for &t in shared {
             let base = 3 * t as usize;
             for slot in base..base + 3 {
@@ -382,10 +435,16 @@ impl PatchState {
         self.vtris[drop].clear();
         self.star = star;
         self.alive[drop] = false;
+        self.parent[drop] = keep as u32;
 
         self.px[keep] = x;
         self.py[keep] = y;
         self.pz[keep] = z;
+        // Both written before the re-pushes below, so that every candidate
+        // queued against the survivor is judged against the plane set it now
+        // carries and not the one it carried a moment ago.
+        self.bound[keep] = bound;
+        self.amin[keep] = self.amin_pair(keep, drop);
         if !self.locked[keep] {
             self.moved[keep] = true;
         }
@@ -442,6 +501,17 @@ impl PatchState {
         // self-mark makes that intersection exactly one too large and the link
         // condition rejects nearly every collapse. That was a real defect here,
         // found by the equivalence test rather than by reading.
+    }
+
+    /// `_PatchState._amin_pair`: `min` unions two vertices' plane sets.
+    #[inline]
+    fn amin_pair(&self, u: usize, v: usize) -> f64 {
+        let (a, b) = (self.amin[u], self.amin[v]);
+        if a < b {
+            a
+        } else {
+            b
+        }
     }
 
     /// `_PatchState._quadric_sum`.
@@ -573,6 +643,13 @@ impl PatchState {
             self.rejected_error += 1;
             return;
         }
+        // `_PatchState._push`'s error-bounded stop rule (Round 10 D6). A
+        // candidate that would carry some original vertex past the budget never
+        // enters the queue, so no accepted collapse can exceed it.
+        if plane_bound(&q, self.amin_pair(a, b), x, y, z) > self.settings.deviation_limit {
+            self.rejected_deviation += 1;
+            return;
+        }
         self.heap.push(Entry {
             cost,
             u: a as u32,
@@ -620,6 +697,12 @@ impl PatchState {
     }
     pub fn triangle_alive_flags(&self) -> &[bool] {
         &self.tri_alive
+    }
+    pub fn bounds(&self) -> &[f64] {
+        &self.bound
+    }
+    pub fn parents(&self) -> &[u32] {
+        &self.parent
     }
     pub fn live_triangle_count(&self) -> i64 {
         self.live_triangles

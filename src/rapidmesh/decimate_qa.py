@@ -50,11 +50,26 @@ Distances reuse `qa._point_triangle_distance`'s branch chain verbatim, returning
 the closest point instead of discarding it, and `tests/test_decimate_qa.py`
 asserts the two agree bit for bit rather than by inspection.
 
-Every figure here is an **upper bound**, not an estimate. The candidate rule is
-`decimate_closest.QA_NEAREST_K` nearest target vertices, and a candidate it
-misses can only make a distance longer — so a reported RMS, percentile or
-maximum is at worst too large. `QA_NEAREST_K` carries the measurement that fixed
-its value and the one figure that is still not converged at it.
+Two candidate rules, and which one a figure came from is recorded
+------------------------------------------------------------------
+`metric="vertex-k"` is Round 10's: the triangles incident to a query's `k`
+nearest target vertices. A candidate it misses can only make a distance longer,
+so every figure it produces is an **upper bound** and never an estimate — and on
+a coarse tier that bound is not tight and its maximum is not pinned at any `k`
+(`decimate_closest.QA_NEAREST_K`; Round 10 §3.3 and §3.11). It stays the default
+so that the recorded Round 10 and Round 11 figures remain reproducible.
+
+`metric="exact"` is WP-3.5's `decimate_nearest.closest_points_certified`: a
+triangle-side index that **proves** it has found the closest triangle rather
+than converging towards it. A figure from it is the distance, not a bound on it,
+and `DecimationDeviation.certified_fraction` records the share of queries the
+proof covered — 1.0 when every one of them is exact.
+
+Both are one-sided and both are a **sample** of the surface. An exact per-query
+distance does not make the RMS or the p99.9 over 300,000 draws a guarantee about
+the points not drawn, and nothing here is described as one. The guaranteed
+quantity is `decimate_bounds.py`'s, it is about planes rather than the surface,
+and it is reported beside these rather than folded into them.
 """
 
 from __future__ import annotations
@@ -63,6 +78,7 @@ from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 from .decimate_closest import QA_NEAREST_K, closest_points
+from .decimate_nearest import closest_points_certified
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -101,6 +117,7 @@ class DecimationDeviation:
     within_1mm: float
     within_3_2mm: float
     zero_fraction: float
+    certified_fraction: float
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -115,15 +132,23 @@ class DecimationDeviation:
 
 
 def summarise(
-    distance: F64, signed: F64, *, baseline: str, metric: str, population: int
+    distance: F64, signed: F64, *, baseline: str, metric: str, population: int,
+    certified: Any = None,
 ) -> DecimationDeviation:
-    """Turn per-query distances into one consistently-labelled report."""
+    """Turn per-query distances into one consistently-labelled report.
+
+    `certified` is the per-query proof flag from `metric="exact"`. It is `None`
+    for the vertex-k rule, which proves nothing and whose figures are upper
+    bounds — recorded as a certified fraction of 0.0 rather than as a missing
+    field, so that a reader comparing two rows cannot mistake "not proved" for
+    "not measured".
+    """
     import numpy as np
 
     if distance.size == 0:
         return DecimationDeviation(
             baseline, metric, 0, population,
-            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0,
         )
     return DecimationDeviation(
         baseline=baseline,
@@ -139,6 +164,9 @@ def summarise(
         within_1mm=float(np.mean(distance <= 0.001)),
         within_3_2mm=float(np.mean(distance <= 0.0032)),
         zero_fraction=float(np.mean(distance == 0.0)),
+        certified_fraction=(
+            0.0 if certified is None else float(np.mean(np.asarray(certified, bool)))
+        ),
     )
 
 
@@ -278,6 +306,7 @@ def against_pre_decimation(
     seed: int,
     k: int = QA_NEAREST_K,
     workers: int = 1,
+    metric: str = "vertex-k",
 ) -> DecimationDeviation:
     """Baseline 1 — the decimated surface against the surface it came from.
 
@@ -289,15 +318,16 @@ def against_pre_decimation(
     import numpy as np
 
     queries, normals, _ = sample_generation(store, samples, seed)
-    distance, closest, _ = closest_points(
-        target_vertices, target_triangles, queries, k=k, workers=workers
+    distance, closest, _, certified, label = _closest(
+        target_vertices, target_triangles, queries, k, workers, metric
     )
     signed = np.einsum("ij,ij->i", closest - queries, normals)
     return summarise(
         distance, signed,
         baseline="pre-decimation surface",
-        metric=f"pre-decimation-surface-to-decimated-mesh (k={k})",
+        metric=f"pre-decimation-surface-to-decimated-mesh ({label})",
         population=int(store.triangle_count),
+        certified=certified,
     )
 
 
@@ -310,6 +340,7 @@ def against_observations(
     seed: int,
     k: int = QA_NEAREST_K,
     workers: int = 1,
+    metric: str = "vertex-k",
 ) -> DecimationDeviation:
     """Baseline 2 — the decimated surface against the source observations.
 
@@ -334,17 +365,40 @@ def against_observations(
     )
     index.sort()
     queries = observations.gather(index).astype(np.float64)
-    distance, closest, which = closest_points(
-        target_vertices, target_triangles, queries, k=k, workers=workers
+    distance, closest, which, certified, label = _closest(
+        target_vertices, target_triangles, queries, k, workers, metric
     )
     normals = triangle_normals(target_vertices, np.asarray(target_triangles, np.int64))
     signed = np.einsum("ij,ij->i", closest - queries, normals[which])
     return summarise(
         distance, signed,
         baseline="source observations",
-        metric=f"retained-observations-to-decimated-mesh (k={k})",
+        metric=f"retained-observations-to-decimated-mesh ({label})",
         population=total,
+        certified=certified,
     )
+
+
+def _closest(
+    vertices: F32, triangles: Any, queries: F64, k: int, workers: int, metric: str
+) -> tuple[F64, F64, I64, Any, str]:
+    """Dispatch the two candidate rules, and carry back which one answered.
+
+    The label goes into `DecimationDeviation.metric`, so a row on the record
+    always says which rule produced it and a reader never has to infer it from
+    the date of the run.
+    """
+    if metric == "vertex-k":
+        distance, closest, which = closest_points(
+            vertices, triangles, queries, k=k, workers=workers
+        )
+        return distance, closest, which, None, f"k={k}"
+    if metric == "exact":
+        distance, closest, which, certified = closest_points_certified(
+            vertices, triangles, queries, workers=workers
+        )
+        return distance, closest, which, certified, "exact, triangle-side index"
+    raise ValueError(f"unknown metric {metric!r}")
 
 
 def open_observations(generation_root: Path) -> Any:

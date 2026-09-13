@@ -16,7 +16,7 @@ deliberately the only place that knows the kernel exists, so that:
 
 **What stays in NumPy, and why.** The per-vertex quadrics
 (`decimate_quadrics.vertex_quadrics`) and the unique-edge list
-(`decimate._unique_edges`) are computed here and handed across. Both are
+(`decimate_sweep._unique_edges`) are computed here and handed across. Both are
 vectorised, both are small — together about 6% of a tile — and the first of them
 accumulates with `np.bincount`, whose summation order would have to be
 reproduced exactly for a bit-identical result. Reproducing it by hand is the
@@ -37,8 +37,10 @@ import os
 from array import array
 from typing import TYPE_CHECKING, Any
 
-from rapidmesh.decimate import DecimationSettings, _PatchState, _unique_edges
+from rapidmesh.decimate import DecimationSettings
+from rapidmesh.decimate_bounds import face_min_areas
 from rapidmesh.decimate_quadrics import vertex_quadrics
+from rapidmesh.decimate_sweep import _PatchState, _unique_edges
 
 if TYPE_CHECKING:
     import numpy as np
@@ -51,7 +53,7 @@ if TYPE_CHECKING:
 #: The kernel contract this module speaks. `rapidmesh_kernel.contract_version()`
 #: must match, so that a stale `.pyd` left on `sys.path` by an earlier build is
 #: refused rather than silently answering a different question.
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
 
 #: Environment override for the default dispatch: `python`, `rust` or `auto`.
 #: An explicit `kernel=` argument to `decimate_patch` always wins over it.
@@ -181,11 +183,21 @@ class _KernelState(_PatchState):
         self.tv = np.frombuffer(  # type: ignore[assignment]
             result["triangle_vertices"], np.int64
         )
+        # The plane bound the kernel accumulated, in the same `array('d')`
+        # the Python sweep holds it in, because the inherited `finish()` reads
+        # it with `np.frombuffer` and must not care which sweep produced it.
+        self.bound = _from_bytes(result["bound"])
+        # `array('i')` to match what `_PatchState` holds, so the inherited
+        # `finish()` reads it through the same `np.frombuffer` dtype on both
+        # paths and neither has a special case.
+        self.parent = array("i")
+        self.parent.frombytes(result["parent"])
         self.collapses = int(result["collapses"])
         self.rejected_link = int(result["rejected_link"])
         self.rejected_seam = int(result["rejected_seam"])
         self.rejected_turn = int(result["rejected_turn"])
         self.rejected_error = int(result["rejected_error"])
+        self.rejected_deviation = int(result["rejected_deviation"])
         self.max_accepted = float(result["max_accepted"])
         self.live_triangles = int(result["live_triangles"])
 
@@ -206,6 +218,11 @@ def sweep(
     count = int(pos64.shape[0])
     faces = int(tris.shape[0])
     quad = vertex_quadrics(pos64, tris, count)
+    # `amin` stays in NumPy for the same reason the quadrics do: it is a
+    # vectorised reduction over the same faces, it is cheap, and computing it
+    # twice in two languages is two chances to disagree about which face is
+    # degenerate.
+    amin = face_min_areas(pos64, tris, count)
     edges = _unique_edges(tris)
 
     # `max_error_m * max_error_m`, not `** 2`: `_PatchState.__init__` writes the
@@ -221,6 +238,7 @@ def sweep(
         np.ascontiguousarray(pos64[:, 1], np.float64).tobytes(),
         np.ascontiguousarray(pos64[:, 2], np.float64).tobytes(),
         quad.tobytes(),
+        amin.tobytes(),
         np.ascontiguousarray(lock, bool).tobytes(),
         np.ascontiguousarray(tris, np.int64).tobytes(),
         np.ascontiguousarray(edges, np.int64).tobytes(),
@@ -228,6 +246,11 @@ def sweep(
         faces,
         -1 if settings.target_triangles is None else int(settings.target_triangles),
         error_limit,
+        # `max_plane_deviation_m` crosses as metres and unsquared, unlike
+        # `error_limit`: the sweep compares it against a length it computes with
+        # a square root, so squaring it here and comparing squares on the far
+        # side would be a different rounding and a different answer.
+        settings.max_plane_deviation_m,
         math.cos(math.radians(settings.max_normal_turn_deg)),
         settings.placement == "optimal",
     )

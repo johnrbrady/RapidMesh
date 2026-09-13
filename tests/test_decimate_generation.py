@@ -36,7 +36,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from rapidmesh import decimate, synthetic
+from rapidmesh import decimate_sweep, synthetic
 from rapidmesh.decimate import DecimationSettings
 from rapidmesh.decimate_qa import (
     against_observations,
@@ -123,12 +123,18 @@ def test_without_the_locked_join_rule_two_tiles_emit_the_same_face(
     Removing the rule leaves each tile's own patch manifold and the boundary set
     unchanged — the seam check still reads clean — while the union gains edges
     used by four triangles, because two tiles closed the same fan onto the same
-    pair of ring vertices. That is why the rule lives in `decimate.py` and not
-    in the seam check.
+    pair of ring vertices. That is why the rule lives in `decimate_sweep.py`
+    and not in the seam check.
+
+    The patch is on the class, not on a module attribute, so it reaches the
+    sweep however `decimate_patch` imported it — and it reaches only the Python
+    sweep, which is why `decimate_kernel.DEFAULT_CHOICE` stays `python`: a
+    monkeypatch cannot enter the Rust one, and a default of `rust` would make
+    this test silently stop testing anything.
     """
     _, root = generation
     monkeypatch.setattr(
-        decimate._PatchState, "_would_join_locked", lambda *_args: False
+        decimate_sweep._PatchState, "_would_join_locked", lambda *_args: False
     )
     report = run(generation, "unruled")
     _, triangles, _ = read_decimated(root / "unruled")
