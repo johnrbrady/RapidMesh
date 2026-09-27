@@ -32,7 +32,13 @@ What it measured, on identical lossless geometry:
 
 ## Decision
 
-1. The client container is **glTF 2.0 binary (GLB)**, one tile per file.
+1. The client container is **glTF 2.0 binary (GLB)**. Round 15 benchmarked one
+   GLB per tier with each tile a separate mesh and byte range. **The delivery
+   unit is not settled by this ADR:** an HTTP range request against a
+   gzip-encoded response addresses the compressed bytes, so "one file per tier,
+   tiles by range" and decision 3 do not compose. The writer already produces a
+   self-attributing one-tile GLB, and Round 16 measures that shape, reporting
+   per-tile gzip size beside Round 15's per-tier figure.
 2. Tier identity travels in the `RM_tier` extension, listed in
    **`extensionsRequired`**. A stock loader therefore refuses a RapidMesh tile;
    that is intended, because an optional marking would let a stock loader open a
