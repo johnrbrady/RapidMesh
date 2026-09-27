@@ -6,9 +6,15 @@ Short on purpose. The detail lives in the documents listed in §7. Keep this
 file current: if you complete a phase or resolve a blocker, update §5 and §9 in
 the same change.
 
-Last updated: 7 September 2026 — **Gate 1 PROVISIONALLY CLOSED at `9e92c85`.**
-All eight lines PASS; **fidelity DEFER** (ITEM-018 — no working metric exists on
-undecimated data, and no fidelity claim is licensed). Formal report:
+Last updated: 27 September 2026 — **Phase 4 under way. The container is glTF 2.0
+(DEC-026, `docs/adr/ADR-009-container-gltf.md`); Round 16, the progressive
+loader, is next.** Phase 3's work packages (Rounds 10–14) are committed and
+accepted, but the phase is not formally gated: ITEM-027 (what "guaranteed bound"
+means) and ITEM-024 (budget or ratio) are open owner rulings, and the end-to-end
+fidelity figure does not yet meet its bar (DEC-024).
+
+Gate 1 remains **PROVISIONALLY CLOSED at `9e92c85`** (7 September 2026): all
+eight lines PASS, **fidelity DEFER**. Formal report:
 `E:\Claude Projects\Lead AI SW Eng\RapidMesh\REPORTS\2026-09-07-GATE-1-CLOSE.md`.
 
 **"Provisionally" is not a formality.** The independent review the system
@@ -93,8 +99,8 @@ project-lead execution plan (`PLAN.md`, project-lead records, adopted 15 August
 | 0c | Spatial contract and transform foundation | **DONE** 15 Aug 2026 — `SPATIAL-CONTRACT.md`; full pose applied once to project-axis offsets and normals; inverse E57 recovery fixed; 13 spatial-contract tests, 35 total tests **at 0c close** (the suite has since grown to 510 — see below), Ruff, strict mypy and smoke pass. Header-only validation covered 312 authorised E57 files / 313 scans, including 310 non-identity poses, with zero pose-validation failures. **The 312 file / 313 scan counts are re-verified** (16 Aug 2026, `tools/e57_inventory.py` over every E57 under the authorised sample root: 312 files, 313 scans); they do not conflict with §10, which lists only the 31 files profiled in `docs/DATA-INVENTORY.md`, not the whole authorised corpus. The 310 non-identity-pose figure is carried from the 0c run and was **not** re-verified here. Cairn unchanged |
 | 1 | QA rework (3 reports) + streamed/chunked processing + isolation matrix + smoke gate. Design-first items precede the code: halo calculus, two-pass island finalisation, versioned intermediate tile contract v0, determinism spec | **PROVISIONALLY CLOSED** 7 Sep 2026 at `9e92c85` — **8 PASS, 0 PARTIAL, 0 FAIL; fidelity DEFER.** Every line Lead-verified from raw measurement JSON, not from implementer summaries. **Line 5, the long blocker, is met:** the 30-station campaign on this tree puts **30/30 inside both budgets**, worst being the named 14.5 M-point station (ordinal 1) at **391,786,496 B working (0.765×)** and **412,454,912 B peak RSS (0.275×)**; median working 250,521,600 B. Every station's mesh is identity-exact against the pre-change `campaign_v3` run on the ledger, vertex and QA fields, so the memory fell and the geometry did not. Rule G1-M's spread was re-measured on this tree (ordinal 1, n=3): **S = 0.20%**, margin 23.10%, **57.7× clear**, so DEC-020 clause 1's headroom case licenses the single-run campaign figures. The engineering that did it was WP-A (lattice-window tiles, DEC-021), WP-B (vertex store removed, DEC-022) and WP-C (QA from observations). **Budgets were never widened.** Line 8 re-run at `9e92c85` in the working tree **and from a fresh clone**: 510 collected, 509 passed + 1 xpassed, ruff, mypy --strict (44 files) and smoke all green. **Two caveats that stay attached to this close:** the real 14.5 M-point station cannot enter the repo (§4 rule 9), so the *in-tree* assertion the gate text calls for remains the **synthetic extent ladder** — a regression guard, not the certification, and it currently **straddles its bar** (xfail/xpass both observed on identical code); and **no fidelity claim is licensed** (ITEM-018). Superseded and withdrawn: the "5 PASS / 2 PARTIAL / 1 FAIL at `d681a4a`" adjudication, and every campaign figure dated 31 Aug – 1 Sep |
 | 2a | **Ingestion contract and Cairn baseline** — on the critical path (DEC-003). Per-axis LAS/LAZ header scale/offset preserved and reported, suspicious quantisation detected, units/CRS never inferred; LAS/LAZ and unstructured E57 accepted, validated and honestly reported "reconstruction not yet supported"; Cairn-vs-RapidMesh baseline on the *same* structured E57s, recording which converter version produced the LAZ | **PARTIAL.** Ingestion contract **DONE** 2 Sep 2026 — `f1df59d`, WP-2a.1: per-axis LAS/LAZ header scale/offset preserved and reported, suspicious quantisation detected, units/CRS never inferred, unsupported reconstruction reported honestly with the missing capability named; 36 tests. **Cairn baseline NOT STARTED** — Round 9, and blocked behind Gate 1 |
-| 3 | Error-bounded decimation, LOD chain, tiled incremental writing. **ITEM-001 (combined-project representation) is investigated inside this phase** (DEC-007). Adds the mean-signed-deviation bias metric and guaranteed per-tile error bounds; the bias budget stays flat and tiny at every LOD so switching can never reveal systematic movement | NOT STARTED |
-| 4 | **Container decided by benchmark** (DEC-005), progressive browser loader, engineering alignment view. Container and manifest make the QC-only / client-audience tier distinction **structural** (DEC-004) | NOT STARTED |
+| 3 | Error-bounded decimation, LOD chain, tiled incremental writing. **ITEM-001 (combined-project representation) is investigated inside this phase** (DEC-007). Adds the mean-signed-deviation bias metric and guaranteed per-tile error bounds; the bias budget stays flat and tiny at every LOD so switching can never reveal systematic movement | **WORK DONE, GATE OPEN.** Rounds 10–14, 8–15 Sep 2026: Python quadric decimation (`c9a37d7`), optional Rust kernel behind the band interface, default `python` (`c9168d4`; adoption is ITEM-025), LOD chain with exact metric and per-tile bounds (`6f6ace6`), 512×512 output tiles measured rather than assumed (`f5226a8`), and the ITEM-001 memo — per-station tiers miss the 1 s site first paint by ~1,935×, so an **unfused**, display-only site coarse tier is licensed (DEC-007). **The bound is over planes, not the surface** (ITEM-027): at 3 of 30 levels a sampled surface point moved further than it. Hardest station (ordinal 1) holds the bar at a 6.4 mm budget with 2.598× reduction, end to end. **Not claimable:** a surface bound, a fidelity pass (end-to-end p99.9 3.2–4.1 mm against 3.2 mm), a project-wide reduction ratio |
+| 4 | **Container decided by benchmark** (DEC-005), progressive browser loader, engineering alignment view. Container and manifest make the QC-only / client-audience tier distinction **structural** (DEC-004) | **IN PROGRESS.** Round 15 accepted and committed 27 Sep 2026: **glTF 2.0 GLB, `RM_tier` in `extensionsRequired`, served gzip** (DEC-026, ADR-009). Both candidates passed Gate C; as containers they are 0.02% apart, bespoke leads only via a codec (1.17–1.30× against a 2× bar) and decodes 8.6–11.0× slower. No client tier carries per-vertex source identity — the writer refuses one (ITEM-029 closed from the container side). Sizes were measured without normals and are re-measured when normals land. **Next: Round 16, progressive loader.** No first-paint figure exists yet |
 | 2b | **LAS/LAZ and unstructured-E57 reconstruction R&D** — parallel to or after phase 4, not on the first-release critical path (DEC-003) | NOT STARTED |
 | 5 | Surveyor/admin-only QC comparison vertical slice, then site-level modes B + D. After the first release. **Entry criterion:** the IFC toolchain licence position answered in writing before the dependency is introduced. Input is phase 1's observation store | NOT STARTED |
 | 6 | NavVis B1. **B2 is deferred past the first release** and re-estimated on its own when scheduled | NOT STARTED |
@@ -116,12 +122,13 @@ band-addressable native lattice, edge-preserving despeckle, cross-station
 occlusion carving with parallax restore, discontinuity-aware triangulation,
 area-based island culling, oriented normals, synthetic fixtures, CLI, and the
 band-streamed two-pass pipeline with its tile contract v0, observation store and
-evidence envelope.
-**510 tests collected; 509 pass and 1 xpasses** — re-run 7 September 2026 at
-`9e92c85`, alongside ruff, mypy --strict (44 source files) and the smoke gate.
-The **fresh-clone** run was repeated at `9e92c85` on the same date — clean
-clone, new virtual environment, `pip install -e ".[e57,dev]"`, all five gates
-green with identical counts.
+evidence envelope; quadric decimation with an error-bounded LOD chain (optional
+Rust kernel); and the glTF tile writer and reader with the DEC-004 tier checks.
+**603 tests collected** — all five gates re-run 27 September 2026 on the tree
+committed that day: 601 passed, 1 skipped, 1 xfailed, ruff clean, mypy --strict
+(63 source files) clean, smoke ok. Run with `TEMP`/`TMP` on `H:\Temp` and
+`RAPIDMESH_DECIMATE_KERNEL` unset, on a quiet host. The last **fresh-clone** run
+is still the one at `9e92c85` (7 September).
 
 **Two things about that count worth knowing before you quote it.** The
 pass/xfail split is **not reproducible**: the synthetic extent-ladder assertion
@@ -203,7 +210,7 @@ end-to-end figure reported separately beside it. See
 | 11 | Scanner identity and registration report for 02516.182 not obtained | Any statement about minimum defensible tolerance for the reference data. Phase 2. **Now the whole story, not one input among several**: `FINDING-003`'s isolation matrix showed RapidMesh's own geometric error is ≈0 mm and the entire reported tail is propagated instrument noise — the 2 mm sigma is a placeholder, and the real figure is exactly what this item is waiting on |
 | 12 | Combination method for minimum defensible tolerance undefined | The computed project-specific floor. Different statistics, different confidence levels; do not simply add them |
 | 13 | LAS/LAZ reconstruction path not selected; neither format carries E57's native lattice | Required input parity in phase 2 |
-| 14 | Combined-project representation: coordinated per-station display, fused display-only surface, or both. **Scheduled — investigated inside phase 3** (DEC-007, project-lead decision 15 Aug 2026: a display-only site coarse tier is pre-approved if phase 3's measurements show per-station LOD0s cannot meet the 1 s site first paint; it never produces numbers and never replaces per-station evidence) | Phase 3 measurement, then phase 4 architecture and acceptance tests |
+| 14 | Combined-project representation. **ANSWERED 15 Sep 2026** (Round 14, ITEM-001): per-station tiers miss the 1 s site first paint by ~1,935×, so DEC-007's display-only site coarse tier is licensed. Build it **unfused** first — it makes no registration decision, so item 7 does not block it. It never produces numbers and never replaces per-station evidence | The site coarse tier is not built yet; no ≤ 1 s first paint can be claimed until it is |
 
 **Supervision-level items live in the project-lead register**, not here:
 `E:\Claude Projects\Lead AI SW Eng\RapidMesh\OPEN-ITEMS.md`. Currently open
@@ -212,9 +219,9 @@ against Gate 1:
 | Item | Subject | Status |
 |---|---|---|
 | ITEM-015 | Reverse QA reports metre-scale figures | **DIAGNOSED** 2 Sep 2026 — the metric is a triangle-size statistic, not an error figure. Not broken; misread |
-| ITEM-018 | No working fidelity metric on undecimated real data | **OPEN** — blocks the Gate 1 fidelity line. Needs John's ruling plus a work package; more runs of the current metrics cannot close it |
+| ITEM-018 | No working fidelity metric on undecimated real data | **CLOSED** 13 Sep 2026 by DEC-024 — fidelity is measured against the **delivered tier**, end to end. The definition is settled; the figure is not: end-to-end p99.9 runs 3.2–4.1 mm against a 3.2 mm bar, so no fidelity claim is licensed yet |
 | ITEM-019 | Gate 1 line 6's "both reference resolutions" is undefined | **RESOLVED** 2 Sep 2026 — John adopted Reading A: the two `docs/DATA-INVENTORY.md` §1.1 classes. Evidence complete 7 Sep 2026: both directions on 30/30, high-res 12/12, medium 18/18 |
-| ITEM-020 | A memory test is sensitive to machine load | **OPEN** — advisory. Never run the suite concurrently with other work on the host |
+| ITEM-020 | A memory test whose noise exceeded its margin | **CLOSED** 27 Sep 2026 by DEC-025 — one-child marginal, n = 3 passes with the maximum asserted, ladder re-based to 356k / 1.43M / 2.53M. Worst slope 5.43 against 8.0 B/sample. Still: never run the suite concurrently with other work on the host |
 | ITEM-021 | **F1** — the streamed path rewrote every real station into a frame ~5.8 × 10⁶ m from the scanner | **CLOSED** 3 Sep 2026, re-confirmed 7 Sep. `frame_path` = `spherical-is-local-by-definition` and terrestrial ranges (6.0–80.0 m) on all 30 stations of the completed campaign; zero coverage flags |
 | ITEM-022 | **Gate 1 line 5** | **CLOSED** 7 Sep 2026. Was 6.2× working / 2.1× peak on the named station; now **0.765× / 0.275×**, and 30/30 inside both budgets. Closed by WP-A (lattice-window tiles), WP-B (vertex store removed) and WP-C (QA from observations). **Budgets were never widened** |
 
