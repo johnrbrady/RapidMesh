@@ -30,7 +30,10 @@ from __future__ import annotations
 import argparse
 import pathlib
 import sys
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 if str(ROOT / "src") not in sys.path:
@@ -670,6 +673,118 @@ def mesh_forward_qa_resident(
         "sampled": int(d.size),
         "rms": float((d * d).mean() ** 0.5),
     }
+
+
+# ---------------------------------------------------------------------------
+# ITEM-020 — the marginal, differenced inside one process
+#
+# The two rows above are the pair the WP-3.1 gate subtracted: `peak(mesh + QA)`
+# from one child and `peak(mesh alone)` from another. That subtraction does not
+# cancel what it appears to cancel. The interpreter, NumPy, SciPy and the mesh
+# loaded from disk are **measured again** in each child, so the common baseline
+# enters the difference twice and brings its run-to-run variation with it.
+#
+# The size of that is not a guess. The first slope of the gate ladder spans
+# 633,583 samples, so the 8.0 B/sample bar allows 5,068,664 B of rise in the
+# marginal between rung 0 and rung 1 — and between two Round 15 suite runs on
+# identical code, rung 1's marginal alone moved 1,396,736 B, or 27.6% of that
+# whole allowance. The Lead then sampled the gate directly: n=6, identical code,
+# 5 PASS / 1 FAIL at slope 8.042, with host load not ordering the outcomes
+# (ITEM-020). A gate whose entire headroom is 5 MB cannot be read through an
+# instrument that wanders 1.4 MB.
+#
+# A peak is a high-water mark and only ever rises, which is exactly what makes a
+# second reading in the same process meaningful. Read the counter once when the
+# prefix is resident and the measured stage has not started, once when it has
+# finished, and the difference is how much higher that stage pushed the mark.
+# The common term is then the same integer subtracted from itself: it cancels
+# exactly rather than being estimated twice.
+#
+# `rapidmesh.memory` already uses this shape for an earlier checkpoint —
+# `_child_main` reads a baseline before the workload and `working_set_delta_bytes`
+# is `peak - baseline`, both in one process. What the QA gate needed was the same
+# idea with the checkpoint moved past the mesh prefix, which is a workload's
+# business and not `measure_in_child`'s. `measure_in_child` is therefore
+# untouched: these are ordinary workloads that read the instrument themselves and
+# report both watermarks in their `detail`. Gate 1's 30-station campaign and
+# DEC-020's S = 0.20% were both measured through that function, and altering it
+# would invalidate their provenance for a reason that has nothing to do with them.
+# ---------------------------------------------------------------------------
+
+
+def _stage_marginal(
+    path: str, stage: Callable[[Any, Any], dict[str, Any]]
+) -> dict[str, Any]:
+    """Run `stage` against a mesh loaded from disk; report both watermarks.
+
+    The prefix watermark is read at the point the two-child form spawned a
+    second process to find — SciPy warm, mesh and QA inputs resident, nothing
+    measured yet — so *what* is being reported has not changed. Only where the
+    subtraction happens has.
+    """
+    from rapidmesh.memory import rss_sample
+
+    _warm_scipy()
+    # Load psapi and the ctypes machinery *before* the checkpoint rather than at
+    # it. Their pages belong to the prefix either way; paying for them at the
+    # first reading instead would quietly shrink every marginal measured after.
+    rss_sample()
+    mesh, rows = load_mesh(path)
+    prefix_peak = rss_sample().peak_bytes
+    measured = stage(mesh, rows)
+    stage_peak = rss_sample().peak_bytes
+    return {
+        "vertices": mesh.vertex_count,
+        "triangles": mesh.triangle_count,
+        "rows": int(rows.shape[0]),
+        "prefix_peak_rss_bytes": int(prefix_peak),
+        "stage_peak_rss_bytes": int(stage_peak),
+        "marginal_bytes": int(stage_peak - prefix_peak),
+        **measured,
+    }
+
+
+def mesh_forward_qa_marginal(
+    path: str, samples: int = 300_000, block: int = 0
+) -> dict[str, Any]:
+    """`mesh_only` and `mesh_forward_qa` as one row, in one process.
+
+    Same prefix, same stage, same reported figures as the pair it replaces.
+    """
+    from rapidmesh.qa import QA_QUERY_BLOCK, deviation_report
+
+    def stage(mesh: Any, rows: Any) -> dict[str, Any]:
+        report = deviation_report(
+            mesh, mesh.vertices, max_samples=samples,
+            block=block or QA_QUERY_BLOCK,
+        )
+        return {"sampled": report.sampled_points, "rms": report.rms}
+
+    return _stage_marginal(path, stage)
+
+
+def mesh_forward_qa_resident_marginal(
+    path: str, samples: int = 300_000, block: int = 0
+) -> dict[str, Any]:
+    """The same row through `qa_reference.resident_distances`.
+
+    The sensitivity break for the WP-3.1 gate, measured the ITEM-020 way: a
+    bound the implementation it replaced also satisfies is not a bound, it is
+    the fixture being small. Measuring it against its *own* prefix rather than
+    against a third child's also removes the one way that row could have gone
+    quietly green — a prefix child that happened to peak high.
+    """
+    from rapidmesh.qa import QA_QUERY_BLOCK
+    from rapidmesh.qa_reference import resident_distances
+
+    def stage(mesh: Any, rows: Any) -> dict[str, Any]:
+        d = resident_distances(
+            mesh, mesh.vertices, max_samples=samples,
+            block=block or QA_QUERY_BLOCK,
+        )
+        return {"sampled": int(d.size), "rms": float((d * d).mean() ** 0.5)}
+
+    return _stage_marginal(path, stage)
 
 
 def mesh_reverse_qa(

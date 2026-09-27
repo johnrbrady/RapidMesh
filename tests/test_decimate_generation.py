@@ -36,7 +36,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from rapidmesh import decimate_sweep, synthetic
+from rapidmesh import decimate_kernel, decimate_sweep, synthetic
 from rapidmesh.decimate import DecimationSettings
 from rapidmesh.decimate_qa import (
     against_observations,
@@ -131,8 +131,13 @@ def test_without_the_locked_join_rule_two_tiles_emit_the_same_face(
     sweep, which is why `decimate_kernel.DEFAULT_CHOICE` stays `python`: a
     monkeypatch cannot enter the Rust one, and a default of `rust` would make
     this test silently stop testing anything.
+
+    For the same reason the kernel is pinned here rather than inherited: with
+    `RAPIDMESH_DECIMATE_KERNEL=rust` in the environment the patch never lands
+    and this red case fails for a reason unrelated to the rule (ITEM-031).
     """
     _, root = generation
+    monkeypatch.setenv(decimate_kernel.ENVIRONMENT_VARIABLE, "python")
     monkeypatch.setattr(
         decimate_sweep._PatchState, "_would_join_locked", lambda *_args: False
     )

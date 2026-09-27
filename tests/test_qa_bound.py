@@ -34,6 +34,12 @@ against a mesh **loaded from disk**. WP-1.10 learned why: with the mesh built in
 the same process the pipeline's own high-water mark sits above the QA transient
 and hides it.
 
+The *marginal* is read twice inside one such child rather than differenced
+across two — ITEM-020, and `build_ladder` carries the arithmetic. The quantity
+claimed is unchanged; what changed is that the interpreter, NumPy, SciPy and the
+loaded mesh are now one number subtracted from itself instead of two separate
+estimates of the same thing whose errors add.
+
 Synthetic fixtures only. No `H:\\Sample` access is made and none is claimed.
 """
 
@@ -72,9 +78,17 @@ TOOLS = str(pathlib.Path(__file__).resolve().parent.parent / "tools")
 FORWARD_MARGINAL_GATE_BYTES = 64_000_000
 FORWARD_SLOPE_GATE_BYTES = 8.0
 
-# The WP ladder. Cells minus a 1% dropout, so 356k / 990k / 2.53M samples.
-LADDER = ((300, 1200), (500, 2000), (800, 3200))
+# Cells minus a 1% dropout, so 356k / 1.43M / 2.53M samples. The middle rung was
+# 500 x 2000 (990k) until ITEM-020: a 634k-sample first span turns the 8.0 B/sample
+# bar into a 5.07 MB allowance, and the stage's own peak wanders 1.85 MB between
+# identical runs. Near-equal ~1.1M spans put both slopes' noise at ~1.7 B/sample.
+LADDER = ((300, 1200), (600, 2400), (800, 3200))
 GATE_QA_SAMPLES = 300_000
+
+# DEC-020 clause 2 applied to the slope and marginal gates (DEC-025): the spread
+# is comparable to the margin, so every figure is taken n times and the maximum
+# is what is asserted. Never the mean, and never a re-roll.
+GATE_REPEATS = 3
 
 # `mesh_to_source_report_v2` on the module fixture, run against a checkout of
 # HEAD `b46aad6` with every WP-3.1 file removed from the tree — the WP-1.10
@@ -416,15 +430,36 @@ def _rows_for(mesh: MeshData) -> Any:
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture(scope="module")
-def ladder(tmp_path_factory: pytest.TempPathFactory) -> list[dict[str, Any]]:
+def build_ladder(root: pathlib.Path) -> list[dict[str, Any]]:
     """Three stations, meshed once each and saved, plus their measured rows.
 
     Every row is one child process, so a peak is that workload's own high-water
     mark and not one inherited from the row before it.
+
+    **The marginal is differenced inside that child, not across two — ITEM-020.**
+    This loop used to spawn a `mesh_only` child and a `mesh_forward_qa` child and
+    subtract their peaks. The interpreter, NumPy, SciPy and the loaded mesh are
+    the overwhelming majority of both figures, and measuring them separately in
+    two processes means they never cancel: two noisy estimates of one large
+    number are subtracted and their errors add. The first slope here spans
+    633,583 samples, so the 8.0 B/sample bar permits only 5,068,664 B of rise —
+    while rung 1's marginal alone moved 1,396,736 B between two Round 15 suite
+    runs on identical code, 27.6% of the whole allowance. The Lead then sampled
+    the gate itself: n=6, identical code, 5 PASS / 1 FAIL at slope 8.042, host
+    load not ordering the outcomes. A peak only rises, so one child can report
+    its own prefix watermark and its own post-stage watermark and the shared term
+    cancels exactly. `rapidmesh.memory.measure_in_child` is unchanged; the
+    workloads read the instrument themselves.
+
+    Exposed as a function and not only as a fixture so the repeat-sampling
+    harness measures the rows this gate asserts on, from one definition.
     """
-    root = tmp_path_factory.mktemp("qa-ladder")
-    rows: list[dict[str, Any]] = []
+    return build_ladders(root, repeats=1)[0]
+
+
+def _prepare_rungs(root: pathlib.Path) -> list[tuple[int, str]]:
+    """Each rung's fixture and mesh, written once: `(samples, mesh path)`."""
+    rungs: list[tuple[int, str]] = []
     for lattice_rows, cols in LADDER:
         scan_path = str(root / f"scan-{lattice_rows}x{cols}.npz")
         mesh_path = str(root / f"mesh-{lattice_rows}x{cols}.npz")
@@ -438,40 +473,89 @@ def ladder(tmp_path_factory: pytest.TempPathFactory) -> list[dict[str, Any]]:
             {"fixture": scan_path, "path": mesh_path},
             label="mesh", sys_path=[TOOLS],
         )
-        prefix = measure_in_child(
-            "measure_peak_memory", "mesh_only", {"path": mesh_path},
-            label="mesh only", sys_path=[TOOLS],
-        )
-        forward = measure_in_child(
-            "measure_peak_memory", "mesh_forward_qa",
-            {"path": mesh_path, "samples": GATE_QA_SAMPLES},
-            label="forward qa", sys_path=[TOOLS],
-        )
-        resident = measure_in_child(
-            "measure_peak_memory", "mesh_forward_qa_resident",
-            {"path": mesh_path, "samples": GATE_QA_SAMPLES},
-            label="forward qa, resident", sys_path=[TOOLS],
-        )
-        assert forward.detail["rms"] == resident.detail["rms"], (
-            "the two implementations disagreed on the figure being measured"
-        )
-        rows.append({
-            "samples": int(made.detail["samples"]),
-            "prefix": prefix.peak_rss_bytes,
-            "forward": forward.peak_rss_bytes,
-            "marginal": forward.peak_rss_bytes - prefix.peak_rss_bytes,
-            "resident_marginal": resident.peak_rss_bytes - prefix.peak_rss_bytes,
-            "seconds": forward.seconds,
-            "resident_seconds": resident.seconds,
-        })
-    return rows
+        rungs.append((int(made.detail["samples"]), mesh_path))
+    return rungs
+
+
+def _measure_rung(samples: int, mesh_path: str) -> dict[str, Any]:
+    forward = measure_in_child(
+        "measure_peak_memory", "mesh_forward_qa_marginal",
+        {"path": mesh_path, "samples": GATE_QA_SAMPLES},
+        label="forward qa", sys_path=[TOOLS],
+    )
+    resident = measure_in_child(
+        "measure_peak_memory", "mesh_forward_qa_resident_marginal",
+        {"path": mesh_path, "samples": GATE_QA_SAMPLES},
+        label="forward qa, resident", sys_path=[TOOLS],
+    )
+    assert forward.detail["rms"] == resident.detail["rms"], (
+        "the two implementations disagreed on the figure being measured"
+    )
+    return {
+        "samples": samples,
+        "prefix": int(forward.detail["prefix_peak_rss_bytes"]),
+        "forward": int(forward.detail["stage_peak_rss_bytes"]),
+        "marginal": int(forward.detail["marginal_bytes"]),
+        "resident_prefix": int(resident.detail["prefix_peak_rss_bytes"]),
+        "resident_forward": int(resident.detail["stage_peak_rss_bytes"]),
+        "resident_marginal": int(resident.detail["marginal_bytes"]),
+        "seconds": forward.seconds,
+        "resident_seconds": resident.seconds,
+    }
+
+
+def build_ladders(
+    root: pathlib.Path, repeats: int = GATE_REPEATS
+) -> list[list[dict[str, Any]]]:
+    """`repeats` complete passes over one set of fixtures, one ladder per pass.
+
+    Every pass measures every rung before the next pass starts, so a slope is
+    always taken between rungs of the same pass and a slow drift in the host
+    lands on all rungs of a pass rather than on one rung of every pass.
+    """
+    rungs = _prepare_rungs(root)
+    return [
+        [_measure_rung(samples, mesh_path) for samples, mesh_path in rungs]
+        for _ in range(repeats)
+    ]
+
+
+def ladder_slopes(ladder: list[dict[str, Any]], key: str) -> list[float]:
+    """Every consecutive slope of `key` against sample count, in B/sample."""
+    return [
+        (later[key] - earlier[key]) / (later["samples"] - earlier["samples"])
+        for earlier, later in zip(ladder[:-1], ladder[1:], strict=True)
+    ]
+
+
+def worst_slopes(ladders: list[list[dict[str, Any]]], key: str) -> list[float]:
+    """Per span, the maximum slope over the repeats — DEC-020 clause 3."""
+    per_pass = [ladder_slopes(ladder, key) for ladder in ladders]
+    return [max(span) for span in zip(*per_pass, strict=True)]
+
+
+@pytest.fixture(scope="module")
+def ladders(tmp_path_factory: pytest.TempPathFactory) -> list[list[dict[str, Any]]]:
+    return build_ladders(tmp_path_factory.mktemp("qa-ladder"))
+
+
+@pytest.fixture(scope="module")
+def ladder(ladders: list[list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    """The first pass, for the assertions that are structural rather than noisy."""
+    return ladders[0]
 
 
 def test_forward_qa_marginal_stays_under_the_gate(
-    ladder: list[dict[str, Any]]
+    ladders: list[list[dict[str, Any]]]
 ) -> None:
-    """`peak(mesh + forward QA) - peak(mesh alone)`, both in fresh children."""
-    over = [row for row in ladder if row["marginal"] > FORWARD_MARGINAL_GATE_BYTES]
+    """`peak(mesh + forward QA) - peak(mesh alone)`, both read in one child.
+
+    Every row of every pass must be under the gate: the maximum, DEC-020.
+    """
+    over = [
+        row for ladder in ladders for row in ladder
+        if row["marginal"] > FORWARD_MARGINAL_GATE_BYTES
+    ]
     assert not over, "\n".join(
         f"{row['samples']:,} samples: marginal {row['marginal']:,} B "
         f"> {FORWARD_MARGINAL_GATE_BYTES:,} B"
@@ -480,24 +564,59 @@ def test_forward_qa_marginal_stays_under_the_gate(
 
 
 def test_forward_qa_marginal_does_not_grow_with_the_station(
-    ladder: list[dict[str, Any]]
+    ladders: list[list[dict[str, Any]]]
 ) -> None:
-    """Every consecutive slope, not only the end points.
+    """Every consecutive slope, not only the end points, worst over the repeats.
 
     DEC-014 requires at least three sizes and a statement of which slopes
     agreed; two points can be joined by a line whatever they are, so a
-    two-point slope is not evidence of anything.
+    two-point slope is not evidence of anything. DEC-025 adds that each slope
+    is the maximum over `GATE_REPEATS` passes, because its run-to-run spread
+    was measured at several times its margin to the bar.
     """
-    assert len(ladder) >= 3
-    slopes = [
-        (later["marginal"] - earlier["marginal"])
-        / (later["samples"] - earlier["samples"])
-        for earlier, later in zip(ladder[:-1], ladder[1:], strict=True)
-    ]
-    assert all(slope <= FORWARD_SLOPE_GATE_BYTES for slope in slopes), (
-        f"slopes {[round(s, 3) for s in slopes]} B/sample exceed "
-        f"{FORWARD_SLOPE_GATE_BYTES} B/sample"
+    assert len(ladders) >= GATE_REPEATS
+    assert all(len(ladder) >= 3 for ladder in ladders)
+    worst = worst_slopes(ladders, "marginal")
+    assert all(slope <= FORWARD_SLOPE_GATE_BYTES for slope in worst), (
+        f"worst slopes {[round(s, 3) for s in worst]} B/sample exceed "
+        f"{FORWARD_SLOPE_GATE_BYTES} B/sample; per pass "
+        f"{[[round(s, 3) for s in ladder_slopes(p, 'marginal')] for p in ladders]}"
     )
+
+
+def test_the_slope_gate_asserts_the_worst_pass_not_a_typical_one() -> None:
+    """DEC-020 clause 3 pinned without a child process.
+
+    One pass over the bar and two comfortably under it must read as over the
+    bar. A mean (7.0) or a median (6.0) would read green here, and so would a
+    best-of; only the maximum is red.
+    """
+    def ladder(marginals: tuple[int, int, int]) -> list[dict[str, Any]]:
+        return [
+            {"samples": samples, "marginal": marginal}
+            for samples, marginal in zip((0, 1_000_000, 2_000_000), marginals, strict=True)
+        ]
+
+    ladders = [
+        ladder((0, 6_000_000, 6_000_000)),
+        ladder((0, 5_000_000, 5_000_000)),
+        ladder((0, 10_000_000, 10_000_000)),
+    ]
+    assert worst_slopes(ladders, "marginal") == [10.0, 0.0]
+    assert max(worst_slopes(ladders, "marginal")) > FORWARD_SLOPE_GATE_BYTES
+
+
+def test_the_first_span_is_wide_enough_to_be_read() -> None:
+    """ITEM-020's other half: the bar must be an allowance the noise cannot fill.
+
+    The forward-QA stage's own peak moved 1,851,392 B between identical runs.
+    Each span must allow at least three times that before its slope reaches the
+    bar, or the gate is once again measuring the host rather than the code.
+    """
+    stage_spread = 1_851_392
+    samples = [round(rows * cols * 0.99) for rows, cols in LADDER]
+    spans = [later - earlier for earlier, later in zip(samples[:-1], samples[1:], strict=True)]
+    assert all(span * FORWARD_SLOPE_GATE_BYTES >= 3 * stage_spread for span in spans), spans
 
 
 def test_the_ladder_actually_spans_a_range(ladder: list[dict[str, Any]]) -> None:
@@ -505,26 +624,60 @@ def test_the_ladder_actually_spans_a_range(ladder: list[dict[str, Any]]) -> None
     assert ladder[-1]["samples"] >= 6 * ladder[0]["samples"]
 
 
+def test_the_marginal_is_a_single_process_difference(
+    ladders: list[list[dict[str, Any]]]
+) -> None:
+    """ITEM-020's fix asserted, not merely documented.
+
+    A peak is monotone **within a process and nowhere else**. So a marginal read
+    from one child is bounded below by zero and is exactly the difference of the
+    two watermarks that child reported; a marginal differenced across two
+    separately spawned children is guaranteed neither, and it was the second
+    child's independent noise that made this gate a coin toss near its bar.
+
+    Both rows are checked, because the forward row and the red-case row are
+    measured by separate children and either could be re-pointed on its own.
+    This is the assertion that goes red if a later edit quietly reintroduces the
+    two-child difference while every budget number still looks plausible.
+    """
+    for row in (row for ladder in ladders for row in ladder):
+        assert row["forward"] >= row["prefix"], row
+        assert row["marginal"] == row["forward"] - row["prefix"], row
+        assert row["resident_forward"] >= row["resident_prefix"], row
+        assert row["resident_marginal"] == (
+            row["resident_forward"] - row["resident_prefix"]
+        ), row
+
+
 def test_the_gate_rejects_the_implementation_it_replaced(
-    ladder: list[dict[str, Any]]
+    ladders: list[list[dict[str, Any]]]
 ) -> None:
     """A gate that nothing fails is not a gate.
 
     `qa_reference.resident_distances` is measured on the same fixtures, in the
-    same instrument, against the same prefix — and must fail the bar the bounded
-    path passes. Its slope must also be plainly non-flat, because a bound that
-    the old shape also satisfied would mean the ladder was too small rather than
-    that anything had been bounded.
+    same instrument, against a prefix built the same way — and must fail the bar
+    the bounded path passes. Its slope must also be plainly non-flat, because a
+    bound that the old shape also satisfied would mean the ladder was too small
+    rather than that anything had been bounded.
+
+    ITEM-020 moved its prefix too: it is now this row's own in-process watermark
+    rather than a third child's. That makes this row strictly harder to pass,
+    since it can no longer be flattered by a prefix child that happened to peak
+    high, and it is still expected to fail the bar by a wide margin.
+
+    Required of **every** pass, since a red case that fails only sometimes is
+    as unreliable as a gate that passes only sometimes.
     """
-    worst = max(row["resident_marginal"] for row in ladder)
-    assert worst > FORWARD_MARGINAL_GATE_BYTES, (
-        f"the resident implementation peaked at only {worst:,} B over the "
-        "prefix; the ladder is not large enough to be evidence"
-    )
-    slope = (
-        ladder[-1]["resident_marginal"] - ladder[0]["resident_marginal"]
-    ) / (ladder[-1]["samples"] - ladder[0]["samples"])
-    assert slope > FORWARD_SLOPE_GATE_BYTES
+    for ladder in ladders:
+        worst = max(row["resident_marginal"] for row in ladder)
+        assert worst > FORWARD_MARGINAL_GATE_BYTES, (
+            f"the resident implementation peaked at only {worst:,} B over the "
+            "prefix; the ladder is not large enough to be evidence"
+        )
+        slope = (
+            ladder[-1]["resident_marginal"] - ladder[0]["resident_marginal"]
+        ) / (ladder[-1]["samples"] - ladder[0]["samples"])
+        assert slope > FORWARD_SLOPE_GATE_BYTES
 
 
 def test_reverse_qa_selection_is_bounded(
